@@ -1,0 +1,59 @@
+rows:
+  - method: temporal_mean
+    domain: beamspace
+    label: Temporal mean
+    input_domain: Beamspace
+  - method: temporal_mean
+    domain: cartesian
+    label: Temporal mean
+    input_domain: Scan-converted
+  - method: frame_unet
+    domain: beamspace
+    label: 2D U-Net
+    input_domain: Beamspace
+  - method: frame_unet
+    domain: cartesian
+    label: 2D U-Net
+    input_domain: Scan-converted
+  - method: temporal_unet
+    domain: beamspace
+    label: 3D U-Net
+    input_domain: Beamspace
+  - method: temporal_unet
+    domain: cartesian
+    label: 3D U-Net
+    input_domain: Scan-converted
+
+columns:
+  - name: tissue
+    task: tissue_doppler
+    title: "Task 1: Tissue velocity (cm/s)"
+    metric: velocity_l1
+    display_scale: 100.0
+    precision: 2
+    best: min
+  - name: color_v
+    task: color_doppler
+    title: "Task 2: Blood velocity (cm/s)"
+    metric: velocity_l1
+    display_scale: 100.0
+    precision: 2
+    best: min
+  - name: color_p
+    task: color_doppler
+    metric: power_l1
+    precision: 3
+    best: min
+  - name: color_s
+    task: color_doppler
+    metric: variation_l1
+    display_scale: 100.0
+    precision: 2
+    best: min
+  - name: dice
+    task: segmentation
+    title: "Task 3: Segmentation"
+    metric: dice_mean
+    display_scale: 100.0
+    precision: 1
+    best: max

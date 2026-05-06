@@ -1,0 +1,16 @@
+trainer:
+  max_epochs: 1
+data:
+  data_fraction: 0.1
+  train_batch_size: 2
+  val_batch_size: 2
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: false
+  persistent_workers: false
+  train_sampling_mode: sliding
+  val_sampling_mode: sliding
+  accepted_fps_range: null
+artifacts:
+  write_epoch_previews: false
+  debug_input_target_pngs: false

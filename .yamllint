@@ -1,0 +1,17 @@
+---
+extends: default
+
+ignore: |
+  .venv/
+  .mypy_cache/
+  .pytest_cache/
+  **/__pycache__/
+  src/echoxflow.egg-info/
+  outputs/
+  tmp/
+  tmp_plot_api_debug_outputs/
+  tasks/*/artifacts/
+
+rules:
+  line-length:
+    max: 120

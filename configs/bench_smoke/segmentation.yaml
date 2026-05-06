@@ -1,0 +1,15 @@
+trainer:
+  max_epochs: 1
+data:
+  data_fraction: 0.1
+  train_batch_size: 4
+  val_batch_size: 1
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: false
+  persistent_workers: false
+  val_sampling_mode: annotation
+  val_annotation_context_frames: 8
+artifacts:
+  write_epoch_previews: false
+  debug_input_target_pngs: false

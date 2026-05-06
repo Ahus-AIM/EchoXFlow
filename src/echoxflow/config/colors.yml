@@ -1,0 +1,248 @@
+---
+# Shared EchoXFlow visualization colors. RGB values use 0-255 channels.
+basic:
+  black: [0, 0, 0]
+  white: [255, 255, 255]
+  red: [255, 0, 0]
+  green: [0, 255, 0]
+  blue: [0, 0, 255]
+  yellow: [255, 255, 0]
+  cyan: [0, 255, 255]
+  magenta: [255, 0, 255]
+
+theme:
+  background_dark: [34, 34, 34]
+  background_light: [42, 42, 42]
+  panel_bg: [34, 34, 34]
+  border: [60, 60, 60]
+  border_light: [80, 80, 80]
+  text_primary: [230, 230, 230]
+  text_secondary: [200, 200, 200]
+  text_dim: [120, 120, 120]
+  accent_green: [60, 255, 60]
+  accent_red: [255, 96, 96]
+  accent_blue: [64, 160, 255]
+
+doppler:
+  ruler: [60, 255, 60]
+  border: [255, 255, 255]
+  panel_indicator: [0, 255, 0]
+  marker_red: [255, 96, 96]
+
+ecg:
+  trace: [74, 196, 74]
+  grid: [30, 30, 30]
+  marker: [255, 96, 96]
+  label: [230, 230, 230]
+
+plot:
+  grid_line: [240, 240, 240]
+  title: [230, 230, 230]
+  subtitle: [200, 220, 200]
+
+categorical:
+  okabe_ito:
+    - [230, 159, 0]
+    - [86, 180, 233]
+    - [0, 158, 115]
+    - [240, 228, 66]
+    - [0, 114, 178]
+    - [213, 94, 0]
+    - [204, 121, 167]
+  neutral_unlabeled: [180, 180, 180]
+
+data_modalities:
+  data/2d_brightness_mode: "grayscale"
+  data/2d_brightness_mode_0: "grayscale"
+  data/2d_brightness_mode_1: "grayscale"
+  data/2d_brightness_mode_2: "grayscale"
+  data/2d_biplane_brightness_mode: "grayscale"
+  data/2d_triplane_brightness_mode: "grayscale"
+  data/3d_brightness_mode: "grayscale"
+  data/1d_motion_mode: "grayscale"
+  data/1d_pulsed_wave_doppler: "spectral_doppler"
+  data/1d_continuous_wave_doppler: "spectral_doppler"
+  data/2d_color_doppler_velocity: "color_doppler_velocity"
+  data/2d_color_doppler_power: "color_doppler_power"
+  data/tissue_doppler: "tissue_doppler"
+  data/4ch_contour: "strain_contour"
+  data/3ch_contour: "strain_contour"
+  data/2ch_contour: "strain_contour"
+  data/rv_contour: "strain_contour"
+  data/seq02_contour_sequence: "strain_contour"
+  data/4ch_curve: "strain_curve"
+  data/3ch_curve: "strain_curve"
+  data/2ch_curve: "strain_curve"
+  data/rv_curve: "strain_curve"
+  data/curve_group03_curve: "strain_curve"
+  data/4ch_ecg: "ecg_signal"
+  data/3ch_ecg: "ecg_signal"
+  data/2ch_ecg: "ecg_signal"
+  data/rv_ecg: "ecg_signal"
+  data/4ch_ecg_qrs: "ecg_marker"
+  data/3ch_ecg_qrs: "ecg_marker"
+  data/2ch_ecg_qrs: "ecg_marker"
+  data/rv_ecg_qrs: "ecg_marker"
+  data/ecg: "ecg_signal"
+
+colormaps:
+  grayscale:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 1.0
+        color: [255, 255, 255]
+
+  spectral_doppler:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 0.18
+        color: [18, 16, 4]
+      - position: 0.4
+        color: [84, 76, 20]
+      - position: 0.68
+        color: [176, 160, 68]
+      - position: 0.88
+        color: [240, 226, 170]
+      - position: 1.0
+        color: [255, 255, 255]
+
+  color_doppler_velocity:
+    stops:
+      - position: 0.0
+        color: [180, 220, 255]
+      - position: 0.25
+        color: [0, 70, 210]
+      - position: 0.425
+        color: [0, 0, 0]
+      - position: 0.5
+        color: [0, 0, 0]
+      - position: 0.575
+        color: [0, 0, 0]
+      - position: 0.75
+        color: [220, 20, 20]
+      - position: 1.0
+        color: [255, 235, 0]
+
+  color_doppler_power:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 0.5
+        color: [255, 255, 0]
+      - position: 1.0
+        color: [255, 255, 255]
+
+  tissue_doppler:
+    stops:
+      - position: 0.0
+        color: [254, 254, 223]
+      - position: 0.095
+        color: [254, 254, 1]
+      - position: 0.47
+        color: [254, 0, 0]
+      - position: 0.5
+        color: [254, 0, 0]
+      - position: 0.5
+        color: [0, 0, 254]
+      - position: 0.605
+        color: [0, 0, 254]
+      - position: 0.86
+        color: [0, 254, 254]
+      - position: 1.0
+        color: [0, 254, 3]
+
+  strain_contour:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 0.35
+        color: [0, 158, 115]
+      - position: 0.7
+        color: [86, 180, 233]
+      - position: 1.0
+        color: [255, 255, 255]
+
+  strain_curve:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 0.5
+        color: [204, 121, 167]
+      - position: 1.0
+        color: [255, 255, 255]
+
+  ecg_signal:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 1.0
+        color: [74, 196, 74]
+
+  ecg_marker:
+    stops:
+      - position: 0.0
+        color: [0, 0, 0]
+      - position: 1.0
+        color: [255, 96, 96]
+
+  data/2d_brightness_mode:
+    alias: "grayscale"
+
+  data/3d_brightness_mode:
+    alias: "grayscale"
+
+  data/1d_motion_mode:
+    alias: "grayscale"
+
+  data/1d_pulsed_wave_doppler:
+    alias: "spectral_doppler"
+
+  data/1d_continuous_wave_doppler:
+    alias: "spectral_doppler"
+
+  data/2d_color_doppler_velocity:
+    alias: "color_doppler_velocity"
+
+  data/2d_color_doppler_power:
+    alias: "color_doppler_power"
+
+  data/tissue_doppler:
+    alias: "tissue_doppler"
+
+  black_white:
+    alias: "grayscale"
+
+  pw_cw_black_yellow:
+    alias: "spectral_doppler"
+
+  blood_color_flow_velocity:
+    alias: "color_doppler_velocity"
+
+  tdi_palette:
+    alias: "tissue_doppler"
+
+  2d_brightness_mode:
+    alias: "grayscale"
+
+  3d_brightness_mode:
+    alias: "grayscale"
+
+  1d_motion_mode:
+    alias: "grayscale"
+
+  1d_pulsed_wave_doppler:
+    alias: "spectral_doppler"
+
+  1d_continuous_wave_doppler:
+    alias: "spectral_doppler"
+
+  2d_color_doppler:
+    alias: "color_doppler_velocity"
+
+  2d_color_doppler_velocity:
+    alias: "color_doppler_velocity"
+
+  2d_color_doppler_power:
+    alias: "color_doppler_power"

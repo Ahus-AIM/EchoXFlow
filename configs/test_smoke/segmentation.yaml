@@ -1,0 +1,18 @@
+model:
+  channels: [4, 8]
+  strides: null
+  kernel_sizes: null
+  output_spatial_stride: [1, 1]
+  target_spatial_shape: [16, 16]
+trainer:
+  max_epochs: 1
+  accelerator: cpu
+  devices: 1
+  precision: 32-true
+data:
+  num_workers: 0
+  clip_length: 2
+  clip_stride: 1
+  input_spatial_shape: [16, 16]
+  train_batch_size: 4
+  val_batch_size: 1

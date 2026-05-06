@@ -1,0 +1,30 @@
+---
+model:
+  # TODO: Configure the model kind, channels, strides, and output shape.
+  kind: template_task
+optimizer:
+  # TODO: Configure optimizer name, learning rate, and weight decay.
+  name: adammuon
+  learning_rate: 0.001
+  weight_decay: 0.0
+trainer:
+  # TODO: Configure accelerator, devices, precision, and epoch count.
+  max_epochs: 1
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+data:
+  # TODO: Configure data discovery, sampling, dataloader sizes, and worker count.
+  root_dir: null
+  train_batch_size: 1
+  val_batch_size: 1
+  num_workers: 0
+loss:
+  # TODO: Configure task-specific loss options.
+  name: template
+metrics:
+  # TODO: Configure validation metric options.
+artifacts:
+  # TODO: Configure output paths and debug artifact options.
+  root_dir: outputs/runs
+  epoch_scores_name: train_scores.jsonl

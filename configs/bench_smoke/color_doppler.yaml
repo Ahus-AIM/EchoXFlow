@@ -1,0 +1,16 @@
+trainer:
+  max_epochs: 1
+data:
+  data_fraction: 0.1
+  train_batch_size: 4
+  val_batch_size: 4
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: false
+  persistent_workers: false
+  frame_ratio_range: [0.0, 10000.0]
+  fps_range: [0.0, 10000.0]
+  nyquist_mps_range: [0.60, 0.61]
+artifacts:
+  write_epoch_previews: false
+  debug_input_target_pngs: false

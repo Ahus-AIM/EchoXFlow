@@ -1,0 +1,65 @@
+---
+model:
+  kind: color_doppler
+  in_channels_per_frame: 1
+  doppler_channels: 3
+  conditioning_features: 0
+  channels: [32, 64, 128, 256, 320, 320]
+  strides:
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [1, 2, 2]
+  kernel_sizes:
+    - [1, 3, 3]
+    - [1, 3, 3]
+    - [1, 3, 3]
+    - [3, 3, 3]
+    - [3, 3, 3]
+    - [3, 3, 3]
+  num_res_units: 1
+  transpose_post_conv_kernel_size: [1, 3, 3]
+  output_spatial_stride: [1, 1]
+  target_spatial_shape: [256, 256]
+  temporal_upsample_factor: 2
+optimizer:
+  name: adammuon
+  learning_rate: 0.0037
+  weight_decay: 0.0
+trainer:
+  max_epochs: 8
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+data:
+  root_dir: null
+  clip_length: 32
+  clip_stride: 16
+  min_frames_per_case: 32
+  input_spatial_shape: [256, 256]
+  target_spatial_shape: [256, 256]
+  val_fraction: 0.2
+  max_files: null
+  max_train_samples: null
+  max_val_samples: null
+  frame_ratio_range: [0.45, 1.1]
+  fps_range: [9.0, 13.0]
+  nyquist_mps_range: [0.60, 0.61]
+  velocity_loss_bmode_threshold: 0.4
+  velocity_loss_power_threshold: 0.3
+  velocity_loss_mask_floor: 0.01
+  train_batch_size: 4
+  val_batch_size: 4
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+  multiprocessing_sharing_strategy: file_system
+  seed: 0
+loss:
+  color_doppler_weight: 1.0
+  outside_box_weight: 0.01
+artifacts:
+  root_dir: outputs/runs
+  epoch_scores_name: train_scores.jsonl

@@ -1,0 +1,11 @@
+methods:
+  temporal_mean:
+    kind: baseline
+    baseline: temporal_mean
+  temporal_unet:
+    kind: trainable
+  frame_unet:
+    kind: trainable
+    config_transform: tasks.utils.models.unet.framewise_temporal_config
+aliases:
+  unet: temporal_unet

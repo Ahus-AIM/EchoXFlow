@@ -1,0 +1,11 @@
+---
+dataset:
+  name: "EchoXFlow"
+  version: "0.0.0"
+
+data:
+  root: "/path/to/EchoXFlow"
+
+output:
+  root: "outputs"
+  temp: "tmp"

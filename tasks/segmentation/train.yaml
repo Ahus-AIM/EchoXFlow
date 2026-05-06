@@ -1,0 +1,65 @@
+---
+model:
+  kind: segmentation
+  in_channels_per_frame: 1
+  out_channels: 3
+  head_channels: 32
+  channels: [32, 64, 128, 256, 320, 320]
+  strides:
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [1, 2, 2]
+  kernel_sizes:
+    - [3, 3, 3]
+    - [3, 3, 3]
+    - [3, 3, 3]
+    - [3, 3, 3]
+    - [3, 3, 3]
+    - [3, 3, 3]
+  transpose_post_conv_kernel_size: [1, 3, 3]
+  num_res_units: 1
+  output_spatial_stride: [1, 1]
+  target_spatial_shape: [256, 256]
+optimizer:
+  name: adammuon
+  learning_rate: 0.0037
+  weight_decay: 0.0
+trainer:
+  max_epochs: 8
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+data:
+  root_dir: null
+  coordinate_space: beamspace
+  clip_length: 32
+  clip_stride: 32
+  input_spatial_shape: [256, 256]
+  spatial_shape: [256, 256]
+  val_fraction: 0.1
+  max_files: null
+  max_train_samples: null
+  max_val_samples: null
+  target_mask_channels: 2
+  require_target_masks: true
+  val_sampling_mode: annotation
+  val_annotation_context_frames: 8
+  train_batch_size: 4
+  val_batch_size: 1
+  num_workers: 32
+  prefetch_factor: 4
+  content_types:
+    - 2d_left_ventricular_strain
+  seed: 0
+loss:
+  name: dice
+  dice_eps: 1.0e-6
+  beamspace_pixel_size_weighting: true
+metrics:
+  dice_eps: 1.0e-6
+artifacts:
+  root_dir: outputs/runs
+  epoch_scores_name: train_scores.jsonl
+  debug_input_target_pngs: true

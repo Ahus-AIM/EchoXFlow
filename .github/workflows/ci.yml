@@ -1,0 +1,39 @@
+---
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    name: Quality Gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Install project and dev dependencies
+        run: |
+          uv venv
+          uv pip install --editable . --requirement requirements-dev.txt
+
+      - name: Run pre-commit hooks
+        run: uv run pre-commit run --all-files
+
+      - name: Run tests
+        run: uv run python -m pytest -q -ra

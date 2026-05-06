@@ -1,0 +1,10 @@
+black==25.1.0
+flake8==7.3.0
+flake8-pyproject==1.2.3
+isort==6.0.1
+mypy==1.14.1
+pre-commit==4.2.0
+pytest==8.3.5
+torch>=2.0.0
+types-PyYAML==6.0.12.20250402
+yamllint==1.37.1
