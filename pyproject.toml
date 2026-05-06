@@ -1,6 +1,6 @@
 [project]
 name = "echoxflow"
-version = "0.2.1"
+version = "0.0.0"
 description = "Library and example tasks for reading and loading the EchoXFlow echocardiographic dataset"
 license = { file = "LICENSE" }
 requires-python = ">=3.13"
