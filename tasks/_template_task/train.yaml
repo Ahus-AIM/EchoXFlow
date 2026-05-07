@@ -1,7 +1,7 @@
 ---
 model:
   # TODO: Configure the model kind, channels, strides, and output shape.
-  kind: template_task
+  kind: _template_task
 optimizer:
   # TODO: Configure optimizer name, learning rate, and weight decay.
   name: adammuon

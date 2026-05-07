@@ -12,7 +12,7 @@ __all__ = ["Sample", "TrainingStepResult"]
 
 @dataclass
 class Sample:
-    task_kind: ClassVar[Literal["template_task"]] = "template_task"
+    task_kind: ClassVar[Literal["_template_task"]] = "_template_task"
 
     # TODO: Add task input tensors, target tensors, masks, and metadata.
     sample_id: str = "sample"

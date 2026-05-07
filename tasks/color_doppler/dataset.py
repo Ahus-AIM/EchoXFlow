@@ -445,30 +445,6 @@ def discover_records(
     )
 
 
-def _color_discovery_predicate(
-    record: RecordingRecord,
-    *,
-    data_root: str | Path,
-    frame_ratio_range: tuple[float, float],
-    fps_range: tuple[float, float],
-    nyquist_mps_range: tuple[float, float] | None,
-) -> bool:
-    if not _color_metadata_discovery_predicate(
-        record,
-        frame_ratio_range=frame_ratio_range,
-        fps_range=fps_range,
-        nyquist_mps_range=nyquist_mps_range,
-    ):
-        return False
-    return _color_runtime_discovery_predicate(
-        record,
-        data_root=data_root,
-        frame_ratio_range=frame_ratio_range,
-        fps_range=fps_range,
-        nyquist_mps_range=nyquist_mps_range,
-    )
-
-
 def _color_metadata_discovery_predicate(
     record: RecordingRecord,
     *,

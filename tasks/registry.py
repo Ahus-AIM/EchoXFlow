@@ -243,6 +243,11 @@ def _task_module_dirs() -> tuple[Path, ...]:
     task_dirs: list[Path] = []
     for root in roots:
         for child in sorted(root.iterdir()):
-            if child.is_dir() and (child / "task.py").is_file() and child not in task_dirs:
+            if (
+                not child.name.startswith("_")
+                and child.is_dir()
+                and (child / "task.py").is_file()
+                and child not in task_dirs
+            ):
                 task_dirs.append(child)
     return tuple(task_dirs)

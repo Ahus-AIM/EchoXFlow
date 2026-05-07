@@ -576,64 +576,6 @@ def mesh_mosaic_annotation_lines(
     return tuple(overlays)
 
 
-def mesh_mosaic_annotation_polygons(
-    annotation: PackedMeshAnnotation,
-    geometry: SphericalGeometry,
-    *,
-    frame_count: int,
-    mosaic_shape: tuple[int, int],
-    view: PanelView,
-    volume_timestamps: np.ndarray | None = None,
-    metadata: Mapping[str, Any] | None = None,
-) -> tuple[tuple[np.ndarray, ...], ...]:
-    """Build per-frame filled mesh intersections in clinical 3D mosaic pixel coordinates."""
-    if view != "clinical":
-        return tuple(() for _ in range(max(0, int(frame_count))))
-    rows, cols = 3, 4
-    cell_h = max(1, int(mosaic_shape[0]) // rows)
-    cell_w = max(1, int(mosaic_shape[1]) // cols)
-    panel_sizes = _mesh_panel_sizes_from_volume(geometry, height=cell_h, width=cell_h, cover_depth_fraction=1.0)
-    plane_specs = _mesh_slice_plane_specs_from_volume(geometry, cover_depth_fraction=1.0)
-    panel_count = min(rows * cols, len(panel_sizes), len(plane_specs))
-    mesh_indices = mesh_frame_indices_for_volume_timestamps(
-        annotation.timestamps,
-        volume_timestamps,
-        metadata,
-        mesh_frame_count=annotation.frame_count,
-        target_count=int(frame_count),
-    )
-    overlays: list[tuple[np.ndarray, ...]] = []
-    for frame_index in range(max(0, int(frame_count))):
-        mesh_index = mesh_indices[frame_index] if frame_index < len(mesh_indices) else frame_index
-        mesh_frame = annotation.frame(min(mesh_index, max(0, annotation.frame_count - 1)))
-        points = _mesh_points_to_render_frame(np.asarray(mesh_frame.points, dtype=np.float32))
-        faces = _valid_mesh_faces(np.asarray(mesh_frame.faces, dtype=np.int32), n_points=int(points.shape[0]))
-        if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] < 3 or faces.size == 0:
-            overlays.append(())
-            continue
-        polygons: list[np.ndarray] = []
-        for panel_idx, (plane_spec, panel_size) in enumerate(zip(plane_specs[:panel_count], panel_sizes[:panel_count])):
-            segments = _mesh_plane_segments(
-                points,
-                faces,
-                np.asarray(plane_spec["plane_point"], dtype=np.float64),
-                np.asarray(plane_spec["plane_normal"], dtype=np.float64),
-                np.asarray(plane_spec["basis_u"], dtype=np.float64),
-                np.asarray(plane_spec["basis_v"], dtype=np.float64),
-            )
-            polygons.extend(
-                _polygons_to_mosaic_polygons(
-                    panel_idx=panel_idx,
-                    polygons=_segments_to_closed_polygons(segments),
-                    plane_spec=plane_spec,
-                    panel_size_hw=panel_size,
-                    cell_shape=(cell_h, cell_w),
-                )
-            )
-        overlays.append(tuple(polygons))
-    return tuple(overlays)
-
-
 def _mesh_slice_plane_specs_from_volume(
     geometry: SphericalGeometry,
     *,
@@ -948,38 +890,6 @@ def _segments_to_closed_polygons(segments: tuple[np.ndarray, ...]) -> tuple[np.n
             continue
         polygons.append(polygon)
     return tuple(polygons)
-
-
-def _polygons_to_mosaic_polygons(
-    *,
-    panel_idx: int,
-    polygons: tuple[np.ndarray, ...],
-    plane_spec: dict[str, np.ndarray | float],
-    panel_size_hw: tuple[int, int],
-    cell_shape: tuple[int, int],
-) -> tuple[np.ndarray, ...]:
-    row = int(panel_idx) // 4
-    col = int(panel_idx) % 4
-    height = int(panel_size_hw[0])
-    width = int(panel_size_hw[1])
-    x_min = float(plane_spec["x_min"])
-    x_max = float(plane_spec["x_max"])
-    y_min = float(plane_spec["y_min"])
-    y_max = float(plane_spec["y_max"])
-    x_span = max(x_max - x_min, 1e-8)
-    y_span = max(y_max - y_min, 1e-8)
-    mosaic_polygons: list[np.ndarray] = []
-    for polygon in polygons:
-        pts = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
-        if pts.shape[0] < 3:
-            continue
-        px = (pts[:, 0] - x_min) / x_span * float(width - 1)
-        py = (pts[:, 1] - y_min) / y_span * float(height - 1)
-        mapped = np.stack([px, py], axis=-1).astype(np.float32)
-        mapped[:, 0] += col * int(cell_shape[1])
-        mapped[:, 1] += row * int(cell_shape[0])
-        mosaic_polygons.append(mapped)
-    return tuple(mosaic_polygons)
 
 
 def _quantized_point_key(point: np.ndarray, tolerance: float) -> tuple[int, int]:

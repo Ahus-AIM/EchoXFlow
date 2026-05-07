@@ -213,20 +213,6 @@ def _annotation_refs(documents: tuple[Mapping[str, Any], ...]) -> tuple[Annotati
     return tuple(refs)
 
 
-def _document_panel_roles(document: Mapping[str, Any]) -> tuple[str, ...]:
-    raw_panels = document.get("linked_panels")
-    if not isinstance(raw_panels, list):
-        return ()
-    roles: list[str] = []
-    for index, item in enumerate(raw_panels):
-        if not isinstance(item, Mapping):
-            continue
-        role_id = _panel_role_id(item, index=index)
-        if role_id is not None:
-            roles.append(role_id)
-    return tuple(roles)
-
-
 def _panel_role_id(item: Mapping[str, Any], *, index: int) -> str | None:
     for value in (
         item.get("role_id"),
