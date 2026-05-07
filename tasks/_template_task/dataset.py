@@ -7,7 +7,7 @@ from typing import Any
 from torch.utils.data import Dataset
 
 from echoxflow import RecordingRecord
-from tasks.template_task.types import Sample
+from tasks._template_task.types import Sample
 
 
 @dataclass(frozen=True)
@@ -29,4 +29,4 @@ def build_dataloaders(
     **kwargs: Any,
 ) -> Any:
     # TODO: Return train and validation dataloaders for this task.
-    raise NotImplementedError("template_task dataloaders are not implemented")
+    raise NotImplementedError("_template_task dataloaders are not implemented")

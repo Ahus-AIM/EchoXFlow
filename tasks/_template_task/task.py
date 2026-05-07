@@ -7,7 +7,7 @@ from tasks.registry import TaskSpec
 
 def loss_terms(model: Any, sample: object, config: object) -> dict[str, Any]:
     # TODO: Run the model, compute task-specific loss terms, and return at least {"loss": loss}.
-    raise NotImplementedError("template_task loss is not implemented")
+    raise NotImplementedError("_template_task loss is not implemented")
 
 
-TASK_SPEC = TaskSpec(name="template_task", loss_fn=loss_terms)
+TASK_SPEC = TaskSpec(name="_template_task", loss_fn=loss_terms)
