@@ -424,8 +424,8 @@ def test_spectral_metadata_extracts_cursor_baseline_and_velocity_axis(tmp_path: 
                 {
                     "semantic_id": semantic_id,
                     "cursor_box": [1, 2, 3, 4],
-                    "baseline_row": 2,
-                    "nyquist_limit_mps": 1.0,
+                    "baseline_frac": 0.5,
+                    "nyquist_mps": 1.0,
                 }
             ],
         }

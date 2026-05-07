@@ -42,8 +42,17 @@ def spectral_metadata_from_attrs(
     raw = _spectral_document(data_path, group_attrs)
     if raw is None:
         return SpectralMetadata(data_path=data_path)
-    baseline = _optional_float(raw.get("baseline_row"))
-    nyquist = _optional_float(_first(raw, "nyquist_limit_mps", "velocity_limit_mps", "velocity_scale_mps"))
+    baseline = _baseline_row(raw, row_count=row_count)
+    nyquist = _optional_float(
+        next(
+            (
+                raw[key]
+                for key in ("nyquist_mps", "nyquist_limit_mps", "velocity_limit_mps", "velocity_scale_mps")
+                if key in raw
+            ),
+            None,
+        )
+    )
     axis = _velocity_axis(raw, row_count=row_count, baseline_row=baseline, nyquist_limit_mps=nyquist)
     return SpectralMetadata(
         data_path=data_path,
@@ -62,12 +71,14 @@ def _spectral_document(data_path: str, group_attrs: Mapping[str, Any]) -> Mappin
         candidates.update(("spectral_doppler", "pw_doppler", "pulsed_wave", "pulsed_wave_doppler"))
     elif name == "1d_continuous_wave_doppler":
         candidates.update(("spectral_doppler", "cw_doppler", "continuous_wave", "continuous_wave_doppler"))
-    for document in _manifest_documents(group_attrs):
+    for document in manifest_documents(group_attrs):
         for key in ("spectral_metadata", "spectral", "doppler_spectrum"):
             value = document.get(key)
             if isinstance(value, dict):
                 return value
-        for track in _items(document.get("tracks")):
+        for track in document.get("tracks") or ():
+            if not isinstance(track, Mapping):
+                continue
             role = _semantic_id(track)
             data_ref = track.get("data")
             array_path = _array_ref_path(data_ref)
@@ -83,10 +94,6 @@ def _spectral_document(data_path: str, group_attrs: Mapping[str, Any]) -> Mappin
             if role in candidates or role.startswith("1d_"):
                 return sector
     return None
-
-
-def _manifest_documents(group_attrs: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
-    return manifest_documents(group_attrs)
 
 
 def _array_ref_path(value: Any) -> str | None:
@@ -110,18 +117,12 @@ def _cursor_box(raw: Mapping[str, Any]) -> SpectralCursorBox | None:
     else:
         return None
     try:
-        x, y, width, height = _float_quad(values)
+        x, y, width, height = (float(value) for value in values)
     except (TypeError, ValueError):
         return None
     if not all(np.isfinite([x, y, width, height])) or width <= 0.0 or height <= 0.0:
         return None
     return SpectralCursorBox(x=x, y=y, width=width, height=height)
-
-
-def _float_quad(values: list[Any]) -> tuple[float, float, float, float]:
-    if len(values) != 4 or any(value is None for value in values):
-        raise ValueError("Expected four finite cursor box values")
-    return float(values[0]), float(values[1]), float(values[2]), float(values[3])
 
 
 def _velocity_axis(
@@ -139,21 +140,18 @@ def _velocity_axis(
         return None
     rows = np.arange(int(row_count), dtype=np.float32)
     baseline = float(baseline_row)
-    scale = np.where(rows <= baseline, max(1.0, baseline), max(1.0, row_count - 1 - baseline))
+    scale = max(1.0, float(row_count - 1) / 2.0)
     return np.asarray((baseline - rows) / scale * float(nyquist_limit_mps), dtype=np.float32)
 
 
-def _first(mapping: Mapping[str, Any], *keys: str) -> Any | None:
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return None
-
-
-def _items(value: Any) -> tuple[Mapping[str, Any], ...]:
-    if not isinstance(value, list):
-        return ()
-    return tuple(item for item in value if isinstance(item, Mapping))
+def _baseline_row(raw: Mapping[str, Any], *, row_count: int | None) -> float | None:
+    baseline = _optional_float(raw.get("baseline_row"))
+    if baseline is not None or row_count is None:
+        return baseline
+    baseline_frac = _optional_float(
+        next((raw[key] for key in ("spectral_row_baseline_frac", "baseline_frac") if key in raw), None)
+    )
+    return None if baseline_frac is None else float(baseline_frac) * max(0, int(row_count) - 1)
 
 
 def _semantic_id(value: Mapping[str, Any]) -> str:
