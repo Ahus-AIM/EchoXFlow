@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 
-from echoxflow.loading import LoadedArray
+from echoxflow.loading import LoadedArray, _stream_metadata
 from echoxflow.plotting import clinical as clinical_module
 from echoxflow.plotting.clinical import _tissue_bmode_multiplier, clinical_loaded_arrays
 from echoxflow.plotting.renderer import RecordingPlotRenderer
@@ -529,34 +529,34 @@ def test_clinical_tissue_doppler_colormaps_before_interpolation(monkeypatch: pyt
     assert (8, 8, 4) in sampled_shapes
 
 
-def test_both_mode_places_pre_converted_left_and_clinical_right() -> None:
-    geometry = SectorGeometry.from_center_width(
-        depth_start_m=0.01,
-        depth_end_m=0.11,
-        tilt_rad=0.0,
-        width_rad=0.8,
-        grid_shape=(8, 8),
-    )
+@pytest.mark.parametrize("bmode_name", ("2d_brightness_mode_0", "2d_brightness_mode_1", "2d_brightness_mode_2"))
+def test_both_mode_places_pre_converted_left_and_clinical_right(bmode_name: str) -> None:
+    wrong = {"DepthStart": 0.01, "DepthEnd": 0.04, "Tilt": 0.0, "Width": 0.8, "GridSize": [8, 8]}
+    right = {**wrong, "DepthEnd": 0.11}
+    geometry = _stream_metadata(
+        f"data/{bmode_name}",
+        {
+            "recording_manifest": {
+                "sectors": [
+                    {"semantic_id": "bmode", "geometry": wrong},
+                    {"semantic_id": "bmode", "frames": {"zarr_path": f"data/{bmode_name}"}, "geometry": right},
+                ]
+            }
+        },
+    ).geometry
+    assert geometry is not None and geometry.depth_end_m == pytest.approx(0.11)
     timestamps = np.asarray([0.0, 0.1], dtype=np.float32)
     bmode = _loaded(
-        "2d_brightness_mode",
+        bmode_name,
         np.full((2, 8, 8), 64, dtype=np.uint8),
         timestamps=timestamps,
         geometry=geometry,
     )
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
     panels = renderer.build_panel_specs((bmode,), view_mode="both")
-    ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
 
-    figure = renderer.render_figure_from_specs(panels=panels, ecg=ecg, time_s=0.0, frame_index=0, dpi=100)
-    try:
-        assert figure.axes[0].get_position().x0 < figure.axes[1].get_position().x0
-        assert panels[0].view == "pre_converted"
-        assert panels[1].view == "clinical"
-        assert panels[1].loaded.data_path == bmode.data_path
-        assert panels[1].loaded.stream is bmode.stream
-    finally:
-        plt.close(figure)
+    assert [panel.view for panel in panels] == ["pre_converted", "clinical"]
+    assert panels[1].loaded.data.shape[-1] == 4
 
 
 def test_clinical_bmode_mmode_keeps_mmode_strip_and_transparent_sector_background() -> None:

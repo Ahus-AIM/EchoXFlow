@@ -569,17 +569,19 @@ def _optional_positive_int(value: Any) -> int | None:
 
 
 def _sector_for_data_path(data_path: str, group_attrs: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    data_path = _normalize_data_path(data_path)
+    exact = data_path.removeprefix("data/") in {"2d_brightness_mode_0", "2d_brightness_mode_1", "2d_brightness_mode_2"}
     roles = _sector_role_candidates(data_path)
-    if not roles:
-        return None
-    for document in _manifest_documents(group_attrs):
+    for document in manifest_documents(group_attrs):
         sectors = document.get("sectors")
         if not isinstance(sectors, list):
             continue
         for sector in sectors:
             if not isinstance(sector, dict):
                 continue
-            if _semantic_id(sector) in roles:
+            if _array_ref_path(sector.get("frames")) == data_path:
+                return sector
+            if _semantic_id(sector) in roles and not exact:
                 return sector
     return None
 
@@ -601,12 +603,8 @@ def _sector_role_candidates(data_path: str) -> tuple[str, ...]:
     return ()
 
 
-def _manifest_documents(group_attrs: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
-    return manifest_documents(group_attrs)
-
-
 def _three_dimensional_document(group_attrs: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    for document in _manifest_documents(group_attrs):
+    for document in manifest_documents(group_attrs):
         sector = _three_dimensional_sector(document)
         if sector is not None:
             return _with_internal_3d_metadata(document, sector)
@@ -681,7 +679,7 @@ def _manifest_timestamp_path(data_path: str, group_attrs: Mapping[str, Any]) -> 
             return timestamp_path
     if data_path != "data/3d_brightness_mode":
         return None
-    for document in _manifest_documents(group_attrs):
+    for document in manifest_documents(group_attrs):
         timelines = document.get("timelines")
         if isinstance(timelines, Mapping):
             timestamp_path = _array_ref_path(timelines.get("frame_timestamps"))
