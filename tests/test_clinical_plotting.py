@@ -177,6 +177,8 @@ def test_clinical_color_doppler_uses_fastest_2d_modality_timeline() -> None:
 
     assert clinical[0].data.shape[0] == 4
     np.testing.assert_allclose(clinical[0].timestamps, doppler_timestamps)
+    assert clinical[0].stream is bmode.stream
+    assert clinical[0].attrs["clinical_source"] == bmode.data_path
     assert timeline.fps == pytest.approx(20.0)
     np.testing.assert_allclose(timeline.timestamps, doppler_timestamps)
 
