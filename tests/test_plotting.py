@@ -1216,14 +1216,7 @@ def test_continuous_wave_sampling_metadata_draws_line_not_box(tmp_path: Path) ->
     group.attrs["recording_manifest"] = {
         "manifest_type": "2d",
         "sectors": [{"semantic_id": "bmode", "geometry": geometry}],
-        "tracks": [
-            {
-                "kind": "matrix",
-                "semantic_id": "continuous_wave",
-                "data": {"zarr_path": "data/1d_continuous_wave_doppler", "format": "zarr_array"},
-                "derived_from": {"gate_center_depth_m": 0.04, "gate_tilt_rad": 0.1},
-            }
-        ],
+        "sampling_gate_metadata": {"gate_center_depth_m": 0.04, "gate_tilt_rad": 0.1, "gate_sample_volume_m": 0.01},
     }
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
     record = RecordingRecord(
