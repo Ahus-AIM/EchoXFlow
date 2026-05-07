@@ -107,8 +107,14 @@ class LinePanelRenderer:
         values = np.asarray(panel.loaded.data, dtype=np.float32)
         timestamps = panel.loaded.timestamps
         x, traces = _line_trace_values(values, timestamps)
-        for trace in traces:
-            ax.plot(x, trace, color=style.line_color, linewidth=1.0)
+        colors = panel.loaded.attrs.get("trace_colors", ())
+        for index, trace in enumerate(traces):
+            ax.plot(
+                x,
+                trace,
+                color=_line_trace_color(index, len(traces), colors, style=style),
+                linewidth=1.0,
+            )
         if x.size:
             ax.axvline(float(time_s), color=style.cursor_color, linewidth=1.4)
         _finish_panel(ax, panel.label, style)
@@ -691,6 +697,15 @@ def _line_trace_values(values: np.ndarray, timestamps: np.ndarray | None) -> tup
         return ts, tuple(np.asarray(matrix[index], dtype=np.float32) for index in range(matrix.shape[0]))
     x = np.arange(matrix.shape[0], dtype=np.float64)
     return x, tuple(np.asarray(matrix[:, index], dtype=np.float32) for index in range(matrix.shape[1]))
+
+
+def _line_trace_color(index: int, count: int, colors: object, *, style: PlotStyle) -> str:
+    if isinstance(colors, tuple) and index < len(colors) and isinstance(colors[index], str):
+        return colors[index]
+    if count < 2:
+        return style.line_color
+    palette = ("#440154", "#414487", "#2A788E", "#22A884", "#7AD151", "#FDE725")
+    return palette[round(index * (len(palette) - 1) / (count - 1))]
 
 
 def _line_x_axis(size: int, timestamps: np.ndarray | None) -> np.ndarray:
