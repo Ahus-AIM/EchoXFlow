@@ -347,6 +347,9 @@ def _sampling_line_metadata(store: RecordingStore, loaded: LoadedArray) -> Mappi
     for document in _render_documents(getattr(store.group, "attrs", {})):
         for candidate in _line_metadata_candidates(document):
             return candidate
+        gate = document.get("sampling_gate_metadata")
+        if isinstance(gate, Mapping) and _has_sampling_line_pose(gate):
+            return gate
     raw = None if loaded.stream is None else loaded.stream.metadata.raw
     for candidate in _line_metadata_candidates(raw):
         return candidate
