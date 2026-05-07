@@ -98,55 +98,6 @@ def test_strain_image_input_chains_reference_load_error() -> None:
     assert exc_info.value.__cause__ is original
 
 
-def test_strain_plotter_displays_extra_curve_arrays_and_all_trace_axes(tmp_path: Path) -> None:
-    group = zarr.open_group(tmp_path / "rv.zarr", mode="w")
-    group.create_array("data/2d_brightness_mode", data=np.zeros((1, 8, 8), dtype=np.uint8))
-    group.create_array("timestamps/2d_brightness_mode", data=np.asarray([0.0], dtype=np.float32))
-    group.create_array("data/rv_contour", data=_contours()[:1])
-    group.create_array("timestamps/rv_contour", data=np.asarray([0.0], dtype=np.float32))
-    group.create_array("data/rv_curve", data=np.asarray([0.0, -12.0], dtype=np.float32))
-    group.create_array("timestamps/rv_curve", data=np.asarray([0.0, 0.1], dtype=np.float32))
-    group.create_array(
-        "data/curve_group03_curve",
-        data=np.asarray([[[0.0, -1.0], [-2.0, -3.0], [-4.0, -5.0]]], dtype=np.float32),
-    )
-    group.create_array("timestamps/curve_group03_curve", data=np.asarray([0.0, 0.1, 0.2], dtype=np.float32))
-    group.attrs["recording_manifest"] = _strain_document(("rv",), self_recording_id="rv")
-    record = _record(
-        "rv",
-        "rv.zarr",
-        content_types=("2d_right_ventricular_strain",),
-        array_paths=(
-            "data/2d_brightness_mode",
-            "timestamps/2d_brightness_mode",
-            "data/rv_contour",
-            "timestamps/rv_contour",
-            "data/rv_curve",
-            "timestamps/rv_curve",
-            "data/curve_group03_curve",
-            "timestamps/curve_group03_curve",
-        ),
-    )
-    renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=320, dpi=100))
-
-    panels, ecg = renderer._load_specs(
-        record,
-        root=tmp_path,
-        modalities=("strain",),
-        view_mode="pre_converted",
-        show_annotations=True,
-    )
-
-    assert [panel.loaded.data_path for panel in panels[1:]] == ["data/rv_curve", "data/curve_group03_curve"]
-    group_curve = panels[-1]
-    figure = renderer.render_figure_from_specs(panels=(group_curve,), ecg=ecg, time_s=0.1, frame_index=0, dpi=100)
-    try:
-        traces = [line for line in figure.axes[0].lines if np.asarray(line.get_xdata()).size == 3]
-        assert len(traces) == 2
-    finally:
-        plt.close(figure)
-
-
 def test_strain_plotter_opens_external_lv_panels_by_default(tmp_path: Path) -> None:
     for index, role in enumerate(("2ch", "3ch", "4ch"), start=1):
         source = zarr.open_group(tmp_path / f"{role}.zarr", mode="w")
@@ -186,11 +137,7 @@ def test_strain_plotter_opens_external_lv_panels_by_default(tmp_path: Path) -> N
 
     assert [panel.loaded.attrs["strain_role_id"] for panel in panels[:3]] == ["2ch", "3ch", "4ch"]
     assert [int(panel.loaded.data[0, 0, 0]) for panel in panels[:3]] == [1, 2, 3]
-    assert [panel.loaded.data_path for panel in panels[3:]] == [
-        "data/2ch_curve",
-        "data/3ch_curve",
-        "data/4ch_curve",
-    ]
+    assert [panel.loaded.data_path for panel in panels[3:]] == ["data/strain_curves"]
     assert all("annotation_overlays" not in panel.loaded.attrs for panel in panels[:3])
 
 

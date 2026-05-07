@@ -402,7 +402,7 @@ def _strain_curve_specs(
     selected_panels: tuple[StrainPanel, ...],
     modalities: tuple[str, ...] | None,
 ) -> tuple[PanelSpec, ...]:
-    include_all = _include_all_strain_curves(modalities)
+    include_all = _has_generic_strain_modality(modalities)
     selected_roles = {panel.role_id for panel in selected_panels}
     requested_paths = _requested_curve_paths(modalities)
     specs: list[PanelSpec] = []
@@ -424,19 +424,52 @@ def _strain_curve_specs(
             specs.append(spec)
             seen.add(data_path)
     for data_path in _strain_curve_data_paths(store):
+        role_id = _role_from_curve_path(data_path)
         if data_path in seen or not _should_include_strain_curve(
             data_path,
-            _role_from_curve_path(data_path),
+            role_id,
             include_all=include_all,
             selected_roles=selected_roles,
             requested_paths=requested_paths,
         ):
             continue
-        spec = _strain_curve_spec(store, data_path, role_id=_role_from_curve_path(data_path), annotation=None)
+        spec = _strain_curve_spec(store, data_path, role_id=role_id, annotation=None)
         if spec is not None:
             specs.append(spec)
             seen.add(data_path)
-    return tuple(specs)
+    return _combined_strain_curve_specs(tuple(specs)) if include_all else tuple(specs)
+
+
+def _combined_strain_curve_specs(specs: tuple[PanelSpec, ...]) -> tuple[PanelSpec, ...]:
+    if len(specs) < 2:
+        return specs
+    curves = [_mean_curve(np.asarray(spec.loaded.data)) for spec in specs]
+    size = max((curve.size for curve in curves), default=0)
+    if size == 0:
+        return ()
+    data = np.full((size, len(curves)), np.nan, dtype=np.float32)
+    for index, curve in enumerate(curves):
+        data[: curve.size, index] = curve
+    timestamps = next((spec.loaded.timestamps for spec in specs if spec.loaded.timestamps is not None), None)
+    timestamps = None if timestamps is None or np.asarray(timestamps).size != size else np.asarray(timestamps)
+    loaded = replace(
+        specs[0].loaded,
+        name="strain_curves",
+        data_path="data/strain_curves",
+        data=data,
+        timestamps_path=None,
+        timestamps=timestamps,
+        attrs={**dict(specs[0].loaded.attrs), "strain_curve_combined": True},
+    )
+    return (replace(specs[0], loaded=loaded, label="strain"),)
+
+
+def _mean_curve(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim <= 1:
+        return arr.reshape(-1)
+    with np.errstate(invalid="ignore"):
+        return np.asarray(np.nanmean(arr.reshape(arr.shape[0], -1), axis=1), dtype=np.float32)
 
 
 def _strain_curve_spec(
@@ -793,7 +826,7 @@ def _has_defined_points(points: np.ndarray) -> bool:
     return bool(np.any(np.all(np.isfinite(arr[..., :2]), axis=-1)))
 
 
-def _include_all_strain_curves(modalities: tuple[str, ...] | None) -> bool:
+def _has_generic_strain_modality(modalities: tuple[str, ...] | None) -> bool:
     if modalities is None:
         return True
     return any(
@@ -825,7 +858,11 @@ def _should_include_strain_curve(
     selected_roles: set[str],
     requested_paths: set[str],
 ) -> bool:
-    return include_all or data_path in requested_paths or bool(role_id and role_id in selected_roles)
+    return (
+        data_path in requested_paths
+        or bool(role_id and role_id in selected_roles)
+        or (include_all and not selected_roles)
+    )
 
 
 def _role_from_curve_path(data_path: str) -> str:
