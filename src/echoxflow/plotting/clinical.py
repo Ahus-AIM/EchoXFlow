@@ -65,7 +65,7 @@ def _clinical_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: Lo
     velocity_geometry = _geometry(velocity)
     power_geometry = _geometry(power)
     bmode_data = np.asarray(bmode.data)
-    timeline_source, timeline_timestamps = _clinical_timeline_source(bmode, velocity, power)
+    _, timeline_timestamps = _clinical_timeline_source(bmode, velocity, power)
     grid = CartesianGrid.from_sector_height(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]))
     frames = []
     for index, time_s in enumerate(timeline_timestamps):
@@ -117,7 +117,7 @@ def _clinical_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: Lo
             )
         )
     return _clinical_loaded(
-        source=timeline_source,
+        source=bmode,
         name="clinical_color_doppler",
         data=np.asarray(frames, dtype=np.float32),
         label_path="data/clinical_color_doppler",
@@ -401,12 +401,3 @@ def _frame_at_time(loaded: LoadedArray, time_s: float, *, fallback_index: int) -
         return _frame_at(data, fallback_index)
     index = int(np.argmin(np.abs(timestamps - float(time_s))))
     return _frame_at(data, index)
-
-
-def _frame_time(loaded: LoadedArray, index: int) -> float:
-    if loaded.timestamps is None:
-        return float(index)
-    timestamps = np.asarray(loaded.timestamps, dtype=np.float64).reshape(-1)
-    if timestamps.size == 0:
-        return float(index)
-    return float(timestamps[int(np.clip(index, 0, timestamps.size - 1))])
