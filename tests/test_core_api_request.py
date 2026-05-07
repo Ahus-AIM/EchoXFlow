@@ -410,24 +410,33 @@ def test_packed_mesh_annotation_loader_exposes_grouped_frame_views(tmp_path: Pat
 
 
 def test_spectral_metadata_extracts_cursor_baseline_and_velocity_axis(tmp_path: Path) -> None:
-    group = zarr.open_group(tmp_path / "case.zarr", mode="w")
-    group.create_array("data/1d_pulsed_wave_doppler", data=np.zeros((3, 5), dtype=np.float32))
-    group.attrs["recording_manifest"] = {
-        "manifest_type": "2d",
-        "tracks": [{"semantic_id": "1d_pulsed_wave_doppler"}],
-        "spectral_metadata": {
-            "cursor_box": [1, 2, 3, 4],
-            "baseline_row": 2,
-            "nyquist_limit_mps": 1.0,
-        },
-    }
+    for stream_name, semantic_id in (
+        ("1d_pulsed_wave_doppler", "pulsed_wave"),
+        ("1d_pulsed_wave_doppler", "pulsed_wave_doppler"),
+        ("1d_continuous_wave_doppler", "continuous_wave"),
+        ("1d_continuous_wave_doppler", "continuous_wave_doppler"),
+    ):
+        group = zarr.open_group(tmp_path / f"{semantic_id}.zarr", mode="w")
+        group.create_array(f"data/{stream_name}", data=np.zeros((3, 5), dtype=np.float32))
+        group.attrs["recording_manifest"] = {
+            "manifest_type": "2d",
+            "tracks": [
+                {
+                    "semantic_id": semantic_id,
+                    "cursor_box": [1, 2, 3, 4],
+                    "baseline_row": 2,
+                    "nyquist_limit_mps": 1.0,
+                }
+            ],
+        }
+        store = open_recording(tmp_path / f"{semantic_id}.zarr")
+        metadata = store.spectral_metadata(stream_name)
+        loaded_metadata = store.load_modality(stream_name).attrs["spectral_metadata"]
 
-    metadata = open_recording(tmp_path / "case.zarr").spectral_metadata("1d_pulsed_wave_doppler")
-
-    assert metadata.cursor_box is not None
-    assert metadata.baseline_row == 2.0
-    assert metadata.row_velocity_mps is not None
-    assert metadata.row_velocity_mps.tolist() == [1.0, 0.5, 0.0, -0.5, -1.0]
+        assert metadata.cursor_box is not None
+        assert isinstance(loaded_metadata, type(metadata))
+        assert loaded_metadata.baseline_row == 2.0
+        np.testing.assert_allclose(loaded_metadata.row_velocity_mps, [1.0, 0.5, 0.0, -0.5, -1.0])
 
 
 def test_sector_resampling_and_beamspace_rasterization() -> None:

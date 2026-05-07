@@ -76,13 +76,6 @@ def _attach_annotation_overlay(
             logger.warning("could not load mesh annotation: %s", exc)
         except (TypeError, ValueError) as exc:
             logger.warning("could not parse mesh annotation: %s", exc)
-    if loaded.name.startswith("1d_"):
-        try:
-            attrs["spectral_metadata"] = store.spectral_metadata(loaded.name)
-        except (FileNotFoundError, KeyError) as exc:
-            logger.warning("could not load spectral metadata for `%s`: %s", loaded.name, exc)
-        except (TypeError, ValueError) as exc:
-            logger.warning("could not parse spectral metadata for `%s`: %s", loaded.name, exc)
     return replace(loaded, attrs=attrs) if attrs != dict(loaded.attrs) else loaded
 
 

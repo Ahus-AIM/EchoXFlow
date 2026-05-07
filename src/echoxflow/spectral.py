@@ -58,9 +58,10 @@ def spectral_metadata_from_attrs(
 def _spectral_document(data_path: str, group_attrs: Mapping[str, Any]) -> Mapping[str, Any] | None:
     name = data_path.strip("/").removeprefix("data/")
     candidates = {name}
-    if name in {"1d_pulsed_wave_doppler", "1d_continuous_wave_doppler"}:
-        candidates.add("spectral_doppler")
-        candidates.add("pw_doppler" if name == "1d_pulsed_wave_doppler" else "cw_doppler")
+    if name == "1d_pulsed_wave_doppler":
+        candidates.update(("spectral_doppler", "pw_doppler", "pulsed_wave", "pulsed_wave_doppler"))
+    elif name == "1d_continuous_wave_doppler":
+        candidates.update(("spectral_doppler", "cw_doppler", "continuous_wave", "continuous_wave_doppler"))
     for document in _manifest_documents(group_attrs):
         for key in ("spectral_metadata", "spectral", "doppler_spectrum"):
             value = document.get(key)
