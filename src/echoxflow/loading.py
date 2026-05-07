@@ -130,21 +130,16 @@ class RecordingStore:
 
     def load_modality(self, name: str) -> LoadedArray:
         """Load a data array plus matching timestamps and inferred sample rate."""
-        stream = self._display_stream(self.load_stream(name))
-        return LoadedArray(
-            name=stream.name,
-            data_path=stream.data_path,
-            data=stream.data,
-            timestamps_path=stream.timestamps_path,
-            timestamps=stream.timestamps,
-            sample_rate_hz=stream.sample_rate_hz,
-            attrs=_stream_attrs(stream.metadata),
-            stream=stream,
-        )
+        return self._loaded_array(self._display_stream(self.load_stream(name)))
 
     def load_modality_slice(self, name: str, start: int | None, stop: int | None) -> LoadedArray:
         """Load a temporal slice of a modality array plus matching timestamp slice."""
-        stream = self._display_stream(self.load_stream_slice(name, start, stop))
+        return self._loaded_array(self._display_stream(self.load_stream_slice(name, start, stop)))
+
+    def _loaded_array(self, stream: EchoStream) -> LoadedArray:
+        attrs = _stream_attrs(stream.metadata)
+        if stream.name.startswith("1d_"):
+            attrs["spectral_metadata"] = self.spectral_metadata(stream.name)
         return LoadedArray(
             name=stream.name,
             data_path=stream.data_path,
@@ -152,7 +147,7 @@ class RecordingStore:
             timestamps_path=stream.timestamps_path,
             timestamps=stream.timestamps,
             sample_rate_hz=stream.sample_rate_hz,
-            attrs=_stream_attrs(stream.metadata),
+            attrs=attrs,
             stream=stream,
         )
 
