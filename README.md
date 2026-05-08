@@ -8,7 +8,7 @@
   <a href="https://huggingface.co/datasets/Ahus-AIM/EchoXFlow">
     <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Dataset-FFD21E">
   </a>
-  <a href="#">
+  <a href="http://arxiv.org/abs/2605.05447">
     <img src="https://img.shields.io/badge/arXiv-Paper-B31B1B?logo=arxiv&logoColor=white">
   </a>
   <a href="https://github.com/Ahus-AIM/EchoXFlow/actions/workflows/ci.yml">
