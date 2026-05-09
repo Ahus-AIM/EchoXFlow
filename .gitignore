@@ -20,5 +20,16 @@ plan.md
 request_to_echoxflow_devs.md
 docs/
 
+scripts/evaluate_tissue_doppler_roi_loss.py
+scripts/extract_example_scan_converted_images.py
+scripts/extract_example_strips.py
+scripts/plot_ecg_alignment_concept.py
+scripts/plot_one_ecg_per_exam.py
+scripts/plot_paper_3d_lv_mesh.py
+scripts/plot_paper_3d_lv_volume_curve.py
+scripts/plot_paper_segmentation_and_strain.py
+scripts/plot_task_predictions.py
+scripts/plot_tissue_doppler_roi_velocities.py
+
 tmp_plot_api_debug_outputs/*
 !tmp_plot_api_debug_outputs/.gitkeep
