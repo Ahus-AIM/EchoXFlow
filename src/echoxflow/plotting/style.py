@@ -16,6 +16,7 @@ class PlotStyle:
     panel_facecolor: str = "#222222"
     text_color: str = "#E6E6E6"
     text_dim_color: str = "#787878"
+    grid_color: str = "#303030"
     ecg_trace_color: str = "#4AC44A"
     ecg_marker_color: str = "#FF6060"
     cursor_color: str = "#FF6060"
@@ -28,6 +29,7 @@ class PlotStyle:
     color_doppler_extent_linewidth: float = 1.2
     show_color_doppler_extent: bool = True
     annotation_color: str = "#00D5FF"
+    annotation_secondary_color: str = "#FF9F0A"
     annotation_edge_color: str = "#000000"
     annotation_linewidth: float = 1.1
     annotation_markersize: float = 4.0
@@ -59,6 +61,7 @@ class PlotStyle:
             panel_facecolor=rgb_to_hex(colors.theme["panel_bg"]),
             text_color=rgb_to_hex(colors.theme["text_primary"]),
             text_dim_color=rgb_to_hex(colors.theme["text_dim"]),
+            grid_color=rgb_to_hex(colors.ecg["grid"]),
             ecg_trace_color=rgb_to_hex(colors.ecg["trace"]),
             ecg_marker_color=rgb_to_hex(colors.ecg["marker"]),
             cursor_color=rgb_to_hex(colors.ecg["marker"]),

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import matplotlib
 
@@ -1213,7 +1213,7 @@ def _ecg_marker_times(panels: tuple[PanelSpec, ...], time_s: float, frame_index:
             continue
         count = temporal_length(panel.loaded.data)
         resolved_index = nearest_index(panel.loaded.timestamps, time_s, count=count, fallback_index=frame_index)
-        return values[min(max(0, resolved_index), values.shape[0] - 1)]
+        return cast(np.ndarray, values[min(max(0, resolved_index), values.shape[0] - 1)])
     return None
 
 
