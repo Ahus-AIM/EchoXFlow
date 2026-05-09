@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from tasks.utils.models.unet import TaskModel
 from tasks.utils.training.loss import masked_color_doppler_loss_terms, masked_velocity_band_l1_loss
+
+if TYPE_CHECKING:
+    from tasks.utils.models.unet import TaskModel
 
 
 def segmentation_val_metrics(model: TaskModel, sample: object, config: object) -> dict[str, Tensor]:

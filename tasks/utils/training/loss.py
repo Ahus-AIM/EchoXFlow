@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import Tensor, nn
 
-from tasks.utils.models.unet import TaskModel
+if TYPE_CHECKING:
+    from tasks.utils.models.unet import TaskModel
 
 
 def segmentation_loss_terms(model: TaskModel, sample: object, config: object) -> dict[str, Tensor]:
