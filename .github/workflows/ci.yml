@@ -22,6 +22,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
+          version: "0.10.8"
           enable-cache: true
 
       - name: Check lockfile
