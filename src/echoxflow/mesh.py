@@ -29,15 +29,12 @@ class PackedMeshAnnotation:
     points: np.ndarray
     faces_path: str
     faces: np.ndarray
-    point_frame_offsets_path: str | None = None
     point_frame_offsets: np.ndarray | None = None
-    face_frame_offsets_path: str | None = None
     face_frame_offsets: np.ndarray | None = None
     point_component_offsets_path: str | None = None
     point_component_offsets: np.ndarray | None = None
     face_component_offsets_path: str | None = None
     face_component_offsets: np.ndarray | None = None
-    point_values_path: str | None = None
     point_values: np.ndarray | None = None
     face_values_path: str | None = None
     face_values: np.ndarray | None = None
@@ -53,11 +50,6 @@ class PackedMeshAnnotation:
         if self.timestamps is not None:
             return int(self.timestamps.size)
         return 1 if self.points.size or self.faces.size else 0
-
-    @property
-    def frame_offsets(self) -> np.ndarray | None:
-        """Backward-compatible alias for point frame offsets."""
-        return self.point_frame_offsets
 
     def frame(self, index: int) -> MeshFrame:
         """Return points, faces, values, and timestamp for one mesh frame."""
@@ -144,15 +136,12 @@ def load_packed_mesh_annotation(
         points=points,
         faces_path=faces_path,
         faces=faces,
-        point_frame_offsets_path=point_offsets_path,
         point_frame_offsets=point_frame_offsets,
-        face_frame_offsets_path=face_offsets_path,
         face_frame_offsets=face_frame_offsets,
         point_component_offsets_path=point_component_offsets_path,
         point_component_offsets=point_component_offsets,
         face_component_offsets_path=face_component_offsets_path,
         face_component_offsets=face_component_offsets,
-        point_values_path=values_path,
         point_values=point_values,
         face_values_path=face_values_path,
         face_values=face_values,

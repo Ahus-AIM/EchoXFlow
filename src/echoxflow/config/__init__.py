@@ -17,7 +17,6 @@ DATA_ROOT_ENV = "ECHOXFLOW_DATA_ROOT"
 @dataclass(frozen=True)
 class DatasetConfig:
     name: str
-    version: str
 
 
 @dataclass(frozen=True)
@@ -28,7 +27,6 @@ class DataConfig:
 @dataclass(frozen=True)
 class OutputConfig:
     root: Path
-    temp: Path
 
 
 @dataclass(frozen=True)
@@ -96,12 +94,9 @@ def load_settings(path: str | Path | None = None) -> EchoXFlowSettings:
     data = _mapping(raw, "data")
     output = _mapping(raw, "output")
     return EchoXFlowSettings(
-        dataset=DatasetConfig(name=_string(dataset, "name"), version=_string(dataset, "version")),
+        dataset=DatasetConfig(name=_string(dataset, "name")),
         data=DataConfig(root=_path(_string(data, "root"), base_dir=base_dir)),
-        output=OutputConfig(
-            root=_path(_string(output, "root"), base_dir=base_dir),
-            temp=_path(_string(output, "temp"), base_dir=base_dir),
-        ),
+        output=OutputConfig(root=_path(_string(output, "root"), base_dir=base_dir)),
         raw=raw,
     )
 

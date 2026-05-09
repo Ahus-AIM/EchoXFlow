@@ -8,6 +8,9 @@ from typing import Any
 
 import numpy as np
 
+FULL_WINDOW_START_FRACTION = 0.10
+FULL_WINDOW_END_FRACTION = 0.90
+
 
 @dataclass(frozen=True)
 class StitchedVolumeStack:
@@ -17,6 +20,14 @@ class StitchedVolumeStack:
     timestamps: np.ndarray | None
     stitch_beat_count: int
     was_stitched: bool
+    source_timestamps: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _BeatTimeSamples:
+    indices: np.ndarray
+    elapsed_s: np.ndarray
+    duration_s: float
 
 
 def prepare_3d_brightness_for_display(
@@ -28,21 +39,19 @@ def prepare_3d_brightness_for_display(
     arr = np.asarray(volumes)
     if arr.ndim != 4:
         raise ValueError(f"Expected 3D brightness mode with shape [T,E,A,R], got {arr.shape}")
-    source_timestamps = None if timestamps is None else np.asarray(timestamps, dtype=np.float64).reshape(-1)
     relative_timestamps = relative_volume_timestamps(timestamps, metadata)
     beat_count = _stitch_beat_count(metadata)
-    qrs = _qrs_trigger_times(metadata)
-    if source_timestamps is None or relative_timestamps is None or beat_count <= 1 or qrs.size < 2:
+    qrs = relative_qrs_trigger_times(metadata)
+    if relative_timestamps is None or beat_count <= 1 or qrs.size < 2:
         return StitchedVolumeStack(
             volumes=arr,
             timestamps=relative_timestamps,
             stitch_beat_count=beat_count,
             was_stitched=False,
         )
-    stitch_timestamps = _best_stitching_timestamps(source_timestamps, relative_timestamps, qrs, beat_count)
-    stitched_volumes, stitched_timestamps = stitch_3d_brightness_beats(
+    stitched_volumes, stitched_timestamps, source_timestamps = _stitch_3d_brightness_beats_with_sources(
         arr,
-        stitch_timestamps,
+        relative_timestamps,
         qrs,
         stitch_beat_count=beat_count,
         output_timestamps=relative_timestamps,
@@ -53,6 +62,7 @@ def prepare_3d_brightness_for_display(
         timestamps=stitched_timestamps if was_stitched else relative_timestamps,
         stitch_beat_count=beat_count,
         was_stitched=was_stitched,
+        source_timestamps=source_timestamps,
     )
 
 
@@ -69,13 +79,9 @@ def relative_volume_timestamps(
     origin = _volume_time_origin_s(metadata)
     if origin is None:
         return ts
-    shifted = ts - origin
-    if _looks_absolute(ts, origin):
-        return shifted
-    qrs = _qrs_trigger_times(metadata)
-    if qrs.size < 2:
+    if _time_reference_basis(metadata) == "relative_to_volume_origin" and not _starts_at_or_after_origin(ts, origin):
         return ts
-    return shifted if _timeline_overlap_score(shifted, qrs) >= _timeline_overlap_score(ts, qrs) else ts
+    return ts - origin if _starts_at_or_after_origin(ts, origin) else ts
 
 
 def relative_qrs_trigger_times(metadata: Mapping[str, Any] | None) -> np.ndarray:
@@ -84,10 +90,9 @@ def relative_qrs_trigger_times(metadata: Mapping[str, Any] | None) -> np.ndarray
     origin = _volume_time_origin_s(metadata)
     if origin is None or qrs.size == 0:
         return qrs
-    shifted = qrs - origin
-    if _looks_absolute(qrs, origin):
-        return shifted
-    return shifted if _timeline_overlap_score(shifted, qrs) >= _timeline_overlap_score(qrs, qrs) else qrs
+    if _time_reference_basis(metadata) == "relative_to_volume_origin":
+        return qrs
+    return qrs - origin if _starts_at_or_after_origin(qrs, origin) else qrs
 
 
 def mesh_frame_indices_for_volume_timestamps(
@@ -134,7 +139,22 @@ def stitch_3d_brightness_beats(
     stitch_beat_count: int,
     output_timestamps: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Stitch gated 3D sub-volumes along elevation using QRS-delimited beats."""
+    """Stitch gated 3D sub-volumes along the lowest-resolution spatial axis."""
+    stitched, stitched_timestamps, _ = _stitch_3d_brightness_beats_with_sources(
+        volumes, timestamps, qrs_trigger_times, stitch_beat_count=stitch_beat_count, output_timestamps=output_timestamps
+    )
+    return stitched, stitched_timestamps
+
+
+def _stitch_3d_brightness_beats_with_sources(
+    volumes: np.ndarray,
+    timestamps: np.ndarray,
+    qrs_trigger_times: np.ndarray,
+    *,
+    stitch_beat_count: int,
+    output_timestamps: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Stitch volumes and return source ECG times for each displayed slab."""
     arr = np.asarray(volumes)
     ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
     qrs = np.sort(np.asarray(qrs_trigger_times, dtype=np.float64).reshape(-1))
@@ -143,54 +163,140 @@ def stitch_3d_brightness_beats(
     if arr.ndim != 4:
         raise ValueError(f"Expected 3D brightness mode with shape [T,E,A,R], got {arr.shape}")
     if beat_count <= 1 or qrs.size < 2 or ts.size != arr.shape[0]:
-        return arr, ts
+        return arr, ts, None
     output_ts = None if output_timestamps is None else np.asarray(output_timestamps, dtype=np.float64).reshape(-1)
     if output_ts is None or output_ts.size != ts.size:
         output_ts = ts
 
-    beat_buffers = _beat_buffers(ts, qrs, beat_count)
+    aligned_groups = _time_aligned_groups(ts, qrs, beat_count)
+    if not aligned_groups:
+        return arr, ts, None
 
-    if sum(1 for buffer in beat_buffers if buffer) < beat_count:
-        return arr, ts
-    min_len = min(len(buffer) for buffer in beat_buffers)
-    if min_len <= 0:
-        return arr, ts
+    stitch_axis = _lowest_resolution_spatial_axis(arr)
+    stitch_offset = _best_antisymmetric_cyclic_rotation(arr, aligned_groups, stitch_axis, beat_count)
+    stitched_frames = []
+    stitched_timestamps = []
+    source_timestamps = []
+    for start_index, indices in aligned_groups:
+        beat_order = _antisymmetric_cyclic_order(start_index, beat_count, stitch_offset)
+        for pos in range(len(indices[0])):
+            source_indices = [indices[beat_index][pos] for beat_index in beat_order]
+            stitched_frames.append(
+                np.concatenate(
+                    [arr[source_index] for source_index in source_indices],
+                    axis=stitch_axis,
+                )
+            )
+            stitched_timestamps.append(float(output_ts[indices[0][pos]]))
+            source_timestamps.append([float(output_ts[source_index]) for source_index in source_indices])
+    return np.stack(stitched_frames, axis=0), np.asarray(stitched_timestamps), np.asarray(source_timestamps)
 
-    stitched_frames = [
-        np.concatenate([arr[beat_buffers[beat_index][pos]] for beat_index in range(beat_count)], axis=0)
-        for pos in range(min_len)
+
+def _time_aligned_groups(timestamps: np.ndarray, qrs: np.ndarray, beat_count: int):
+    return _collect_time_aligned_groups(timestamps, qrs, beat_count, require_full=True)
+
+
+def _collect_time_aligned_groups(timestamps, qrs, beat_count, *, require_full):
+    groups = []
+    start_index = 0
+    while start_index <= qrs.size - beat_count:
+        aligned, is_full = _time_aligned_indices(_beat_time_samples(timestamps, qrs, start_index, beat_count))
+        if len(aligned) == beat_count and aligned[0] and (is_full or not require_full):
+            groups.append((start_index, aligned))
+            start_index += beat_count
+            continue
+        start_index += 1
+    return groups
+
+
+def _beat_time_samples(
+    timestamps: np.ndarray, qrs: np.ndarray, start_index: int, beat_count: int
+) -> list[_BeatTimeSamples]:
+    samples: list[_BeatTimeSamples] = []
+    for beat_index in range(beat_count):
+        start = float(qrs[start_index + beat_index])
+        stop_index = start_index + beat_index + 1
+        stop = float(qrs[stop_index]) if stop_index < qrs.size else _final_stop(timestamps, start)
+        duration = stop - start
+        if duration <= 0.0:
+            return []
+        frame_indices = np.where((timestamps >= start) & (timestamps < stop))[0]
+        samples.append(
+            _BeatTimeSamples(
+                indices=frame_indices.astype(np.int64, copy=False),
+                elapsed_s=np.asarray(timestamps[frame_indices] - start, dtype=np.float64),
+                duration_s=duration,
+            )
+        )
+    return samples
+
+
+def _time_aligned_indices(samples: list[_BeatTimeSamples]) -> tuple[list[list[int]], bool]:
+    if not samples or any(sample.indices.size == 0 for sample in samples):
+        return [], False
+    elapsed = [sample.elapsed_s for sample in samples]
+    lower = max(float(values[0]) for values in elapsed)
+    upper = min(float(values[-1]) for values in elapsed)
+    if upper + 1e-6 < lower:
+        return [[] for _ in samples], False
+    in_range = [(values >= lower - 1e-6) & (values <= upper + 1e-6) for values in elapsed]
+    target_times = elapsed[int(np.argmin([np.count_nonzero(mask) for mask in in_range]))][
+        in_range[int(np.argmin([np.count_nonzero(mask) for mask in in_range]))]
     ]
-    stitched_timestamps = [float(output_ts[beat_buffers[0][pos]]) for pos in range(min_len)]
-    return np.stack(stitched_frames, axis=0), np.asarray(stitched_timestamps, dtype=np.float64)
+    if target_times.size == 0:
+        return [[] for _ in samples], False
+    aligned: list[list[int]] = []
+    for sample, values in zip(samples, elapsed, strict=True):
+        nearest = np.abs(values[:, None] - target_times[None, :]).argmin(axis=0)
+        aligned.append([int(index) for index in sample.indices[nearest]])
+    shortest_duration = min(sample.duration_s for sample in samples)
+    return aligned, (
+        lower <= FULL_WINDOW_START_FRACTION * shortest_duration
+        and upper >= FULL_WINDOW_END_FRACTION * shortest_duration
+    )
 
 
-def _best_stitching_timestamps(
-    source_timestamps: np.ndarray,
-    relative_timestamps: np.ndarray,
-    qrs: np.ndarray,
-    beat_count: int,
-) -> np.ndarray:
-    source_score = _beat_bucket_score(source_timestamps, qrs, beat_count)
-    relative_score = _beat_bucket_score(relative_timestamps, qrs, beat_count)
-    if relative_score > source_score:
-        return relative_timestamps
-    return source_timestamps
+def _lowest_resolution_spatial_axis(volumes: np.ndarray) -> int:
+    """Return the current metadata-free proxy for the elevation stitch axis."""
+    return int(np.argmin(np.asarray(volumes).shape[1:]))
 
 
-def _beat_bucket_score(timestamps: np.ndarray, qrs: np.ndarray, beat_count: int) -> tuple[int, int]:
-    buffers = _beat_buffers(timestamps, qrs, beat_count)
-    nonempty = sum(1 for buffer in buffers if buffer)
-    min_len = min((len(buffer) for buffer in buffers), default=0)
-    return nonempty, min_len
+def _best_antisymmetric_cyclic_rotation(volumes, groups, stitch_axis: int, beat_count: int) -> int:
+    if beat_count <= 1:
+        return 0
+    scores = []
+    for offset in range(beat_count):
+        group_scores = []
+        for start_index, indices in groups:
+            parts = [np.asarray(volumes[index_group]) for index_group in indices]
+            order = _antisymmetric_cyclic_order(start_index, beat_count, offset)
+            group_scores.append(_cyclic_rotation_seam_score(parts, stitch_axis, order))
+        scores.append((float(np.median(group_scores)), offset != 0, offset))
+    return min(scores)[2]
 
 
-def _beat_buffers(timestamps: np.ndarray, qrs: np.ndarray, beat_count: int) -> list[list[int]]:
-    beat_buffers: list[list[int]] = [list() for _ in range(beat_count)]
-    for qrs_index, start in enumerate(qrs):
-        stop = float(qrs[qrs_index + 1]) if qrs_index + 1 < qrs.size else _final_stop(timestamps, float(start))
-        frame_indices = np.where((timestamps >= float(start)) & (timestamps < stop))[0]
-        beat_buffers[qrs_index % beat_count].extend(int(index) for index in frame_indices)
-    return beat_buffers
+def _antisymmetric_cyclic_order(start_index: int, beat_count: int, offset: int) -> tuple[int, ...]:
+    return tuple(sorted(range(beat_count), key=lambda index: (start_index + index + offset) % beat_count, reverse=True))
+
+
+def _cyclic_rotation_seam_score(parts: list[np.ndarray], stitch_axis: int, order: tuple[int, ...]) -> float:
+    axis = 1 + int(stitch_axis)
+    ratios = []
+    for left_index, right_index in zip(order[:-1], order[1:], strict=True):
+        left_part = parts[left_index]
+        right_part = parts[right_index]
+        left = np.take(left_part, -1, axis=axis).astype(np.float32)
+        left_gradient = (
+            np.abs(left - np.take(left_part, -2, axis=axis).astype(np.float32)) if left_part.shape[axis] > 1 else None
+        )
+        right = np.take(right_part, 0, axis=axis).astype(np.float32)
+        gradients = [] if left_gradient is None else [left_gradient]
+        if right_part.shape[axis] > 1:
+            gradients.append(np.abs(right - np.take(right_part, 1, axis=axis).astype(np.float32)))
+        seam = np.abs(left - right)
+        reference = np.concatenate([gradient.reshape(-1) for gradient in gradients]) if gradients else seam.reshape(-1)
+        ratios.append(float(np.median(seam)) / (float(np.median(reference)) + 1e-6))
+    return float(np.median(ratios) + 0.25 * max(ratios))
 
 
 def _mesh_frame_count(mesh_timestamps: np.ndarray | None, mesh_frame_count: int | None) -> int:
@@ -210,21 +316,8 @@ def _target_frame_count(volume_timestamps: np.ndarray | None, target_count: int 
 
 
 def _relative_timestamps(timestamps: np.ndarray | None, metadata: Mapping[str, Any] | None) -> np.ndarray:
-    if timestamps is None:
-        return np.asarray([], dtype=np.float64)
-    values = np.asarray(timestamps, dtype=np.float64).reshape(-1)
-    if values.size == 0:
-        return values
-    origin = _volume_time_origin_s(metadata)
-    if origin is None:
-        return values
-    shifted = values - origin
-    if _looks_absolute(values, origin):
-        return shifted
-    qrs = relative_qrs_trigger_times(metadata)
-    if qrs.size < 2:
-        return values
-    return shifted if _timeline_overlap_score(shifted, qrs) >= _timeline_overlap_score(values, qrs) else values
+    values = relative_volume_timestamps(timestamps, metadata)
+    return np.asarray([], dtype=np.float64) if values is None else values
 
 
 def _mesh_sample_time_for_volume_time(*, mesh_times: np.ndarray, current_t: float, qrs: np.ndarray) -> float:
@@ -305,15 +398,10 @@ def _qrs_trigger_times(metadata: Mapping[str, Any] | None) -> np.ndarray:
 
 
 def _volume_time_origin_s(metadata: Mapping[str, Any] | None) -> float | None:
-    if metadata is None:
+    reference = _time_reference(metadata)
+    if reference is None:
         return None
-    public_metadata = metadata.get("metadata")
-    reference = public_metadata.get("time_reference") if isinstance(public_metadata, Mapping) else None
-    if not isinstance(reference, Mapping):
-        reference = metadata.get("volume_time_reference")
-    if not isinstance(reference, Mapping):
-        return None
-    raw = reference.get("volume_time_origin_s")
+    raw = reference.get("volume_time_origin_s", reference.get("origin_s"))
     if raw is None:
         return None
     try:
@@ -323,19 +411,25 @@ def _volume_time_origin_s(metadata: Mapping[str, Any] | None) -> float | None:
     return value if np.isfinite(value) else None
 
 
-def _looks_absolute(timestamps: np.ndarray, origin: float) -> bool:
-    finite = timestamps[np.isfinite(timestamps)]
-    return bool(finite.size and np.nanmin(finite) >= origin - 1.0)
+def _time_reference(metadata: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if metadata is None:
+        return None
+    public_metadata = metadata.get("metadata")
+    reference = public_metadata.get("time_reference") if isinstance(public_metadata, Mapping) else None
+    if not isinstance(reference, Mapping):
+        reference = metadata.get("volume_time_reference")
+    return reference if isinstance(reference, Mapping) else None
 
 
-def _timeline_overlap_score(timestamps: np.ndarray, qrs: np.ndarray) -> float:
+def _time_reference_basis(metadata: Mapping[str, Any] | None) -> str | None:
+    reference = _time_reference(metadata)
+    raw = None if reference is None else reference.get("basis")
+    return str(raw).strip().lower() if raw is not None else None
+
+
+def _starts_at_or_after_origin(timestamps: np.ndarray, origin: float) -> bool:
     finite = timestamps[np.isfinite(timestamps)]
-    qrs_finite = qrs[np.isfinite(qrs)]
-    if finite.size == 0 or qrs_finite.size == 0:
-        return 0.0
-    start = max(float(finite[0]), float(qrs_finite[0]))
-    stop = min(float(finite[-1]), float(qrs_finite[-1]))
-    return max(0.0, stop - start)
+    return bool(finite.size and float(np.nanmin(finite)) >= origin - 1e-6)
 
 
 def _final_stop(timestamps: np.ndarray, start: float) -> float:

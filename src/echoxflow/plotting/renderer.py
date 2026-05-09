@@ -228,7 +228,13 @@ class RecordingPlotRenderer:
             _set_ecg_xlim(ax, ecg)
         if show_ecg:
             ecg_ax = figure.add_subplot(grid[total_rows - 1, :])
-            render_ecg(ecg_ax, ecg, time_s=time_s, style=self.style)
+            render_ecg(
+                ecg_ax,
+                ecg,
+                time_s=time_s,
+                style=self.style,
+                marker_times=_ecg_marker_times(panels, time_s, frame_index),
+            )
             _set_ecg_xlim(ecg_ax, ecg)
         figure.tight_layout(pad=0.8)
         return figure
@@ -1084,14 +1090,13 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
         "3d_stitch_beat_count": acquisition_stitch_beat_count,
         "3d_was_beat_stitched": prepared.was_stitched,
     }
-    if view == "pre_converted":
-        attrs["data_layout_axes"] = ("T", "E", "A", "R")
-        attrs["data_layout_shape"] = tuple(int(size) for size in prepared.volumes.shape)
+    if prepared.source_timestamps is not None:
+        attrs["ecg_marker_timestamps"] = prepared.source_timestamps
     mesh_annotation = attrs.get("mesh_annotation")
     if view == "clinical" and isinstance(mesh_annotation, PackedMeshAnnotation):
         try:
             geometry = spherical_geometry_from_metadata(raw)
-            attrs["mosaic_annotation_lines"] = mesh_mosaic_annotation_lines(
+            lines = mesh_mosaic_annotation_lines(
                 mesh_annotation,
                 geometry,
                 frame_count=int(mosaic.shape[0]),
@@ -1100,6 +1105,8 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
                 volume_timestamps=prepared.timestamps,
                 metadata=raw,
             )
+            if any(lines):
+                attrs["mosaic_annotation_lines"] = lines
         except (KeyError, TypeError, ValueError, IndexError):
             pass
     return _panel_spec(
@@ -1194,6 +1201,22 @@ def _set_ecg_xlim(ax: Axes, ecg: TraceSpec) -> None:
         ax.set_xlim(start, end)
 
 
+def _ecg_marker_times(panels: tuple[PanelSpec, ...], time_s: float, frame_index: int) -> np.ndarray | None:
+    for panel in panels:
+        marker_times = panel.loaded.attrs.get("ecg_marker_timestamps")
+        if marker_times is None:
+            continue
+        values = np.asarray(marker_times, dtype=np.float64)
+        if values.ndim == 1:
+            return values
+        if values.ndim != 2 or values.shape[0] == 0:
+            continue
+        count = temporal_length(panel.loaded.data)
+        resolved_index = nearest_index(panel.loaded.timestamps, time_s, count=count, fallback_index=frame_index)
+        return values[min(max(0, resolved_index), values.shape[0] - 1)]
+    return None
+
+
 def _ecg_trace(store: RecordingStore) -> TraceSpec:
     loaded = store.load_modality(_ecg_data_path(store))
     signal = np.asarray(loaded.data, dtype=np.float32).reshape(-1)
@@ -1222,7 +1245,7 @@ def _normalize_view_mode(view_mode: PlotViewMode | str) -> PlotViewMode:
     text = str(view_mode).strip().lower().replace("-", "_")
     if text in {"pre_converted", "preconverted", "raw"}:
         return "pre_converted"
-    if text == "clinical":
+    if text in {"clinical", "cartesian"}:
         return "clinical"
     if text == "both":
         return "both"

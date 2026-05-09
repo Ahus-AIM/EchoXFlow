@@ -45,9 +45,6 @@ class RecordingRecord:
     def path(self, root: str | Path | None = None) -> Path:
         return data_root(root) / self.zarr_path
 
-    def has_mode(self, mode: str) -> bool:
-        return mode in self.modes
-
     def has_content_type(self, content_type: str) -> bool:
         return content_type in self.content_types
 
@@ -85,14 +82,6 @@ class CroissantArrayRecord:
     shape: tuple[int, ...] = ()
     data_sha256: str | None = None
     raw: Mapping[str, Any] | None = None
-
-    @property
-    def is_data_array(self) -> bool:
-        return self.array_path.startswith("data/")
-
-    @property
-    def is_timestamp_array(self) -> bool:
-        return self.array_path.startswith("timestamps/")
 
     def temporal_count(self) -> int | None:
         if not self.shape:
