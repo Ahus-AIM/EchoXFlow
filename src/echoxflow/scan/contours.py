@@ -20,7 +20,6 @@ class ContourMaskResult:
     point_grid: np.ndarray
     endo_mask: np.ndarray
     myo_mask: np.ndarray
-    cell_areas_px2: np.ndarray
 
 
 LV_GROUP_LAYOUT = ContourGroupLayout(group_size=5, endo_index=0, outer_index=4)
@@ -64,13 +63,11 @@ def build_contour_masks(
             point_grid=point_grid,
             endo_mask=empty.copy(),
             myo_mask=empty.copy(),
-            cell_areas_px2=np.zeros((0,), dtype=np.float32),
         )
 
     endo_mask = np.zeros((height, width), dtype=bool)
     _rasterize_polygon_into(endo_mask, point_grid[:, group_layout.endo_index, :])
     myo_mask = np.zeros((height, width), dtype=bool)
-    cell_areas: list[float] = []
     start_col = min(group_layout.endo_index, group_layout.outer_index)
     stop_col = max(group_layout.endo_index, group_layout.outer_index)
     quad = np.empty((4, 2), dtype=np.float32)
@@ -80,10 +77,8 @@ def build_contour_masks(
             quad[1] = point_grid[row + 1, col]
             quad[2] = point_grid[row + 1, col + 1]
             quad[3] = point_grid[row, col + 1]
-            area = abs(_polygon_area(quad))
-            if area <= 1e-6:
+            if abs(_polygon_area(quad)) <= 1e-6:
                 continue
-            cell_areas.append(float(area))
             _rasterize_polygon_into(myo_mask, quad)
     myo_mask &= ~endo_mask
 
@@ -92,7 +87,6 @@ def build_contour_masks(
         point_grid=point_grid,
         endo_mask=endo_mask,
         myo_mask=myo_mask,
-        cell_areas_px2=np.asarray(cell_areas, dtype=np.float32),
     )
 
 

@@ -69,9 +69,24 @@ def _attach_annotation_overlay(
     attrs = dict(loaded.attrs)
     if overlays:
         attrs["annotation_overlays"] = tuple(overlays)
-    if loaded.data_path == "data/3d_brightness_mode":
+    mesh_sequences = store.load_object().mesh_sequences if loaded.data_path == "data/3d_brightness_mode" else ()
+    if mesh_sequences:
         try:
-            attrs["mesh_annotation"] = store.load_packed_mesh_annotation()
+            mesh_sequence = mesh_sequences[0]
+            mesh = store.load_packed_mesh_annotation(mesh_sequence.mesh_group.path)
+            timestamps = mesh_sequence.timestamps
+            if timestamps is not None:
+                timestamp_values = (
+                    store.group[timestamps.path][:]
+                    if timestamps.path in store.group
+                    else store.load_array(timestamps.path)
+                )
+                mesh = replace(
+                    mesh,
+                    timestamps_path=timestamps.path,
+                    timestamps=np.asarray(timestamp_values, dtype=np.float32).reshape(-1),
+                )
+            attrs["mesh_annotation"] = mesh
         except (FileNotFoundError, KeyError) as exc:
             logger.warning("could not load mesh annotation: %s", exc)
         except (TypeError, ValueError) as exc:
@@ -531,6 +546,17 @@ def mesh_mosaic_annotation_lines(
     """Build per-frame mesh intersection lines in clinical 3D mosaic pixel coordinates."""
     if view != "clinical":
         return tuple(() for _ in range(max(0, int(frame_count))))
+    if frame_count > 1:
+        volume_times = np.asarray([] if volume_timestamps is None else volume_timestamps).reshape(-1)
+        mesh_times = np.asarray([] if annotation.timestamps is None else annotation.timestamps).reshape(-1)
+        if (
+            annotation.frame_count <= 1
+            or volume_times.size < frame_count
+            or mesh_times.size < annotation.frame_count
+            or not np.any(np.isfinite(volume_times))
+            or not np.any(np.isfinite(mesh_times))
+        ):
+            return tuple(() for _ in range(max(0, int(frame_count))))
     rows, cols = 3, 4
     cell_h = max(1, int(mosaic_shape[0]) // rows)
     cell_w = max(1, int(mosaic_shape[1]) // cols)
@@ -822,95 +848,6 @@ def _segments_to_mosaic_lines(
         line[:, 1] += row * int(cell_shape[0])
         lines.append(line)
     return tuple(lines)
-
-
-def _segments_to_closed_polygons(segments: tuple[np.ndarray, ...]) -> tuple[np.ndarray, ...]:
-    prepared: list[tuple[np.ndarray, np.ndarray]] = []
-    for segment in segments:
-        pts = np.asarray(segment, dtype=np.float64).reshape(-1, 2)
-        if pts.shape[0] < 2:
-            continue
-        start = pts[0]
-        end = pts[-1]
-        if not np.all(np.isfinite(start)) or not np.all(np.isfinite(end)):
-            continue
-        if float(np.linalg.norm(end - start)) <= 1e-8:
-            continue
-        prepared.append((start, end))
-    if not prepared:
-        return ()
-
-    all_points = np.concatenate([np.stack(edge, axis=0) for edge in prepared], axis=0)
-    span = np.ptp(all_points, axis=0)
-    tolerance = max(float(np.nanmax(span)) * 1e-4, 1e-5)
-
-    vertices: dict[tuple[int, int], np.ndarray] = {}
-    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
-    for start, end in prepared:
-        start_key = _quantized_point_key(start, tolerance)
-        end_key = _quantized_point_key(end, tolerance)
-        if start_key == end_key:
-            continue
-        vertices.setdefault(start_key, start)
-        vertices.setdefault(end_key, end)
-        adjacency.setdefault(start_key, []).append(end_key)
-        adjacency.setdefault(end_key, []).append(start_key)
-        edges.add(_edge_key(start_key, end_key))
-
-    unvisited = set(edges)
-    polygons: list[np.ndarray] = []
-    while unvisited:
-        first_edge = next(iter(unvisited))
-        start, current = first_edge
-        path = [start, current]
-        unvisited.remove(first_edge)
-        previous = start
-        while current != start:
-            candidates = [
-                neighbor
-                for neighbor in adjacency.get(current, ())
-                if _edge_key(current, neighbor) in unvisited and neighbor != previous
-            ]
-            if not candidates:
-                candidates = [
-                    neighbor for neighbor in adjacency.get(current, ()) if _edge_key(current, neighbor) in unvisited
-                ]
-            if not candidates:
-                break
-            previous, current = current, candidates[0]
-            unvisited.remove(_edge_key(previous, current))
-            path.append(current)
-            if len(path) > len(edges) + 1:
-                break
-        if path[-1] != start or len(path) < 4:
-            continue
-        polygon = np.asarray([vertices[key] for key in path[:-1]], dtype=np.float32)
-        if abs(_polygon_area(polygon)) <= tolerance * tolerance:
-            continue
-        polygons.append(polygon)
-    return tuple(polygons)
-
-
-def _quantized_point_key(point: np.ndarray, tolerance: float) -> tuple[int, int]:
-    pts = np.asarray(point, dtype=np.float64).reshape(2)
-    return int(round(float(pts[0]) / tolerance)), int(round(float(pts[1]) / tolerance))
-
-
-def _edge_key(
-    start: tuple[int, int],
-    end: tuple[int, int],
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    return (start, end) if start <= end else (end, start)
-
-
-def _polygon_area(polygon: np.ndarray) -> float:
-    pts = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
-    if pts.shape[0] < 3:
-        return 0.0
-    x = pts[:, 0]
-    y = pts[:, 1]
-    return float(0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1)))
 
 
 def _mesh_points_to_render_frame(points: np.ndarray) -> np.ndarray:

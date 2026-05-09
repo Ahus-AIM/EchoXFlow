@@ -86,7 +86,6 @@ class RecordingObject:
     panels: tuple[StrainPanel, ...] = ()
     mesh_sequences: tuple[MeshSequenceRef, ...] = ()
     annotations: tuple[AnnotationRef, ...] = ()
-    raw_documents: tuple[Mapping[str, Any], ...] = ()
 
 
 def load_recording_object(
@@ -123,7 +122,6 @@ def recording_object_from_metadata(
         panels=panels,
         mesh_sequences=mesh_sequences,
         annotations=annotations,
-        raw_documents=documents,
     )
 
 
@@ -373,12 +371,3 @@ def _optional_str(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

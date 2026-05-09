@@ -163,23 +163,6 @@ def test_pre_converted_doppler_panel_omits_colorbar_by_default() -> None:
         plt.close(figure)
 
 
-def test_pre_converted_panel_draws_data_layout_legend() -> None:
-    renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
-    loaded = _loaded("2d_brightness_mode", np.zeros((2, 8, 9), dtype=np.float32), np.asarray([0.0, 0.1]))
-    pre_panel = PanelSpec(loaded=loaded, kind="image", label="B-mode", view="pre_converted")
-    clinical_panel = PanelSpec(loaded=loaded, kind="image", label="B-mode", view="clinical")
-    ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
-
-    figure = renderer.render_figure_from_specs(
-        panels=(pre_panel, clinical_panel), ecg=ecg, time_s=0.0, frame_index=0, dpi=100
-    )
-    try:
-        assert [text.get_text() for text in figure.axes[0].texts] == ["T=2, R=8, A=9"]
-        assert not figure.axes[1].texts
-    finally:
-        plt.close(figure)
-
-
 def test_color_doppler_velocity_colorbar_uses_colormap_orientation() -> None:
     spec = colorbar_spec_for_modality("data/2d_color_doppler_velocity", value_range=(-0.8, 0.8))
 
@@ -235,10 +218,12 @@ def test_plot_view_modes_build_expected_panel_sets() -> None:
 
     pre = renderer.build_panel_specs(loaded, view_mode="pre-converted")
     clinical = renderer.build_panel_specs(loaded, view_mode="clinical")
+    cartesian = renderer.build_panel_specs(loaded, view_mode="cartesian")
     both = renderer.build_panel_specs(loaded, view_mode="both")
 
     assert [panel.view for panel in pre] == ["pre_converted", "pre_converted"]
     assert [panel.view for panel in clinical] == ["clinical", "clinical"]
+    assert [panel.view for panel in cartesian] == ["clinical", "clinical"]
     assert [panel.view for panel in both] == ["pre_converted", "clinical", "clinical"]
     assert [panel.label for panel in both] == [
         "brightness mode",
@@ -805,17 +790,10 @@ def test_3d_brightness_mode_builds_single_mosaic_panel() -> None:
     assert clinical[0].loaded.data.shape[2] > 480
     assert clinical[0].view == "clinical"
 
-    ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
-    figure = renderer.render_figure_from_specs(panels=pre, ecg=ecg, time_s=0.0, frame_index=0, dpi=100)
-    try:
-        assert [text.get_text() for text in figure.axes[0].texts] == ["T=2, E=5, A=7, R=9"]
-    finally:
-        plt.close(figure)
-
 
 def test_3d_brightness_mode_panel_uses_beat_stitched_timeline() -> None:
     data = np.arange(8, dtype=np.uint8).reshape(8, 1, 1, 1)
-    timestamps = np.asarray([10.1, 10.2, 11.1, 11.2, 12.1, 12.2, 13.1, 13.2], dtype=np.float64)
+    timestamps = np.asarray([10.05, 10.95, 11.05, 11.95, 12.05, 12.95, 13.05, 13.95], dtype=np.float64)
     raw = {
         "stitch_beat_count": 4,
         "metadata": {
@@ -870,11 +848,55 @@ def test_3d_brightness_mode_panel_uses_beat_stitched_timeline() -> None:
     assert panel.loaded.attrs["3d_was_beat_stitched"] is True
     assert panel.loaded.attrs["3d_stitch_beat_count"] == 4
     assert panel.loaded.data.shape == (2, 360, 480)
-    assert np.allclose(panel.loaded.timestamps, [0.1, 0.2])
+    assert np.allclose(panel.loaded.timestamps, [0.05, 0.95])
+    np.testing.assert_allclose(
+        panel.loaded.attrs["ecg_marker_timestamps"],
+        [
+            [3.05, 2.05, 1.05, 0.05],
+            [3.95, 2.95, 1.95, 0.95],
+        ],
+        atol=1e-6,
+    )
+
+
+def test_stitched_3d_panel_draws_all_source_times_on_ecg() -> None:
+    loaded = LoadedArray(
+        name="3d_brightness_mode_mosaic",
+        data_path="data/3d_brightness_mode",
+        data=np.zeros((2, 6, 6), dtype=np.uint8),
+        timestamps_path="timestamps/3d_brightness_mode",
+        timestamps=np.asarray([0.1, 0.2], dtype=np.float64),
+        sample_rate_hz=None,
+        attrs={
+            "ecg_marker_timestamps": np.asarray(
+                [
+                    [0.1, 1.1, 2.1],
+                    [0.2, 1.2, 2.2],
+                ],
+                dtype=np.float64,
+            )
+        },
+        stream=None,
+    )
+    panel = PanelSpec(loaded=loaded, kind="image", label="brightness mode")
+    ecg = TraceSpec(signal=np.zeros(40, dtype=np.float32), timestamps=np.linspace(0.0, 3.0, 40))
+    renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
+
+    figure = renderer.render_figure_from_specs(panels=(panel,), ecg=ecg, time_s=0.2, frame_index=1, dpi=100)
+    try:
+        ecg_ax = figure.axes[-1]
+        vertical_times = [
+            float(np.asarray(line.get_xdata(), dtype=np.float64)[0])
+            for line in ecg_ax.lines
+            if np.asarray(line.get_xdata()).size == 2 and np.allclose(line.get_xdata(), line.get_xdata()[0])
+        ]
+        np.testing.assert_allclose(vertical_times, [0.2, 1.2, 2.2])
+    finally:
+        plt.close(figure)
 
 
 def test_3d_brightness_mode_panel_uses_croissant_stitch_beat_count_for_display_stitching(tmp_path: Path) -> None:
-    timestamps = np.asarray([10.1, 10.2, 11.1, 11.2, 12.1, 12.2, 13.1, 13.2], dtype=np.float64)
+    timestamps = np.asarray([10.05, 10.95, 11.05, 11.95, 12.05, 12.95, 13.05, 13.95], dtype=np.float64)
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
     group.create_array("data/3d_brightness_mode", data=np.arange(8, dtype=np.uint8).reshape(8, 1, 1, 1))
     group.create_array(
@@ -922,9 +944,8 @@ def test_3d_brightness_mode_panel_uses_croissant_stitch_beat_count_for_display_s
     assert loaded.stream.metadata.stitch_beat_count == 4
     assert panel.loaded.attrs["3d_stitch_beat_count"] == 4
     assert panel.loaded.attrs["3d_was_beat_stitched"] is True
-    assert panel.loaded.attrs["data_layout_shape"] == (2, 4, 1, 1)
     assert panel.loaded.data.shape[0] == 2
-    assert np.allclose(panel.loaded.timestamps, [0.1, 0.2])
+    assert np.allclose(panel.loaded.timestamps, [0.05, 0.95])
 
 
 def test_recording_plotter_loads_annotation_overlays_by_default(tmp_path: Path) -> None:
@@ -1430,6 +1451,97 @@ def test_3d_mesh_annotation_builds_mosaic_overlay_lines() -> None:
     assert "mosaic_annotation_lines" not in pre_panel.loaded.attrs
     assert "mosaic_annotation_lines" in clinical_panel.loaded.attrs
     assert any(line.size for line in clinical_panel.loaded.attrs["mosaic_annotation_lines"][0])
+
+
+def test_3d_mesh_arrays_without_manifest_link_do_not_attach_overlay(tmp_path: Path) -> None:
+    group = zarr.open_group(tmp_path / "case.zarr", mode="w")
+    group.create_array("data/3d_brightness_mode", data=np.zeros((2, 3, 4, 5), dtype=np.uint8))
+    group.create_array("timestamps/3d_brightness_mode", data=np.asarray([0.0, 1.0], dtype=np.float32))
+    mesh_group = group.create_group("data/3d_left_ventricle_mesh")
+    mesh_group.create_array("point_values", data=np.zeros((3, 3), dtype=np.float32))
+    mesh_group.create_array("face_values", data=np.asarray([[0, 1, 2]], dtype=np.int32))
+    group.attrs["recording_manifest"] = _three_d_manifest(linked_mesh=False)
+    store = open_recording(tmp_path / "case.zarr")
+    loaded = attach_annotation_overlays(store, (store.load_modality("3d_brightness_mode"),))[0]
+
+    assert "mesh_annotation" not in loaded.attrs
+    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="clinical")
+    assert "mosaic_annotation_lines" not in panel.loaded.attrs
+
+
+def test_explicit_3d_mesh_sequence_builds_moving_mosaic_overlay(tmp_path: Path) -> None:
+    group = zarr.open_group(tmp_path / "case.zarr", mode="w")
+    group.create_array("data/3d_brightness_mode", data=np.zeros((2, 3, 4, 5), dtype=np.uint8))
+    group.create_array("timestamps/3d_brightness_mode", data=np.asarray([0.0, 1.0], dtype=np.float32))
+    _write_mesh_group(group, frame_count=2)
+    group.create_array("mesh_times", data=np.asarray([0.0, 1.0], dtype=np.float32))
+    group.attrs["recording_manifest"] = _three_d_manifest(mesh_timestamps_path="mesh_times")
+    store = open_recording(tmp_path / "case.zarr")
+    loaded = attach_annotation_overlays(store, (store.load_modality("3d_brightness_mode"),))[0]
+
+    assert "mesh_annotation" in loaded.attrs
+    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="clinical")
+
+    assert "mosaic_annotation_lines" in panel.loaded.attrs
+    assert len(panel.loaded.attrs["mosaic_annotation_lines"]) == 2
+    assert any(line.size for line in panel.loaded.attrs["mosaic_annotation_lines"][0])
+
+
+def test_single_frame_3d_mesh_sequence_does_not_repeat_on_multi_frame_volume(tmp_path: Path) -> None:
+    group = zarr.open_group(tmp_path / "case.zarr", mode="w")
+    group.create_array("data/3d_brightness_mode", data=np.zeros((2, 3, 4, 5), dtype=np.uint8))
+    group.create_array("timestamps/3d_brightness_mode", data=np.asarray([0.0, 1.0], dtype=np.float32))
+    _write_mesh_group(group, frame_count=1)
+    group.attrs["recording_manifest"] = _three_d_manifest()
+    store = open_recording(tmp_path / "case.zarr")
+    loaded = attach_annotation_overlays(store, (store.load_modality("3d_brightness_mode"),))[0]
+    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="clinical")
+
+    assert "mesh_annotation" in loaded.attrs
+    assert "mosaic_annotation_lines" not in panel.loaded.attrs
+
+
+def _three_d_manifest(*, linked_mesh: bool = True, mesh_timestamps_path: str = "timestamps/3d_left_ventricle_mesh"):
+    manifest: dict[str, object] = {
+        "manifest_type": "3d",
+        "sectors": [
+            {
+                "semantic_id": "bmode",
+                "frames": {"array_path": "data/3d_brightness_mode", "format": "zarr_array"},
+                "timestamps": {"array_path": "timestamps/3d_brightness_mode", "format": "zarr_array"},
+                "geometry": {
+                    "coordinate_system": "spherical_sector_3d",
+                    "DepthStart": 0.01,
+                    "DepthEnd": 0.12,
+                    "Width": 0.8,
+                    "ElevationWidth": 0.7,
+                },
+            }
+        ],
+    }
+    if linked_mesh:
+        manifest["linked_mesh_sequences"] = [
+            {
+                "mesh_data": {"zarr_path": "data/3d_left_ventricle_mesh", "format": "zarr_group"},
+                "timestamps": {"zarr_path": mesh_timestamps_path, "format": "zarr_array"},
+                "mesh_key": "LV",
+            }
+        ]
+    return manifest
+
+
+def _write_mesh_group(group: object, *, frame_count: int) -> None:
+    points = np.asarray(
+        [[-0.02, 0.05, -0.01], [0.02, 0.05, 0.01], [0.0, 0.08, 0.0]],
+        dtype=np.float32,
+    )
+    faces = np.asarray([[0, 1, 2]], dtype=np.int32)
+    mesh_group = group.create_group("data/3d_left_ventricle_mesh")
+    mesh_group.create_array("point_values", data=np.tile(points, (frame_count, 1)))
+    mesh_group.create_array("face_values", data=np.tile(faces, (frame_count, 1)))
+    mesh_group.create_array("point_frame_offsets", data=np.arange(frame_count + 1, dtype=np.int64) * points.shape[0])
+    mesh_group.create_array("face_frame_offsets", data=np.arange(frame_count + 1, dtype=np.int64) * faces.shape[0])
+    group.create_array("timestamps/3d_left_ventricle_mesh", data=np.arange(frame_count, dtype=np.float32))
 
 
 def test_image_renderer_draws_mosaic_annotation_polygons_without_edges() -> None:

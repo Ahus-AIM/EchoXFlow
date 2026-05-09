@@ -15,11 +15,18 @@ from echoxflow.scan import (
     opacity_from_values,
     preconverted_spherical_mosaic,
     prepare_3d_brightness_for_display,
+    relative_qrs_trigger_times,
+    relative_volume_timestamps,
     resize_pixel_xy,
     sector_depth_ticks,
     sector_geometry_from_mapping,
     sector_to_cartesian,
     slice_volume,
+)
+from echoxflow.scan.beat_stitching import (
+    _antisymmetric_cyclic_order,
+    _best_antisymmetric_cyclic_rotation,
+    _lowest_resolution_spatial_axis,
 )
 from echoxflow.scan.contours import LV_GROUP_LAYOUT, build_contour_masks
 
@@ -234,7 +241,7 @@ def test_preconverted_spherical_mosaic_first_column_has_radial_axis_vertical() -
 
 def test_prepare_3d_brightness_stitches_beats_along_elevation() -> None:
     volumes = np.arange(8, dtype=np.uint8).reshape(8, 1, 1, 1)
-    timestamps = np.asarray([10.1, 10.2, 11.1, 11.2, 12.1, 12.2, 13.1, 13.2], dtype=np.float64)
+    timestamps = np.asarray([10.05, 10.95, 11.05, 11.95, 12.05, 12.95, 13.05, 13.95], dtype=np.float64)
     metadata = {
         "stitch_beat_count": 4,
         "metadata": {
@@ -248,13 +255,166 @@ def test_prepare_3d_brightness_stitches_beats_along_elevation() -> None:
     assert prepared.was_stitched is True
     assert prepared.stitch_beat_count == 4
     assert prepared.volumes.shape == (2, 4, 1, 1)
-    assert np.allclose(prepared.timestamps, [0.1, 0.2])
-    assert prepared.volumes[:, :, 0, 0].tolist() == [[0, 2, 4, 6], [1, 3, 5, 7]]
+    assert np.allclose(prepared.timestamps, [0.05, 0.95])
+    assert prepared.volumes[:, :, 0, 0].tolist() == [[6, 4, 2, 0], [7, 5, 3, 1]]
+    np.testing.assert_allclose(
+        prepared.source_timestamps,
+        [
+            [3.05, 2.05, 1.05, 0.05],
+            [3.95, 2.95, 1.95, 0.95],
+        ],
+    )
+
+
+def test_time_reference_basis_uses_origin_s_and_relative_qrs_axis() -> None:
+    metadata = {
+        "metadata": {
+            "time_reference": {
+                "basis": "relative_to_volume_origin",
+                "origin_s": 1.3,
+            },
+            "qrs_trigger_times": [-0.1, 0.8, 1.7],
+        },
+    }
+
+    volume_timestamps = relative_volume_timestamps(np.asarray([1.3, 1.8, 2.3], dtype=np.float64), metadata)
+    qrs_timestamps = relative_qrs_trigger_times(metadata)
+
+    assert np.allclose(volume_timestamps, [0.0, 0.5, 1.0])
+    assert np.allclose(qrs_timestamps, [-0.1, 0.8, 1.7])
+
+
+def test_prepare_3d_brightness_aligns_stitched_beats_by_qrs_elapsed_time() -> None:
+    volumes = np.arange(6, dtype=np.uint8).reshape(6, 1, 1, 1)
+    timestamps = np.asarray([0.05, 0.5, 0.95, 1.05, 1.5, 1.95], dtype=np.float64)
+    metadata = {
+        "stitch_beat_count": 2,
+        "metadata": {
+            "qrs_trigger_times": [0.0, 1.0, 2.0],
+        },
+    }
+
+    prepared = prepare_3d_brightness_for_display(volumes, timestamps, metadata)
+
+    assert prepared.was_stitched is True
+    assert prepared.volumes.shape == (3, 2, 1, 1)
+    assert np.allclose(prepared.timestamps, [0.05, 0.5, 0.95])
+    assert prepared.volumes[:, :, 0, 0].tolist() == [[3, 0], [4, 1], [5, 2]]
+    np.testing.assert_allclose(
+        prepared.source_timestamps,
+        [
+            [1.05, 0.05],
+            [1.5, 0.5],
+            [1.95, 0.95],
+        ],
+    )
+
+
+def test_prepare_3d_brightness_does_not_accelerate_long_rr_intervals() -> None:
+    volumes = np.arange(7, dtype=np.uint8).reshape(7, 1, 1, 1)
+    timestamps = np.asarray([0.0, 0.5, 0.95, 1.0, 1.5, 1.95, 2.3], dtype=np.float64)
+    metadata = {
+        "stitch_beat_count": 2,
+        "metadata": {
+            "qrs_trigger_times": [0.0, 1.0, 2.5],
+        },
+    }
+
+    prepared = prepare_3d_brightness_for_display(volumes, timestamps, metadata)
+
+    assert prepared.was_stitched is True
+    assert prepared.volumes.shape == (3, 2, 1, 1)
+    assert np.allclose(prepared.timestamps, [0.0, 0.5, 0.95])
+    assert prepared.volumes[:, :, 0, 0].tolist() == [[3, 0], [4, 1], [5, 2]]
+    np.testing.assert_allclose(
+        prepared.source_timestamps,
+        [
+            [1.0, 0.0],
+            [1.5, 0.5],
+            [1.95, 0.95],
+        ],
+    )
+    assert 6 not in prepared.volumes[:, :, 0, 0]
+
+
+def test_prepare_3d_brightness_stitches_along_smallest_spatial_axis() -> None:
+    volumes = np.arange(8 * 4 * 2 * 5, dtype=np.uint8).reshape(8, 4, 2, 5)
+    timestamps = np.asarray([10.05, 10.95, 11.05, 11.95, 12.05, 12.95, 13.05, 13.95], dtype=np.float64)
+    metadata = {
+        "stitch_beat_count": 4,
+        "metadata": {
+            "time_reference": {"volume_time_origin_s": 10.0},
+            "qrs_trigger_times": [0.0, 1.0, 2.0, 3.0, 4.0],
+        },
+    }
+
+    prepared = prepare_3d_brightness_for_display(volumes, timestamps, metadata)
+
+    assert prepared.was_stitched is True
+    assert prepared.volumes.shape == (2, 4, 8, 5)
+
+
+def test_prepare_3d_brightness_grows_only_the_lowest_resolution_spatial_axis() -> None:
+    volumes = np.arange(8 * 4 * 6 * 2, dtype=np.uint8).reshape(8, 4, 6, 2)
+    timestamps = np.asarray([0.05, 0.95, 1.05, 1.95, 2.05, 2.95, 3.05, 3.95], dtype=np.float64)
+    metadata = {"stitch_beat_count": 4, "metadata": {"qrs_trigger_times": [0.0, 1.0, 2.0, 3.0, 4.0]}}
+
+    prepared = prepare_3d_brightness_for_display(volumes, timestamps, metadata)
+
+    assert prepared.was_stitched is True
+    assert _lowest_resolution_spatial_axis(volumes) == 2
+    assert prepared.volumes.shape == (2, 4, 6, 8)
+
+
+def test_antisymmetric_cyclic_order_is_the_only_candidate_family() -> None:
+    assert _antisymmetric_cyclic_order(0, 3, 0) == (2, 1, 0)
+    assert _antisymmetric_cyclic_order(0, 3, 1) == (1, 0, 2)
+    assert _antisymmetric_cyclic_order(0, 4, 0) == (3, 2, 1, 0)
+    assert _antisymmetric_cyclic_order(0, 6, 0) == (5, 4, 3, 2, 1, 0)
+    assert {_antisymmetric_cyclic_order(0, 4, offset) for offset in range(4)} == {
+        (3, 2, 1, 0),
+        (2, 1, 0, 3),
+        (1, 0, 3, 2),
+        (0, 3, 2, 1),
+    }
+
+
+def test_best_antisymmetric_cyclic_rotation_tie_breaks_to_zero() -> None:
+    volumes = np.zeros((4, 2, 2, 2), dtype=np.float32)
+    groups = [(0, [[0], [1], [2], [3]])]
+
+    offset = _best_antisymmetric_cyclic_rotation(volumes, groups, stitch_axis=0, beat_count=4)
+
+    assert offset == 0
+
+
+def test_prepare_3d_brightness_selects_zero_offset_for_two_synthetic_windows() -> None:
+    volumes, timestamps = _synthetic_three_beat_windows(((150.0, 200.0), (100.0, 150.0), (50.0, 100.0)))
+    metadata = {"stitch_beat_count": 3, "metadata": {"qrs_trigger_times": np.arange(7, dtype=np.float64)}}
+
+    prepared = prepare_3d_brightness_for_display(volumes, timestamps, metadata)
+
+    assert prepared.was_stitched is True
+    assert prepared.volumes.shape == (4, 6, 4, 4)
+    np.testing.assert_allclose(prepared.timestamps, [0.05, 0.95, 3.05, 3.95])
+    _assert_elevation_planes(prepared.volumes, [50.0, 100.0, 100.0, 150.0, 150.0, 200.0])
+
+
+def test_prepare_3d_brightness_selects_rotated_offset_for_two_synthetic_windows() -> None:
+    volumes, timestamps = _synthetic_three_beat_windows(((100.0, 150.0), (50.0, 100.0), (150.0, 200.0)))
+    metadata = {"stitch_beat_count": 3, "metadata": {"qrs_trigger_times": np.arange(7, dtype=np.float64)}}
+
+    prepared = prepare_3d_brightness_for_display(volumes, timestamps, metadata)
+
+    assert prepared.was_stitched is True
+    assert prepared.volumes.shape == (4, 6, 4, 4)
+    np.testing.assert_allclose(prepared.timestamps, [0.05, 0.95, 3.05, 3.95])
+    _assert_elevation_planes(prepared.volumes, [50.0, 100.0, 100.0, 150.0, 150.0, 200.0])
 
 
 def test_prepare_3d_brightness_can_stitch_on_raw_timestamp_axis() -> None:
     volumes = np.arange(8, dtype=np.uint8).reshape(8, 1, 1, 1)
-    timestamps = np.asarray([10.1, 10.2, 11.1, 11.2, 12.1, 12.2, 13.1, 13.2], dtype=np.float64)
+    timestamps = np.asarray([10.05, 10.95, 11.05, 11.95, 12.05, 12.95, 13.05, 13.95], dtype=np.float64)
     metadata = {
         "stitch_beat_count": 4,
         "metadata": {
@@ -267,8 +427,8 @@ def test_prepare_3d_brightness_can_stitch_on_raw_timestamp_axis() -> None:
 
     assert prepared.was_stitched is True
     assert prepared.volumes.shape == (2, 4, 1, 1)
-    assert np.allclose(prepared.timestamps, [0.1, 0.2])
-    assert prepared.volumes[:, :, 0, 0].tolist() == [[0, 2, 4, 6], [1, 3, 5, 7]]
+    assert np.allclose(prepared.timestamps, [0.05, 0.95])
+    assert prepared.volumes[:, :, 0, 0].tolist() == [[6, 4, 2, 0], [7, 5, 3, 1]]
 
 
 def test_prepare_3d_brightness_noop_stitch_keeps_relative_timeline() -> None:
@@ -287,3 +447,27 @@ def test_prepare_3d_brightness_noop_stitch_keeps_relative_timeline() -> None:
     assert prepared.was_stitched is False
     assert prepared.volumes.shape == volumes.shape
     assert np.allclose(prepared.timestamps, [0.1, 0.2, 0.3, 0.4])
+    assert prepared.source_timestamps is None
+
+
+def _synthetic_three_beat_windows(beat_planes: tuple[tuple[float, float], ...]) -> tuple[np.ndarray, np.ndarray]:
+    timestamps = []
+    volumes = []
+    for window_start in (0, 3):
+        for beat_index, planes in enumerate(beat_planes):
+            for phase in (0.05, 0.95):
+                timestamps.append(window_start + beat_index + phase)
+                volumes.append(_constant_elevation_volume(planes))
+    return np.stack(volumes, axis=0), np.asarray(timestamps, dtype=np.float64)
+
+
+def _constant_elevation_volume(planes: tuple[float, float]) -> np.ndarray:
+    volume = np.zeros((2, 4, 4), dtype=np.float32)
+    volume[0] = planes[0]
+    volume[1] = planes[1]
+    return volume
+
+
+def _assert_elevation_planes(volumes: np.ndarray, expected: list[float]) -> None:
+    for frame in volumes:
+        np.testing.assert_allclose(frame[:, 0, 0], expected)

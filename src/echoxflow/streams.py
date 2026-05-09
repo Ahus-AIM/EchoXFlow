@@ -12,7 +12,6 @@ from echoxflow.scan.geometry import SectorGeometry
 
 TDI_NATIVE_STORAGE_ENCODING = "ge_tdi_raw_u16"
 TDI_LINEAR_UINT8_STORAGE_ENCODING = "linear_velocity_uint8_mps_v1"
-TDI_STORAGE_ENCODING = TDI_NATIVE_STORAGE_ENCODING
 
 FloatArray: TypeAlias = NDArray[np.float32]
 UInt8Array: TypeAlias = NDArray[np.uint8]

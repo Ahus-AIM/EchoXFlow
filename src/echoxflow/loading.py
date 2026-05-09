@@ -572,6 +572,7 @@ def _sector_for_data_path(data_path: str, group_attrs: Mapping[str, Any]) -> Map
     data_path = _normalize_data_path(data_path)
     exact = data_path.removeprefix("data/") in {"2d_brightness_mode_0", "2d_brightness_mode_1", "2d_brightness_mode_2"}
     roles = _sector_role_candidates(data_path)
+    fallback: Mapping[str, Any] | None = None
     for document in manifest_documents(group_attrs):
         sectors = document.get("sectors")
         if not isinstance(sectors, list):
@@ -583,7 +584,16 @@ def _sector_for_data_path(data_path: str, group_attrs: Mapping[str, Any]) -> Map
                 return sector
             if _semantic_id(sector) in roles and not exact:
                 return sector
-    return None
+            frame_path = _array_ref_path(sector.get("frames")) or ""
+            name = (_semantic_id(sector) or frame_path.removeprefix("data/")).lower()
+            if (
+                fallback is None
+                and data_path == "data/2d_brightness_mode"
+                and name.startswith("sector_")
+                and "_b_mode" in name
+            ):
+                fallback = sector
+    return fallback
 
 
 def _sector_role_candidates(data_path: str) -> tuple[str, ...]:
@@ -607,7 +617,10 @@ def _three_dimensional_document(group_attrs: Mapping[str, Any]) -> Mapping[str, 
     for document in manifest_documents(group_attrs):
         sector = _three_dimensional_sector(document)
         if sector is not None:
-            return _with_internal_3d_metadata(document, sector)
+            restored = dict(_with_internal_3d_metadata(document, sector))
+            if "stitch_beat_count" not in restored and group_attrs.get("stitch_beat_count") is not None:
+                restored["stitch_beat_count"] = group_attrs["stitch_beat_count"]
+            return restored
     return None
 
 
@@ -674,8 +687,9 @@ def _array_ref_path(value: Any) -> str | None:
 def _manifest_timestamp_path(data_path: str, group_attrs: Mapping[str, Any]) -> str | None:
     sector = _sector_for_data_path(data_path, group_attrs)
     if sector is not None:
+        frame_path = _array_ref_path(sector.get("frames"))
         timestamp_path = _array_ref_path(sector.get("timestamps"))
-        if timestamp_path is not None:
+        if timestamp_path is not None and (frame_path is None or frame_path == data_path):
             return timestamp_path
     if data_path != "data/3d_brightness_mode":
         return None

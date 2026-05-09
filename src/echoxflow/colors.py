@@ -32,7 +32,6 @@ class NamedColormapConfig:
 
 @dataclass(frozen=True)
 class Colors:
-    basic: Mapping[str, tuple[int, int, int]]
     theme: Mapping[str, tuple[int, int, int]]
     doppler: Mapping[str, tuple[int, int, int]]
     ecg: Mapping[str, tuple[int, int, int]]
@@ -136,7 +135,6 @@ def load_colors(path: str | Path | None = None) -> Colors:
     """Load shared EchoXFlow colors and named colormaps."""
     raw = _load_yaml(path)
     return Colors(
-        basic=_parse_rgb_mapping(_section(raw, "basic")),
         theme=_parse_rgb_mapping(_section(raw, "theme")),
         doppler=_parse_rgb_mapping(_section(raw, "doppler")),
         ecg=_parse_rgb_mapping(_section(raw, "ecg")),

@@ -53,7 +53,6 @@ class ImagePanelRenderer:
             draw_top_right_colorbar(ax, colorbar_cmap, colorbar_spec, style=style)
         _draw_clinical_depth_ruler(ax, panel, style=style)
         _finish_panel(ax, panel.label, style)
-        _draw_preconverted_layout_legend(ax, panel, style=style)
 
 
 class MatrixPanelRenderer:
@@ -82,7 +81,6 @@ class MatrixPanelRenderer:
                     draw_top_right_colorbar(ax, cmap, colorbar_spec, style=style)
                 _finish_panel(ax, panel.label, style)
                 _configure_matrix_y_axis(ax, panel, y_size=y_size, style=style)
-                _draw_preconverted_layout_legend(ax, panel, style=style)
                 return
         y_size = matrix.shape[1]
         ax.imshow(
@@ -98,7 +96,6 @@ class MatrixPanelRenderer:
             draw_top_right_colorbar(ax, cmap, colorbar_spec, style=style)
         _finish_panel(ax, panel.label, style)
         _configure_matrix_y_axis(ax, panel, y_size=y_size, style=style)
-        _draw_preconverted_layout_legend(ax, panel, style=style)
 
 
 class LinePanelRenderer:
@@ -118,7 +115,6 @@ class LinePanelRenderer:
         if x.size:
             ax.axvline(float(time_s), color=style.cursor_color, linewidth=1.4)
         _finish_panel(ax, panel.label, style)
-        _draw_preconverted_layout_legend(ax, panel, style=style)
 
 
 def renderer_for(kind: PanelKind) -> PanelRenderer:
@@ -1085,14 +1081,33 @@ def _has_temporal_axis(panel: PanelSpec, count: int) -> bool:
     )
 
 
-def render_ecg(ax: Axes, ecg: TraceSpec, *, time_s: float, style: PlotStyle) -> None:
+def render_ecg(
+    ax: Axes,
+    ecg: TraceSpec,
+    *,
+    time_s: float,
+    style: PlotStyle,
+    marker_times: np.ndarray | None = None,
+) -> None:
     signal = np.asarray(ecg.signal, dtype=np.float32).reshape(-1)
     timestamps = np.asarray(ecg.timestamps, dtype=np.float64).reshape(-1)
     count = min(signal.size, timestamps.size)
     if count:
         ax.plot(timestamps[:count], signal[:count], color=style.ecg_trace_color, linewidth=0.9)
-        ax.axvline(float(time_s), color=style.ecg_marker_color, linewidth=1.4)
+        markers = _ecg_marker_times(marker_times, fallback_time=float(time_s))
+        linewidth = 1.4 if markers.size == 1 else 1.1
+        alpha = 1.0 if markers.size == 1 else 0.75
+        for marker_time in markers:
+            ax.axvline(float(marker_time), color=style.ecg_marker_color, linewidth=linewidth, alpha=alpha)
     _finish_panel(ax, "", style)
+
+
+def _ecg_marker_times(marker_times: np.ndarray | None, *, fallback_time: float) -> np.ndarray:
+    if marker_times is None:
+        return np.asarray([fallback_time], dtype=np.float64)
+    values = np.asarray(marker_times, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    return values if values.size else np.asarray([fallback_time], dtype=np.float64)
 
 
 def _finish_panel(ax: Axes, title: str, style: PlotStyle) -> None:
@@ -1105,79 +1120,6 @@ def _finish_panel(ax: Axes, title: str, style: PlotStyle) -> None:
     ax.margins(x=0.0, y=0.0)
     for spine in ax.spines.values():
         spine.set_visible(False)
-
-
-def _draw_preconverted_layout_legend(ax: Axes, panel: PanelSpec, *, style: PlotStyle) -> None:
-    if panel.view != "pre_converted":
-        return
-    text = _preconverted_layout_text(panel)
-    if not text:
-        return
-    label = ax.text(
-        0.012,
-        0.988,
-        text,
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        color=style.text_color,
-        fontsize=style.axis_tick_label_fontsize,
-        zorder=20.0,
-        bbox={
-            "boxstyle": "square,pad=0.18",
-            "facecolor": style.panel_facecolor,
-            "edgecolor": "none",
-            "alpha": 0.72,
-        },
-    )
-    label.set_in_layout(False)
-
-
-def _preconverted_layout_text(panel: PanelSpec) -> str:
-    explicit = _explicit_layout_entries(panel.loaded.attrs)
-    if explicit:
-        return ", ".join(f"{axis}={size}" for axis, size in explicit)
-    axes = _data_layout_axes(panel)
-    if not axes:
-        return ""
-    shape = tuple(int(size) for size in np.asarray(panel.loaded.data).shape)
-    if len(shape) != len(axes):
-        return ""
-    return ", ".join(f"{axis}={size}" for axis, size in zip(axes, shape))
-
-
-def _explicit_layout_entries(attrs: Mapping[str, Any]) -> tuple[tuple[str, int], ...]:
-    raw_axes = attrs.get("data_layout_axes")
-    raw_shape = attrs.get("data_layout_shape")
-    if not isinstance(raw_axes, (list, tuple)) or not isinstance(raw_shape, (list, tuple)):
-        return ()
-    axes = tuple(str(axis).strip().upper() for axis in raw_axes if str(axis).strip())
-    try:
-        shape = tuple(int(size) for size in raw_shape)
-    except TypeError:
-        return ()
-    if len(axes) != len(shape):
-        return ()
-    return tuple((axis, size) for axis, size in zip(axes, shape) if axis)
-
-
-def _data_layout_axes(panel: PanelSpec) -> tuple[str, ...]:
-    path = panel.loaded.data_path.strip("/")
-    shape = tuple(np.asarray(panel.loaded.data).shape)
-    if not shape:
-        return ()
-    has_time = panel.loaded.timestamps is not None and np.asarray(panel.loaded.timestamps).reshape(-1).size == shape[0]
-    prefix = ("T",) if has_time else ()
-    spatial_ndim = len(shape) - len(prefix)
-    if path == "data/3d_brightness_mode":
-        return (*prefix, "E", "A", "R") if spatial_ndim == 3 else ()
-    if path.startswith("data/2d_") or path == "data/tissue_doppler":
-        return (*prefix, "R", "A") if spatial_ndim == 2 else ()
-    if path == "data/1d_motion_mode":
-        return (*prefix, "R") if spatial_ndim == 1 else ()
-    if path.startswith("data/1d_"):
-        return (*prefix, "V") if spatial_ndim == 1 else ()
-    return ()
 
 
 def fixed_normalize(loaded: LoadedArray, values: np.ndarray) -> Normalize:
