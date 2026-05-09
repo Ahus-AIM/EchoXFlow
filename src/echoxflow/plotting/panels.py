@@ -697,7 +697,7 @@ def _line_trace_values(values: np.ndarray, timestamps: np.ndarray | None) -> tup
 
 def _line_trace_color(index: int, count: int, colors: object, *, style: PlotStyle) -> str:
     if isinstance(colors, tuple) and index < len(colors) and isinstance(colors[index], str):
-        return colors[index]
+        return str(colors[index])
     if count < 2:
         return style.line_color
     palette = ("#440154", "#414487", "#2A788E", "#22A884", "#7AD151", "#FDE725")

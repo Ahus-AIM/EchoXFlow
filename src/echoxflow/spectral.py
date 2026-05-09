@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import numpy as np
 
@@ -117,7 +117,7 @@ def _cursor_box(raw: Mapping[str, Any]) -> SpectralCursorBox | None:
     else:
         return None
     try:
-        x, y, width, height = (float(value) for value in values)
+        x, y, width, height = (float(cast(Any, value)) for value in values)
     except (TypeError, ValueError):
         return None
     if not all(np.isfinite([x, y, width, height])) or width <= 0.0 or height <= 0.0:
