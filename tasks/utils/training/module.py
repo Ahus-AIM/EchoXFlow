@@ -5,8 +5,6 @@ from typing import Any, cast
 
 from torch import Tensor, nn
 
-from tasks.utils.models.unet import build_model
-
 LossFn = Callable[[Any, object, object], dict[str, Tensor]]
 ValMetricsFn = Callable[[Any, object, object], dict[str, Tensor]]
 
@@ -20,6 +18,8 @@ class TrainingModule(nn.Module):
         val_metrics_fn: ValMetricsFn | None = None,
     ) -> None:
         super().__init__()
+        from tasks.utils.models.unet import build_model
+
         self.config = config
         self.model = build_model(**config.model)  # type: ignore[attr-defined]
         self._loss_fn = loss_fn
