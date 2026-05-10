@@ -37,7 +37,7 @@ class ImagePanelRenderer:
         frame = _display_frame(data[index] if _has_temporal_axis(panel, count) else data)
         cmap = None if frame.ndim == 3 else _transparent_bad_colormap(named_listed_colormap(panel.loaded.data_path))
         norm = None if frame.ndim == 3 else fixed_normalize(panel.loaded, frame)
-        grid = _clinical_grid(panel)
+        grid = _cartesian_grid(panel)
         ax.imshow(
             frame,
             cmap=cmap or _transparent_bad_colormap("gray"),
@@ -51,7 +51,7 @@ class ImagePanelRenderer:
         colorbar_cmap = _colorbar_colormap(panel, cmap)
         if colorbar_cmap is not None and (colorbar_spec := _colorbar_spec(panel)) is not None:
             draw_top_right_colorbar(ax, colorbar_cmap, colorbar_spec, style=style)
-        _draw_clinical_depth_ruler(ax, panel, style=style)
+        _draw_cartesian_depth_ruler(ax, panel, style=style)
         _finish_panel(ax, panel.label, style)
 
 
@@ -240,7 +240,7 @@ def _draw_sampling_gate_annotation(
     frame_shape: tuple[int, ...],
     style: PlotStyle,
 ) -> None:
-    if panel.view != "clinical" and _draw_preconverted_sampling_gate_annotation(
+    if panel.view != "cartesian" and _draw_beamspace_sampling_gate_annotation(
         ax, panel, overlay, frame_shape=frame_shape, style=style
     ):
         return
@@ -269,7 +269,7 @@ def _draw_sampling_line_annotation(
     frame_shape: tuple[int, ...],
     style: PlotStyle,
 ) -> None:
-    if panel.view != "clinical" and _draw_preconverted_sampling_line_annotation(
+    if panel.view != "cartesian" and _draw_beamspace_sampling_line_annotation(
         ax, panel, overlay, frame_shape=frame_shape, style=style
     ):
         return
@@ -291,7 +291,7 @@ def _draw_sector_sampling_gate_annotation(
     *,
     style: PlotStyle,
 ) -> bool:
-    geometry = _clinical_geometry(panel)
+    geometry = _cartesian_geometry(panel)
     metadata = overlay.get("metadata")
     if geometry is None or not isinstance(metadata, Mapping):
         return False
@@ -306,7 +306,7 @@ def _draw_sector_sampling_gate_annotation(
     return True
 
 
-def _draw_preconverted_sampling_gate_annotation(
+def _draw_beamspace_sampling_gate_annotation(
     ax: Axes,
     panel: PanelSpec,
     overlay: Mapping[object, object],
@@ -318,7 +318,7 @@ def _draw_preconverted_sampling_gate_annotation(
     metadata = overlay.get("metadata")
     if not isinstance(geometry, SectorGeometry) or not isinstance(metadata, Mapping):
         return False
-    coords = _preconverted_sampling_gate_coordinates(metadata, geometry, frame_shape=frame_shape)
+    coords = _beamspace_sampling_gate_coordinates(metadata, geometry, frame_shape=frame_shape)
     if coords is None:
         return False
     x, row0, row1, row_end = coords
@@ -329,7 +329,7 @@ def _draw_preconverted_sampling_gate_annotation(
     return True
 
 
-def _draw_preconverted_sampling_line_annotation(
+def _draw_beamspace_sampling_line_annotation(
     ax: Axes,
     panel: PanelSpec,
     overlay: Mapping[object, object],
@@ -343,7 +343,7 @@ def _draw_preconverted_sampling_line_annotation(
     tilt_rad = _sampling_line_tilt_rad(overlay)
     if tilt_rad is None:
         return False
-    coords = _preconverted_sampling_line_coordinates(tilt_rad, geometry, frame_shape=frame_shape)
+    coords = _beamspace_sampling_line_coordinates(tilt_rad, geometry, frame_shape=frame_shape)
     if coords is None:
         return False
     x, row0, row1 = coords
@@ -351,7 +351,7 @@ def _draw_preconverted_sampling_line_annotation(
     return True
 
 
-def _preconverted_sampling_gate_coordinates(
+def _beamspace_sampling_gate_coordinates(
     metadata: Mapping[object, object],
     geometry: SectorGeometry,
     *,
@@ -375,7 +375,7 @@ def _preconverted_sampling_gate_coordinates(
     return col, row0, row1, float(max(0, height - 1))
 
 
-def _preconverted_sampling_line_coordinates(
+def _beamspace_sampling_line_coordinates(
     tilt_rad: float,
     geometry: SectorGeometry,
     *,
@@ -423,7 +423,7 @@ def _draw_sector_sampling_line_annotation(
     *,
     style: PlotStyle,
 ) -> bool:
-    geometry = _clinical_geometry(panel)
+    geometry = _cartesian_geometry(panel)
     metadata = overlay.get("metadata")
     if geometry is None or not isinstance(metadata, Mapping):
         return False
@@ -654,7 +654,7 @@ def _annotation_image_xy(
     *,
     frame_shape: tuple[int, ...],
 ) -> np.ndarray | None:
-    if panel.view == "clinical":
+    if panel.view == "cartesian":
         return np.asarray(points_xy_m, dtype=np.float32)
     geometry = panel.loaded.attrs.get("annotation_geometry")
     if not isinstance(geometry, SectorGeometry):
@@ -1148,33 +1148,33 @@ def _stream_value_range(loaded: LoadedArray) -> tuple[float, float] | None:
 
 
 def _colorbar_data_path(panel: PanelSpec) -> str:
-    raw = panel.loaded.attrs.get("clinical_colorbar_data_path") if panel.view == "clinical" else None
+    raw = panel.loaded.attrs.get("cartesian_colorbar_data_path") if panel.view == "cartesian" else None
     return str(raw) if isinstance(raw, str) and raw else panel.loaded.data_path
 
 
 def _colorbar_value_range(panel: PanelSpec) -> tuple[float, float] | None:
-    raw = panel.loaded.attrs.get("clinical_colorbar_value_range") if panel.view == "clinical" else None
+    raw = panel.loaded.attrs.get("cartesian_colorbar_value_range") if panel.view == "cartesian" else None
     if isinstance(raw, tuple) and len(raw) == 2:
         return float(raw[0]), float(raw[1])
     return _stream_value_range(panel.loaded)
 
 
 def _colorbar_colormap(panel: PanelSpec, image_cmap: Colormap | None) -> Colormap | None:
-    if panel.view != "clinical":
+    if panel.view != "cartesian":
         return None
     return image_cmap or named_listed_colormap(_colorbar_data_path(panel))
 
 
 def _colorbar_spec(panel: PanelSpec):
-    if panel.view != "clinical":
+    if panel.view != "cartesian":
         return None
     return colorbar_spec_for_modality(_colorbar_data_path(panel), value_range=_colorbar_value_range(panel))
 
 
-def _clinical_grid(panel: PanelSpec) -> CartesianGrid | None:
-    if panel.view != "clinical":
+def _cartesian_grid(panel: PanelSpec) -> CartesianGrid | None:
+    if panel.view != "cartesian":
         return None
-    grid = panel.loaded.attrs.get("clinical_grid")
+    grid = panel.loaded.attrs.get("cartesian_grid")
     return grid if isinstance(grid, CartesianGrid) else None
 
 
@@ -1184,30 +1184,30 @@ def _cartesian_extent(grid: CartesianGrid | None) -> tuple[float, float, float, 
     return grid.x_range_m[0], grid.x_range_m[1], grid.y_range_m[1], grid.y_range_m[0]
 
 
-def _clinical_geometry(panel: PanelSpec) -> SectorGeometry | None:
-    if panel.view != "clinical" or panel.loaded.stream is None:
+def _cartesian_geometry(panel: PanelSpec) -> SectorGeometry | None:
+    if panel.view != "cartesian" or panel.loaded.stream is None:
         return None
     geometry = panel.loaded.stream.metadata.geometry
     return geometry if isinstance(geometry, SectorGeometry) else None
 
 
-def _draw_clinical_depth_ruler(ax: Axes, panel: PanelSpec, *, style: PlotStyle) -> None:
-    geometry = _clinical_geometry(panel)
-    if geometry is None or not style.show_clinical_depth_ruler:
+def _draw_cartesian_depth_ruler(ax: Axes, panel: PanelSpec, *, style: PlotStyle) -> None:
+    geometry = _cartesian_geometry(panel)
+    if geometry is None or not style.show_cartesian_depth_ruler:
         return
-    side: Literal["left", "right"] = "right" if style.clinical_depth_ruler_side == "right" else "left"
+    side: Literal["left", "right"] = "right" if style.cartesian_depth_ruler_side == "right" else "left"
     ruler = SectorDepthRuler(
         side=side,
-        tick_interval_cm=style.clinical_depth_ruler_tick_interval_cm,
-        label_interval_cm=style.clinical_depth_ruler_label_interval_cm,
-        minor_tick_length_cm=style.clinical_depth_ruler_minor_tick_length_cm,
-        major_tick_length_cm=style.clinical_depth_ruler_major_tick_length_cm,
-        label_pad_cm=style.clinical_depth_ruler_label_pad_cm,
+        tick_interval_cm=style.cartesian_depth_ruler_tick_interval_cm,
+        label_interval_cm=style.cartesian_depth_ruler_label_interval_cm,
+        minor_tick_length_cm=style.cartesian_depth_ruler_minor_tick_length_cm,
+        major_tick_length_cm=style.cartesian_depth_ruler_major_tick_length_cm,
+        label_pad_cm=style.cartesian_depth_ruler_label_pad_cm,
         color=style.ecg_trace_color,
-        linewidth=style.clinical_depth_ruler_linewidth,
-        border_linewidth=style.clinical_depth_ruler_border_linewidth,
-        label_fontsize=style.clinical_depth_ruler_label_fontsize,
-        show_border=style.clinical_depth_ruler_show_border,
+        linewidth=style.cartesian_depth_ruler_linewidth,
+        border_linewidth=style.cartesian_depth_ruler_border_linewidth,
+        label_fontsize=style.cartesian_depth_ruler_label_fontsize,
+        show_border=style.cartesian_depth_ruler_show_border,
     )
     draw_sector_depth_ruler(ax, geometry, ruler)
 
@@ -1215,11 +1215,11 @@ def _draw_clinical_depth_ruler(ax: Axes, panel: PanelSpec, *, style: PlotStyle) 
 def _draw_color_doppler_extent(ax: Axes, panel: PanelSpec, *, frame_shape: tuple[int, ...], style: PlotStyle) -> None:
     if not style.show_color_doppler_extent:
         return
-    if panel.view == "clinical":
-        sector = panel.loaded.attrs.get("clinical_color_doppler_sector")
+    if panel.view == "cartesian":
+        sector = panel.loaded.attrs.get("cartesian_color_doppler_sector")
         points = _native_physical_polygon(sector)
         if points is None:
-            geometry = panel.loaded.attrs.get("clinical_color_doppler_geometry")
+            geometry = panel.loaded.attrs.get("cartesian_color_doppler_geometry")
             points = _sector_extent_polygon(geometry) if isinstance(geometry, SectorGeometry) else None
         if points is not None:
             ax.plot(
@@ -1231,7 +1231,7 @@ def _draw_color_doppler_extent(ax: Axes, panel: PanelSpec, *, frame_shape: tuple
                 zorder=7.0,
             )
         return
-    rect = _preconverted_extent_rect(panel, frame_shape=frame_shape)
+    rect = _beamspace_extent_rect(panel, frame_shape=frame_shape)
     if rect is None:
         return
     row0, row1, col0, col1 = rect
@@ -1249,7 +1249,7 @@ def _draw_color_doppler_extent(ax: Axes, panel: PanelSpec, *, frame_shape: tuple
     )
 
 
-def _preconverted_extent_rect(
+def _beamspace_extent_rect(
     panel: PanelSpec, *, frame_shape: tuple[int, ...]
 ) -> tuple[float, float, float, float] | None:
     if len(frame_shape) < 2:
@@ -1257,8 +1257,8 @@ def _preconverted_extent_rect(
     height, width = int(frame_shape[0]), int(frame_shape[1])
     if height <= 0 or width <= 0:
         return None
-    color_sector = panel.loaded.attrs.get("preconverted_color_doppler_sector")
-    reference_sector = panel.loaded.attrs.get("preconverted_reference_sector")
+    color_sector = panel.loaded.attrs.get("beamspace_color_doppler_sector")
+    reference_sector = panel.loaded.attrs.get("beamspace_reference_sector")
     if isinstance(reference_sector, Mapping) and isinstance(color_sector, Mapping):
         return _beamspace_rect_from_native(
             reference_sector=reference_sector, color_sector=color_sector, shape=frame_shape

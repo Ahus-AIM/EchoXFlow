@@ -30,11 +30,11 @@ class SpatialLayout:
 def spatial_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
     if not panels:
         return SpatialLayout(cols=1, rows=0, placements=(), width_ratios=(1.0,))
-    pre = tuple(panel for panel in panels if panel.view == "pre_converted")
-    clinical = tuple(panel for panel in panels if panel.view == "clinical")
-    if pre and clinical:
-        pre_layout = pre_converted_layout(pre)
-        rows = max(pre_layout.rows, len(clinical))
+    beamspace = tuple(panel for panel in panels if panel.view == "beamspace")
+    cartesian = tuple(panel for panel in panels if panel.view == "cartesian")
+    if beamspace and cartesian:
+        beamspace_layout_result = beamspace_layout(beamspace)
+        rows = max(beamspace_layout_result.rows, len(cartesian))
         converted = tuple(
             PanelPlacement(
                 row=placement.row,
@@ -43,23 +43,26 @@ def spatial_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
                 row_span=placement.row_span,
                 col_span=placement.col_span,
             )
-            for placement in pre_layout.placements
+            for placement in beamspace_layout_result.placements
         )
-        clinical_span = rows if len(clinical) == 1 else 1
+        cartesian_span = rows if len(cartesian) == 1 else 1
         return SpatialLayout(
-            cols=pre_layout.cols + 1,
+            cols=beamspace_layout_result.cols + 1,
             rows=rows,
             placements=(
                 *converted,
                 *(
-                    PanelPlacement(row=row, col=pre_layout.cols, panel=panel, row_span=clinical_span)
-                    for row, panel in enumerate(clinical)
+                    PanelPlacement(row=row, col=beamspace_layout_result.cols, panel=panel, row_span=cartesian_span)
+                    for row, panel in enumerate(cartesian)
                 ),
             ),
-            width_ratios=(*((1.0 / pre_layout.cols,) * pre_layout.cols), 1.0),
+            width_ratios=(
+                *((1.0 / beamspace_layout_result.cols,) * beamspace_layout_result.cols),
+                1.0,
+            ),
         )
-    if pre:
-        return pre_converted_layout(pre)
+    if beamspace:
+        return beamspace_layout(beamspace)
     cols = min(2, max(1, len(panels)))
     rows = int(math.ceil(len(panels) / cols))
     return SpatialLayout(
@@ -70,7 +73,7 @@ def spatial_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
     )
 
 
-def pre_converted_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
+def beamspace_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
     if len(panels) == 3 and all(panel.kind == "image" for panel in panels):
         largest = max(panels, key=panel_spatial_area)
         others = tuple(panel for panel in panels if panel is not largest)

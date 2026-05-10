@@ -37,17 +37,17 @@ class PlotStyle:
     sampling_gate_color: str = "#4AC44A"
     sampling_gate_linewidth: float = 2.0
     sampling_gate_markersize: float = 9.0
-    show_clinical_depth_ruler: bool = True
-    clinical_depth_ruler_side: str = "left"
-    clinical_depth_ruler_tick_interval_cm: float = 1.0
-    clinical_depth_ruler_label_interval_cm: float = 5.0
-    clinical_depth_ruler_minor_tick_length_cm: float = 0.22
-    clinical_depth_ruler_major_tick_length_cm: float = 0.34
-    clinical_depth_ruler_label_pad_cm: float = 0.12
-    clinical_depth_ruler_linewidth: float = 0.75
-    clinical_depth_ruler_border_linewidth: float = 0.65
-    clinical_depth_ruler_label_fontsize: float = 14.0
-    clinical_depth_ruler_show_border: bool = False
+    show_cartesian_depth_ruler: bool = True
+    cartesian_depth_ruler_side: str = "left"
+    cartesian_depth_ruler_tick_interval_cm: float = 1.0
+    cartesian_depth_ruler_label_interval_cm: float = 5.0
+    cartesian_depth_ruler_minor_tick_length_cm: float = 0.22
+    cartesian_depth_ruler_major_tick_length_cm: float = 0.34
+    cartesian_depth_ruler_label_pad_cm: float = 0.12
+    cartesian_depth_ruler_linewidth: float = 0.75
+    cartesian_depth_ruler_border_linewidth: float = 0.65
+    cartesian_depth_ruler_label_fontsize: float = 14.0
+    cartesian_depth_ruler_show_border: bool = False
 
     @property
     def figsize(self) -> tuple[float, float]:

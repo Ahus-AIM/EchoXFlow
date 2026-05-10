@@ -1,4 +1,4 @@
-"""Clinical-view rendering data preparation."""
+"""Cartesian-view rendering data preparation."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from echoxflow.streams import default_value_range_for_path
 _COLOR_DOPPLER_HIDDEN_CENTER_FRACTION = 0.20
 
 
-def clinical_loaded_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
-    """Build Cartesian clinical-view arrays from loaded 2D streams."""
+def cartesian_loaded_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
+    """Build Cartesian cartesian-view arrays from loaded 2D streams."""
     by_path = {loaded.data_path: loaded for loaded in loaded_arrays}
     bmode = _first_available(
         by_path,
@@ -35,37 +35,37 @@ def clinical_loaded_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[Load
         ),
     )
     if bmode is None or not _has_geometry(bmode):
-        converted = tuple(_clinical_single(loaded) for loaded in loaded_arrays if _has_geometry(loaded))
+        converted = tuple(_cartesian_single(loaded) for loaded in loaded_arrays if _has_geometry(loaded))
         return converted or loaded_arrays
 
-    overlays = _clinical_overlays(bmode, by_path)
+    overlays = _cartesian_overlays(bmode, by_path)
     if overlays:
         return overlays
 
     return (
-        _clinical_single(bmode),
-        *tuple(_clinical_single(loaded) for loaded in loaded_arrays if loaded is not bmode and _has_geometry(loaded)),
+        _cartesian_single(bmode),
+        *tuple(_cartesian_single(loaded) for loaded in loaded_arrays if loaded is not bmode and _has_geometry(loaded)),
     )
 
 
-def _clinical_overlays(bmode: LoadedArray, by_path: dict[str, LoadedArray]) -> tuple[LoadedArray, ...]:
+def _cartesian_overlays(bmode: LoadedArray, by_path: dict[str, LoadedArray]) -> tuple[LoadedArray, ...]:
     overlays: list[LoadedArray] = []
     velocity = by_path.get("data/2d_color_doppler_velocity")
     power = by_path.get("data/2d_color_doppler_power")
     if velocity is not None and power is not None and _has_geometry(velocity) and _has_geometry(power):
-        overlays.append(_clinical_color_doppler(bmode, velocity, power))
+        overlays.append(_cartesian_color_doppler(bmode, velocity, power))
     tissue = by_path.get("data/tissue_doppler")
     if tissue is not None and _has_geometry(tissue):
-        overlays.append(_clinical_tissue_doppler(bmode, tissue))
+        overlays.append(_cartesian_tissue_doppler(bmode, tissue))
     return tuple(overlays)
 
 
-def _clinical_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: LoadedArray) -> LoadedArray:
+def _cartesian_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: LoadedArray) -> LoadedArray:
     bmode_geometry = _geometry(bmode)
     velocity_geometry = _geometry(velocity)
     power_geometry = _geometry(power)
     bmode_data = np.asarray(bmode.data)
-    _, timeline_timestamps = _clinical_timeline_source(bmode, velocity, power)
+    _, timeline_timestamps = _cartesian_timeline_source(bmode, velocity, power)
     grid = CartesianGrid.from_sector_height(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]))
     frames = []
     for index, time_s in enumerate(timeline_timestamps):
@@ -116,28 +116,28 @@ def _clinical_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: Lo
                 background=None,
             )
         )
-    return _clinical_loaded(
+    return _cartesian_loaded(
         source=bmode,
-        name="clinical_color_doppler",
+        name="cartesian_color_doppler",
         data=np.asarray(frames, dtype=np.float32),
-        label_path="data/clinical_color_doppler",
+        label_path="data/cartesian_color_doppler",
         grid=grid,
         timestamps=timeline_timestamps,
         attrs={
             "annotation_overlays": _combined_annotation_overlays(bmode, velocity, power),
-            "clinical_colorbar_data_path": velocity.data_path,
-            "clinical_colorbar_value_range": _value_range(velocity, np.asarray(velocity.data)),
-            "clinical_color_doppler_geometry": velocity_geometry,
-            "clinical_color_doppler_sector": None if velocity.stream is None else velocity.stream.metadata.raw,
+            "cartesian_colorbar_data_path": velocity.data_path,
+            "cartesian_colorbar_value_range": _value_range(velocity, np.asarray(velocity.data)),
+            "cartesian_color_doppler_geometry": velocity_geometry,
+            "cartesian_color_doppler_sector": None if velocity.stream is None else velocity.stream.metadata.raw,
         },
     )
 
 
-def _clinical_tissue_doppler(bmode: LoadedArray, tissue: LoadedArray) -> LoadedArray:
+def _cartesian_tissue_doppler(bmode: LoadedArray, tissue: LoadedArray) -> LoadedArray:
     bmode_geometry = _geometry(bmode)
     tissue_geometry = _geometry(tissue)
     bmode_data = np.asarray(bmode.data)
-    timeline_source, timeline_timestamps = _clinical_timeline_source(bmode, tissue)
+    timeline_source, timeline_timestamps = _cartesian_timeline_source(bmode, tissue)
     grid = CartesianGrid.from_sector_height(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]))
     frames = []
     for index, time_s in enumerate(timeline_timestamps):
@@ -161,22 +161,22 @@ def _clinical_tissue_doppler(bmode: LoadedArray, tissue: LoadedArray) -> LoadedA
                 tissue_mask=gate,
             )
         )
-    return _clinical_loaded(
+    return _cartesian_loaded(
         source=timeline_source,
-        name="clinical_tissue_doppler",
+        name="cartesian_tissue_doppler",
         data=np.asarray(frames, dtype=np.float32),
-        label_path="data/clinical_tissue_doppler",
+        label_path="data/cartesian_tissue_doppler",
         grid=grid,
         timestamps=timeline_timestamps,
         attrs={
             "annotation_overlays": _combined_annotation_overlays(bmode, tissue),
-            "clinical_colorbar_data_path": tissue.data_path,
-            "clinical_colorbar_value_range": _value_range(tissue, np.asarray(tissue.data)),
+            "cartesian_colorbar_data_path": tissue.data_path,
+            "cartesian_colorbar_value_range": _value_range(tissue, np.asarray(tissue.data)),
         },
     )
 
 
-def _clinical_single(loaded: LoadedArray) -> LoadedArray:
+def _cartesian_single(loaded: LoadedArray) -> LoadedArray:
     geometry = _geometry(loaded)
     data = np.asarray(loaded.data)
     frame_count = _frame_count(data)
@@ -185,9 +185,9 @@ def _clinical_single(loaded: LoadedArray) -> LoadedArray:
     for index in range(frame_count):
         cart = sector_to_cartesian(_frame_at(data, index), geometry, grid=grid, interpolation="linear")
         converted.append(_masked_rgba(loaded, cart.data, cart.mask))
-    return _clinical_loaded(
+    return _cartesian_loaded(
         source=loaded,
-        name=f"clinical_{loaded.name}",
+        name=f"cartesian_{loaded.name}",
         data=np.asarray(converted),
         label_path=loaded.data_path,
         grid=grid,
@@ -208,7 +208,7 @@ def _masked_rgba(loaded: LoadedArray, data: np.ndarray, mask: np.ndarray) -> np.
     )
 
 
-def _clinical_loaded(
+def _cartesian_loaded(
     *,
     source: LoadedArray,
     name: str,
@@ -226,7 +226,7 @@ def _clinical_loaded(
         timestamps_path=source.timestamps_path,
         timestamps=resolved_timestamps,
         sample_rate_hz=_sample_rate_from_timestamps(resolved_timestamps) or source.sample_rate_hz,
-        attrs={**dict(source.attrs), "clinical_source": source.data_path, "clinical_grid": grid, **dict(attrs or {})},
+        attrs={**dict(source.attrs), "cartesian_source": source.data_path, "cartesian_grid": grid, **dict(attrs or {})},
         stream=source.stream,
     )
 
@@ -339,7 +339,7 @@ def _value_range(loaded: LoadedArray, values: np.ndarray) -> tuple[float, float]
     return default_value_range_for_path(loaded.data_path, values) or (0.0, 1.0)
 
 
-def _clinical_timeline_source(*loaded_arrays: LoadedArray) -> tuple[LoadedArray, np.ndarray]:
+def _cartesian_timeline_source(*loaded_arrays: LoadedArray) -> tuple[LoadedArray, np.ndarray]:
     candidates: list[tuple[float, LoadedArray, np.ndarray]] = []
     for loaded in loaded_arrays:
         timestamps = _valid_frame_timestamps(loaded)

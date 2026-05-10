@@ -103,13 +103,13 @@ def test_layout_uses_configured_background_and_bottom_ecg() -> None:
         plt.close(figure)
 
 
-def test_single_pre_converted_image_preserves_aspect_ratio() -> None:
+def test_single_beamspace_image_preserves_aspect_ratio() -> None:
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
     image_panel = PanelSpec(
         loaded=_loaded("2d_brightness_mode", np.zeros((2, 8, 24), dtype=np.float32), np.asarray([0.0, 0.1])),
         kind="image",
         label="B-mode",
-        view="pre_converted",
+        view="beamspace",
     )
     ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
 
@@ -120,20 +120,20 @@ def test_single_pre_converted_image_preserves_aspect_ratio() -> None:
         plt.close(figure)
 
 
-def test_multiple_pre_converted_images_keep_automatic_aspect() -> None:
+def test_multiple_beamspace_images_keep_automatic_aspect() -> None:
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
     panels = (
         PanelSpec(
             loaded=_loaded("2d_brightness_mode", np.zeros((2, 8, 24), dtype=np.float32), np.asarray([0.0, 0.1])),
             kind="image",
             label="B-mode",
-            view="pre_converted",
+            view="beamspace",
         ),
         PanelSpec(
             loaded=_loaded("tissue_doppler", np.zeros((2, 8, 24), dtype=np.float32), np.asarray([0.0, 0.1])),
             kind="image",
             label="TDI",
-            view="pre_converted",
+            view="beamspace",
         ),
     )
     ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
@@ -146,13 +146,13 @@ def test_multiple_pre_converted_images_keep_automatic_aspect() -> None:
         plt.close(figure)
 
 
-def test_pre_converted_doppler_panel_omits_colorbar_by_default() -> None:
+def test_beamspace_doppler_panel_omits_colorbar_by_default() -> None:
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
     tissue_panel = PanelSpec(
         loaded=_loaded("tissue_doppler", np.zeros((2, 8, 8), dtype=np.float32), np.asarray([0.0, 0.1])),
         kind="image",
         label="TDI",
-        view="pre_converted",
+        view="beamspace",
     )
     ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
 
@@ -183,13 +183,13 @@ def test_tissue_doppler_colorbar_displays_cm_per_second() -> None:
     assert spec.tick_labels == ("-20", "0", "20")
 
 
-def test_clinical_doppler_panel_adds_fixed_top_right_colorbar() -> None:
+def test_cartesian_doppler_panel_adds_fixed_top_right_colorbar() -> None:
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
     tissue_panel = PanelSpec(
         loaded=_loaded("tissue_doppler", np.zeros((2, 8, 8), dtype=np.float32), np.asarray([0.0, 0.1])),
         kind="image",
         label="TDI",
-        view="clinical",
+        view="cartesian",
     )
     ecg = TraceSpec(signal=np.asarray([0.0, 1.0, 0.0]), timestamps=np.asarray([0.0, 0.05, 0.1]))
 
@@ -216,15 +216,13 @@ def test_plot_view_modes_build_expected_panel_sets() -> None:
         _loaded("1d_pulsed_wave_doppler", np.zeros((3, 6), dtype=np.float32), np.asarray([0.0, 0.05, 0.1])),
     )
 
-    pre = renderer.build_panel_specs(loaded, view_mode="pre-converted")
-    clinical = renderer.build_panel_specs(loaded, view_mode="clinical")
+    beamspace = renderer.build_panel_specs(loaded, view_mode="beamspace")
     cartesian = renderer.build_panel_specs(loaded, view_mode="cartesian")
     both = renderer.build_panel_specs(loaded, view_mode="both")
 
-    assert [panel.view for panel in pre] == ["pre_converted", "pre_converted"]
-    assert [panel.view for panel in clinical] == ["clinical", "clinical"]
-    assert [panel.view for panel in cartesian] == ["clinical", "clinical"]
-    assert [panel.view for panel in both] == ["pre_converted", "clinical", "clinical"]
+    assert [panel.view for panel in beamspace] == ["beamspace", "beamspace"]
+    assert [panel.view for panel in cartesian] == ["cartesian", "cartesian"]
+    assert [panel.view for panel in both] == ["beamspace", "cartesian", "cartesian"]
     assert [panel.label for panel in both] == [
         "brightness mode",
         "brightness mode",
@@ -780,15 +778,15 @@ def test_3d_brightness_mode_builds_single_mosaic_panel() -> None:
     )
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
 
-    pre = renderer.build_panel_specs((loaded,), view_mode="pre_converted")
-    clinical = renderer.build_panel_specs((loaded,), view_mode="clinical")
+    beamspace = renderer.build_panel_specs((loaded,), view_mode="beamspace")
+    cartesian = renderer.build_panel_specs((loaded,), view_mode="cartesian")
 
-    assert len(pre) == 1
-    assert pre[0].loaded.data.shape == (2, 360, 480)
-    assert pre[0].label == "brightness mode"
-    assert clinical[0].loaded.data.shape[0:2] == (2, 360)
-    assert clinical[0].loaded.data.shape[2] > 480
-    assert clinical[0].view == "clinical"
+    assert len(beamspace) == 1
+    assert beamspace[0].loaded.data.shape == (2, 360, 480)
+    assert beamspace[0].label == "brightness mode"
+    assert cartesian[0].loaded.data.shape[0:2] == (2, 360)
+    assert cartesian[0].loaded.data.shape[2] > 480
+    assert cartesian[0].view == "cartesian"
 
 
 def test_3d_brightness_mode_panel_uses_beat_stitched_timeline() -> None:
@@ -843,7 +841,7 @@ def test_3d_brightness_mode_panel_uses_beat_stitched_timeline() -> None:
     )
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
 
-    (panel,) = renderer.build_panel_specs((loaded,), view_mode="pre_converted")
+    (panel,) = renderer.build_panel_specs((loaded,), view_mode="beamspace")
 
     assert panel.loaded.attrs["3d_was_beat_stitched"] is True
     assert panel.loaded.attrs["3d_stitch_beat_count"] == 4
@@ -938,7 +936,7 @@ def test_3d_brightness_mode_panel_uses_croissant_stitch_beat_count_for_display_s
     loaded = open_recording(record, root=tmp_path).load_modality("3d_brightness_mode")
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
 
-    (panel,) = renderer.build_panel_specs((loaded,), view_mode="pre_converted")
+    (panel,) = renderer.build_panel_specs((loaded,), view_mode="beamspace")
 
     assert loaded.stream is not None
     assert loaded.stream.metadata.stitch_beat_count == 4
@@ -1016,14 +1014,14 @@ def test_recording_plotter_loads_annotation_overlays_by_default(tmp_path: Path) 
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode",),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
     disabled_panels, _disabled_ecg = renderer._load_specs(
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode",),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=False,
     )
 
@@ -1043,7 +1041,7 @@ def test_recording_plotter_loads_annotation_overlays_by_default(tmp_path: Path) 
         plt.close(figure)
 
 
-def test_tissue_doppler_gate_draws_preconverted_vertical_marker(tmp_path: Path) -> None:
+def test_tissue_doppler_gate_draws_beamspace_vertical_marker(tmp_path: Path) -> None:
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
     group.create_array("data/tissue_doppler", data=np.full((1, 8, 8), 128, dtype=np.uint8))
     group.create_array("timestamps/tissue_doppler", data=np.asarray([0.0], dtype=np.float32))
@@ -1100,7 +1098,7 @@ def test_tissue_doppler_gate_draws_preconverted_vertical_marker(tmp_path: Path) 
         record,
         root=tmp_path,
         modalities=("tissue_doppler", "1d_pulsed_wave_doppler"),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
 
@@ -1126,7 +1124,7 @@ def test_tissue_doppler_gate_draws_preconverted_vertical_marker(tmp_path: Path) 
         plt.close(figure)
 
 
-def test_mmode_sampling_line_draws_in_preconverted_and_clinical_views(tmp_path: Path) -> None:
+def test_mmode_sampling_line_draws_in_beamspace_and_cartesian_views(tmp_path: Path) -> None:
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
     group.create_array("data/2d_brightness_mode", data=np.zeros((1, 8, 8), dtype=np.uint8))
     group.create_array("timestamps/2d_brightness_mode", data=np.asarray([0.0], dtype=np.float32))
@@ -1179,7 +1177,7 @@ def test_mmode_sampling_line_draws_in_preconverted_and_clinical_views(tmp_path: 
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode", "1d_motion_mode"),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
     assert pre_panels[0].loaded.attrs["annotation_overlays"][0]["kind"] == "sampling_line"
@@ -1196,27 +1194,27 @@ def test_mmode_sampling_line_draws_in_preconverted_and_clinical_views(tmp_path: 
     finally:
         plt.close(pre_figure)
 
-    clinical_panels, clinical_ecg = renderer._load_specs(
+    cartesian_panels, cartesian_ecg = renderer._load_specs(
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode", "1d_motion_mode"),
-        view_mode="clinical",
+        view_mode="cartesian",
         show_annotations=True,
     )
-    clinical_figure = renderer.render_figure_from_specs(
-        panels=clinical_panels, ecg=clinical_ecg, time_s=0.0, frame_index=0, dpi=100
+    cartesian_figure = renderer.render_figure_from_specs(
+        panels=cartesian_panels, ecg=cartesian_ecg, time_s=0.0, frame_index=0, dpi=100
     )
     try:
         foreground = [
             line
-            for line in clinical_figure.axes[0].lines
+            for line in cartesian_figure.axes[0].lines
             if to_hex(line.get_color(), keep_alpha=False) == "#4ac44a" and np.isclose(line.get_zorder(), 8.5)
         ]
         solid = [line for line in foreground if line.get_linestyle() == "-"]
         assert len(solid) == 1
         assert np.allclose(np.column_stack([solid[0].get_xdata(), solid[0].get_ydata()]), cursor_line)
     finally:
-        plt.close(clinical_figure)
+        plt.close(cartesian_figure)
 
 
 def test_continuous_wave_sampling_metadata_draws_line_not_box(tmp_path: Path) -> None:
@@ -1262,7 +1260,7 @@ def test_continuous_wave_sampling_metadata_draws_line_not_box(tmp_path: Path) ->
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode", "1d_continuous_wave_doppler"),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
     figure = renderer.render_figure_from_specs(panels=panels, ecg=ecg, time_s=0.0, frame_index=0, dpi=100)
@@ -1274,7 +1272,7 @@ def test_continuous_wave_sampling_metadata_draws_line_not_box(tmp_path: Path) ->
         plt.close(figure)
 
 
-def test_clinical_tissue_doppler_carries_gate_overlay(tmp_path: Path) -> None:
+def test_cartesian_tissue_doppler_carries_gate_overlay(tmp_path: Path) -> None:
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
     group.create_array("data/2d_brightness_mode", data=np.zeros((1, 8, 8), dtype=np.uint8))
     group.create_array("timestamps/2d_brightness_mode", data=np.asarray([0.0], dtype=np.float32))
@@ -1337,7 +1335,7 @@ def test_clinical_tissue_doppler_carries_gate_overlay(tmp_path: Path) -> None:
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode", "tissue_doppler"),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
     assert all(
@@ -1345,15 +1343,15 @@ def test_clinical_tissue_doppler_carries_gate_overlay(tmp_path: Path) -> None:
         for panel in no_spectral_panels
     )
 
-    preconverted_panels, _ = renderer._load_specs(
+    beamspace_panels, _ = renderer._load_specs(
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode", "tissue_doppler", "1d_pulsed_wave_doppler"),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
     sector_panels = tuple(
-        panel for panel in preconverted_panels if panel.loaded.data_path != "data/1d_pulsed_wave_doppler"
+        panel for panel in beamspace_panels if panel.loaded.data_path != "data/1d_pulsed_wave_doppler"
     )
     assert [panel.loaded.data_path for panel in sector_panels] == ["data/2d_brightness_mode", "data/tissue_doppler"]
     assert all(
@@ -1365,11 +1363,11 @@ def test_clinical_tissue_doppler_carries_gate_overlay(tmp_path: Path) -> None:
         record,
         root=tmp_path,
         modalities=("2d_brightness_mode", "tissue_doppler", "1d_pulsed_wave_doppler"),
-        view_mode="clinical",
+        view_mode="cartesian",
         show_annotations=True,
     )
 
-    assert panels[0].view == "clinical"
+    assert panels[0].view == "cartesian"
     assert sum(overlay["kind"] == "sampling_gate" for overlay in panels[0].loaded.attrs["annotation_overlays"]) == 1
 
     figure = renderer.render_figure_from_specs(panels=panels, ecg=ecg, time_s=0.0, frame_index=0, dpi=100)
@@ -1445,12 +1443,12 @@ def test_3d_mesh_annotation_builds_mosaic_overlay_lines() -> None:
     )
     renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=300, dpi=100))
 
-    (pre_panel,) = renderer.build_panel_specs((loaded,), view_mode="pre_converted")
-    (clinical_panel,) = renderer.build_panel_specs((loaded,), view_mode="clinical")
+    (pre_panel,) = renderer.build_panel_specs((loaded,), view_mode="beamspace")
+    (cartesian_panel,) = renderer.build_panel_specs((loaded,), view_mode="cartesian")
 
     assert "mosaic_annotation_lines" not in pre_panel.loaded.attrs
-    assert "mosaic_annotation_lines" in clinical_panel.loaded.attrs
-    assert any(line.size for line in clinical_panel.loaded.attrs["mosaic_annotation_lines"][0])
+    assert "mosaic_annotation_lines" in cartesian_panel.loaded.attrs
+    assert any(line.size for line in cartesian_panel.loaded.attrs["mosaic_annotation_lines"][0])
 
 
 def test_3d_mesh_arrays_without_manifest_link_do_not_attach_overlay(tmp_path: Path) -> None:
@@ -1465,7 +1463,7 @@ def test_3d_mesh_arrays_without_manifest_link_do_not_attach_overlay(tmp_path: Pa
     loaded = attach_annotation_overlays(store, (store.load_modality("3d_brightness_mode"),))[0]
 
     assert "mesh_annotation" not in loaded.attrs
-    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="clinical")
+    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="cartesian")
     assert "mosaic_annotation_lines" not in panel.loaded.attrs
 
 
@@ -1480,7 +1478,7 @@ def test_explicit_3d_mesh_sequence_builds_moving_mosaic_overlay(tmp_path: Path) 
     loaded = attach_annotation_overlays(store, (store.load_modality("3d_brightness_mode"),))[0]
 
     assert "mesh_annotation" in loaded.attrs
-    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="clinical")
+    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="cartesian")
 
     assert "mosaic_annotation_lines" in panel.loaded.attrs
     assert len(panel.loaded.attrs["mosaic_annotation_lines"]) == 2
@@ -1495,7 +1493,7 @@ def test_single_frame_3d_mesh_sequence_does_not_repeat_on_multi_frame_volume(tmp
     group.attrs["recording_manifest"] = _three_d_manifest()
     store = open_recording(tmp_path / "case.zarr")
     loaded = attach_annotation_overlays(store, (store.load_modality("3d_brightness_mode"),))[0]
-    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="clinical")
+    (panel,) = RecordingPlotRenderer().build_panel_specs((loaded,), view_mode="cartesian")
 
     assert "mesh_annotation" in loaded.attrs
     assert "mosaic_annotation_lines" not in panel.loaded.attrs
@@ -1559,7 +1557,7 @@ def test_image_renderer_draws_mosaic_annotation_polygons_without_edges() -> None
         ),
         kind="image",
         label="mesh",
-        view="clinical",
+        view="cartesian",
     )
     figure, ax = plt.subplots()
     try:

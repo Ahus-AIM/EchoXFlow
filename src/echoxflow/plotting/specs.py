@@ -11,8 +11,8 @@ import numpy as np
 from echoxflow.loading import LoadedArray
 
 PanelKind = Literal["image", "matrix", "line"]
-PlotViewMode = Literal["pre_converted", "clinical", "both"]
-PanelView = Literal["pre_converted", "clinical"]
+PlotViewMode = Literal["beamspace", "cartesian", "both"]
+PanelView = Literal["beamspace", "cartesian"]
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class PanelSpec:
     loaded: LoadedArray
     kind: PanelKind
     label: str
-    view: PanelView = "pre_converted"
+    view: PanelView = "beamspace"
 
 
 @dataclass(frozen=True)
