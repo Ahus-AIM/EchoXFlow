@@ -10,10 +10,10 @@ from echoxflow.scan import (
     SlicePlane,
     SphericalGeometry,
     VolumeGrid,
-    clinical_spherical_mosaic,
+    beamspace_spherical_mosaic,
+    cartesian_spherical_mosaic,
     compose_layers,
     opacity_from_values,
-    preconverted_spherical_mosaic,
     prepare_3d_brightness_for_display,
     relative_qrs_trigger_times,
     relative_volume_timestamps,
@@ -216,20 +216,20 @@ def test_spherical_mosaics_return_twelve_temporal_slices() -> None:
         elevation_width_rad=0.7,
     )
 
-    pre = preconverted_spherical_mosaic(volumes, output_size=(8, 10))
-    clinical = clinical_spherical_mosaic(volumes, geometry, output_size=(8, 10), interpolation="nearest")
+    beamspace = beamspace_spherical_mosaic(volumes, output_size=(8, 10))
+    cartesian = cartesian_spherical_mosaic(volumes, geometry, output_size=(8, 10), interpolation="nearest")
 
-    assert pre.frames.shape == (2, 24, 40)
-    assert clinical.frames.shape == (2, 24, 40)
-    assert float(np.max(pre.frames)) > 0.0
-    assert float(np.nanmax(clinical.frames)) > 0.0
-    assert np.isnan(clinical.frames).any()
+    assert beamspace.frames.shape == (2, 24, 40)
+    assert cartesian.frames.shape == (2, 24, 40)
+    assert float(np.max(beamspace.frames)) > 0.0
+    assert float(np.nanmax(cartesian.frames)) > 0.0
+    assert np.isnan(cartesian.frames).any()
 
 
-def test_preconverted_spherical_mosaic_first_column_has_radial_axis_vertical() -> None:
+def test_beamspace_spherical_mosaic_first_column_has_radial_axis_vertical() -> None:
     volumes = np.arange(1 * 3 * 5 * 5, dtype=np.float32).reshape(1, 3, 5, 5)
 
-    mosaic = preconverted_spherical_mosaic(volumes, output_size=(5, 3))
+    mosaic = beamspace_spherical_mosaic(volumes, output_size=(5, 3))
 
     first_row_panel = mosaic.frames[0, 0:5, 0:3]
     middle_row_panel = mosaic.frames[0, 5:10, 0:3]

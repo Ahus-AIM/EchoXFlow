@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from echoxflow import RecordingArray, RecordingRecord, open_recording
 from echoxflow.loading import LoadedArray
 from echoxflow.plotting import PlotViewMode, blend_segmentation_rgb
-from echoxflow.plotting.clinical import (
+from echoxflow.plotting.cartesian import (
     _compose_tissue_overlay,
     _outside_middle_colormap_band,
     _tissue_rgba_frame,
@@ -326,7 +326,7 @@ def _segmentation_recording_preview_specs(
 
 def _preview_view_mode(sample: object) -> PlotViewMode:
     if str(getattr(sample, "coordinate_space", "")).strip().lower() == "cartesian":
-        return "pre_converted"
+        return "beamspace"
     return "both"
 
 
@@ -426,7 +426,7 @@ def _tissue_recording_preview_specs(
     extra_arrays = _native_tdi_extra_arrays(store, source_stream)
     common_arrays = _common_preview_arrays(store, sample, extra=extra_arrays)
     videos = {"real": expected_video, "predicted": predicted_video}
-    is_cartesian = _preview_view_mode(sample) == "pre_converted"
+    uses_cartesian_prediction = _preview_view_mode(sample) == "beamspace"
 
     def build_modality_arrays(suffix: str) -> Sequence[RecordingArray]:
         encoded = _encode_tissue_doppler_for_source(
@@ -444,21 +444,21 @@ def _tissue_recording_preview_specs(
                 content_type="tissue_doppler",
             )
         ]
-        if is_cartesian:
+        if uses_cartesian_prediction:
             arrays.append(
                 RecordingArray(
-                    data_path="data/clinical_tissue_doppler",
+                    data_path="data/cartesian_tissue_doppler",
                     values=_cartesian_tissue_overlay_video(
                         sample=sample,
                         tissue_video=videos[suffix],
                         velocity_limit_mps=limit,
                     ),
                     timestamps=target_timestamps,
-                    timestamps_path="timestamps/clinical_tissue_doppler",
-                    content_type="clinical_tissue_doppler",
+                    timestamps_path="timestamps/cartesian_tissue_doppler",
+                    content_type="cartesian_tissue_doppler",
                     attrs={
-                        "clinical_colorbar_data_path": "data/tissue_doppler",
-                        "clinical_colorbar_value_range": [-float(limit), float(limit)],
+                        "cartesian_colorbar_data_path": "data/tissue_doppler",
+                        "cartesian_colorbar_value_range": [-float(limit), float(limit)],
                     },
                 )
             )
@@ -469,7 +469,9 @@ def _tissue_recording_preview_specs(
         real=tuple(build_modality_arrays("real")),
         predicted=tuple(build_modality_arrays("predicted")),
         attrs=_preview_attrs(store),
-        modalities=("clinical_tissue_doppler",) if is_cartesian else ("2d_brightness_mode", "tissue_doppler"),
+        modalities=(
+            ("cartesian_tissue_doppler",) if uses_cartesian_prediction else ("2d_brightness_mode", "tissue_doppler")
+        ),
         view_mode=_preview_view_mode(sample),
     )
 
@@ -563,10 +565,10 @@ def _color_recording_preview_specs(
                 content_type="2d_color_doppler_power",
             ),
         ]
-        if _preview_view_mode(sample) == "pre_converted":
+        if _preview_view_mode(sample) == "beamspace":
             arrays.append(
                 RecordingArray(
-                    data_path="data/clinical_color_doppler",
+                    data_path="data/cartesian_color_doppler",
                     values=_cartesian_color_overlay_video(
                         sample=sample,
                         velocity_video=velocity,
@@ -574,11 +576,11 @@ def _color_recording_preview_specs(
                         velocity_limit_mps=velocity_limit,
                     ),
                     timestamps=doppler_timestamps,
-                    timestamps_path="timestamps/clinical_color_doppler",
-                    content_type="clinical_color_doppler",
+                    timestamps_path="timestamps/cartesian_color_doppler",
+                    content_type="cartesian_color_doppler",
                     attrs={
-                        "clinical_colorbar_data_path": "data/2d_color_doppler_velocity",
-                        "clinical_colorbar_value_range": [-float(velocity_limit), float(velocity_limit)],
+                        "cartesian_colorbar_data_path": "data/2d_color_doppler_velocity",
+                        "cartesian_colorbar_value_range": [-float(velocity_limit), float(velocity_limit)],
                     },
                 )
             )
@@ -595,8 +597,8 @@ def _color_recording_preview_specs(
         predicted=tuple(build_modality_arrays("predicted")),
         attrs=attrs,
         modalities=(
-            ("clinical_color_doppler",)
-            if _preview_view_mode(sample) == "pre_converted"
+            ("cartesian_color_doppler",)
+            if _preview_view_mode(sample) == "beamspace"
             else ("2d_brightness_mode", "2d_color_doppler_velocity", "2d_color_doppler_power")
         ),
         view_mode=_preview_view_mode(sample),
@@ -630,7 +632,7 @@ def _common_preview_arrays(
     extra: Sequence[RecordingArray] = (),
 ) -> tuple[RecordingArray, ...]:
     common = common_preview_arrays(store, sample, extra=extra)
-    if _preview_view_mode(sample) != "pre_converted":
+    if _preview_view_mode(sample) != "beamspace":
         return common
     bmode = _tensor_video(getattr(sample, "frames"))[:, 0]
     return (

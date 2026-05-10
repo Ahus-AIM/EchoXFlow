@@ -44,7 +44,7 @@ def test_strain_plotter_builds_self_referenced_bmode_with_contour_and_curve(tmp_
         record,
         root=tmp_path,
         modalities=("strain",),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
 
@@ -131,7 +131,7 @@ def test_strain_plotter_opens_external_lv_panels_by_default(tmp_path: Path) -> N
         record,
         root=tmp_path,
         modalities=None,
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=False,
     )
 
@@ -189,7 +189,7 @@ def test_strain_linked_panels_start_together_at_qrs(tmp_path: Path) -> None:
         record,
         root=tmp_path,
         modalities=("strain",),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
 
@@ -230,7 +230,7 @@ def test_strain_plotter_can_select_one_role_from_explicit_modalities(tmp_path: P
         record,
         root=tmp_path,
         modalities=("4ch_contour",),
-        view_mode="pre_converted",
+        view_mode="beamspace",
         show_annotations=True,
     )
 

@@ -1,4 +1,4 @@
-"""Reusable clinical-view gating masks for Doppler overlays."""
+"""Reusable cartesian-view gating masks for Doppler overlays."""
 
 from __future__ import annotations
 

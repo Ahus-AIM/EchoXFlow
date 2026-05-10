@@ -543,8 +543,8 @@ def mesh_mosaic_annotation_lines(
     volume_timestamps: np.ndarray | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[tuple[np.ndarray, ...], ...]:
-    """Build per-frame mesh intersection lines in clinical 3D mosaic pixel coordinates."""
-    if view != "clinical":
+    """Build per-frame mesh intersection lines in cartesian 3D mosaic pixel coordinates."""
+    if view != "cartesian":
         return tuple(() for _ in range(max(0, int(frame_count))))
     if frame_count > 1:
         volume_times = np.asarray([] if volume_timestamps is None else volume_timestamps).reshape(-1)

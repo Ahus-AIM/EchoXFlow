@@ -22,7 +22,7 @@ from echoxflow.croissant import RecordingRecord
 from echoxflow.loading import LoadedArray, PackedMeshAnnotation, RecordingStore, open_recording
 from echoxflow.objects import AnnotationRef, RecordingObject, StrainPanel
 from echoxflow.plotting.annotations import attach_annotation_overlays, mesh_mosaic_annotation_lines
-from echoxflow.plotting.clinical import clinical_loaded_arrays
+from echoxflow.plotting.cartesian import cartesian_loaded_arrays
 from echoxflow.plotting.layout import spatial_layout, uses_ecg_timescale
 from echoxflow.plotting.panels import render_ecg, renderer_for
 from echoxflow.plotting.specs import (
@@ -38,8 +38,8 @@ from echoxflow.plotting.style import PlotStyle
 from echoxflow.plotting.timeline import nearest_index, resolve_frame_time, select_timeline, temporal_length
 from echoxflow.plotting.writers import figure_to_rgb, save_figure, write_video
 from echoxflow.scan import (
-    clinical_spherical_mosaic,
-    preconverted_spherical_mosaic,
+    beamspace_spherical_mosaic,
+    cartesian_spherical_mosaic,
     prepare_3d_brightness_for_display,
     spherical_geometry_from_metadata,
 )
@@ -68,7 +68,7 @@ class RecordingPlotRenderer:
         modalities: tuple[str, ...] | None = None,
         time_s: float | None = None,
         frame_index: int | None = None,
-        view_mode: PlotViewMode | str = "pre_converted",
+        view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
     ) -> Figure:
         panels, ecg = self._load_specs(
@@ -92,7 +92,7 @@ class RecordingPlotRenderer:
         modalities: tuple[str, ...] | None = None,
         time_s: float | None = None,
         frame_index: int | None = None,
-        view_mode: PlotViewMode | str = "pre_converted",
+        view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
     ) -> RenderedFrame:
         figure = self.plot_recording(
@@ -128,7 +128,7 @@ class RecordingPlotRenderer:
         modalities: tuple[str, ...] | None = None,
         time_s: float | None = None,
         frame_index: int | None = None,
-        view_mode: PlotViewMode | str = "pre_converted",
+        view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
         dpi: int = 200,
     ) -> Path:
@@ -153,7 +153,7 @@ class RecordingPlotRenderer:
         *,
         root: str | Path | None = None,
         modalities: tuple[str, ...] | None = None,
-        view_mode: PlotViewMode | str = "pre_converted",
+        view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
         max_fps: float | None = None,
         dpi: int = 150,
@@ -191,7 +191,7 @@ class RecordingPlotRenderer:
             raise ValueError("At least one non-ECG modality panel is required")
         spatial_panels = tuple(panel for panel in panels if not uses_ecg_timescale(panel))
         temporal_panels = tuple(panel for panel in panels if uses_ecg_timescale(panel))
-        preserve_single_preconverted_image_aspect = _preserve_single_preconverted_image_aspect(panels)
+        preserve_single_beamspace_image_aspect = _preserve_single_beamspace_image_aspect(panels)
         layout = spatial_layout(spatial_panels)
         cols = layout.cols
         spatial_rows = layout.rows
@@ -213,7 +213,7 @@ class RecordingPlotRenderer:
             ax = figure.add_subplot(grid[placement.row : row_end, placement.col : col_end])
             panel = placement.panel
             renderer_for(panel.kind).render(ax, panel, time_s=time_s, frame_index=frame_index, style=self.style)
-            if preserve_single_preconverted_image_aspect and panel is panels[0]:
+            if preserve_single_beamspace_image_aspect and panel is panels[0]:
                 ax.set_aspect("equal", adjustable="box")
             for row in range(placement.row, row_end):
                 for col in range(placement.col, col_end):
@@ -240,7 +240,7 @@ class RecordingPlotRenderer:
         return figure
 
     def build_panel_specs(
-        self, loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewMode | str = "pre_converted"
+        self, loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewMode | str = "beamspace"
     ) -> tuple[PanelSpec, ...]:
         """Build display panel specs from loaded modality arrays."""
         return _panel_specs(loaded_arrays, view_mode=_normalize_view_mode(view_mode))
@@ -282,8 +282,8 @@ def _resolve_modality_paths(store: RecordingStore, modalities: tuple[str, ...] |
     return tuple(dict.fromkeys(resolved))
 
 
-def _preserve_single_preconverted_image_aspect(panels: tuple[PanelSpec, ...]) -> bool:
-    return len(panels) == 1 and panels[0].view == "pre_converted" and panels[0].kind == "image"
+def _preserve_single_beamspace_image_aspect(panels: tuple[PanelSpec, ...]) -> bool:
+    return len(panels) == 1 and panels[0].view == "beamspace" and panels[0].kind == "image"
 
 
 def _should_plot_strain_object(
@@ -321,7 +321,7 @@ def _strain_specs(
     if not selected_panels:
         raise KeyError(f"Requested strain modalities are not available in {store.path}")
     normalized_view = _normalize_view_mode(view_mode)
-    image_view: PanelView = "clinical" if normalized_view == "clinical" else "pre_converted"
+    image_view: PanelView = "cartesian" if normalized_view == "cartesian" else "beamspace"
     image_inputs = _align_strain_image_inputs(tuple(_strain_image_input(store, panel) for panel in selected_panels))
     image_specs = [
         _strain_image_spec(image_input, view=image_view, show_annotations=show_annotations)
@@ -389,11 +389,11 @@ def _strain_image_spec(
     if show_annotations and contour_overlays:
         attrs["annotation_overlays"] = (*tuple(attrs.get("annotation_overlays", ())), *contour_overlays)
     loaded = replace(loaded, attrs=attrs)
-    if view == "clinical":
+    if view == "cartesian":
         if _loaded_has_sector_geometry(loaded):
-            loaded = clinical_loaded_arrays((loaded,))[0]
+            loaded = cartesian_loaded_arrays((loaded,))[0]
         else:
-            view = "pre_converted"
+            view = "beamspace"
     return PanelSpec(
         loaded=loaded,
         kind="image",
@@ -511,7 +511,7 @@ def _strain_curve_spec(
         loaded=loaded,
         kind="line",
         label=f"{label_role} strain",
-        view="pre_converted",
+        view="beamspace",
     )
 
 
@@ -1042,17 +1042,17 @@ def _panel_specs(loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewM
     if _has_3d_brightness(loaded_arrays):
         return (_three_dimensional_panel(loaded_arrays, view_mode=view_mode),)
     panels: list[PanelSpec] = []
-    if view_mode == "pre_converted":
-        panels.extend(_panel_spec(loaded, view="pre_converted") for loaded in _preconverted_arrays(loaded_arrays))
+    if view_mode == "beamspace":
+        panels.extend(_panel_spec(loaded, view="beamspace") for loaded in _beamspace_arrays(loaded_arrays))
     if view_mode == "both":
         panels.extend(
-            _panel_spec(loaded, view="pre_converted")
-            for loaded in _preconverted_arrays(loaded_arrays)
+            _panel_spec(loaded, view="beamspace")
+            for loaded in _beamspace_arrays(loaded_arrays)
             if _panel_kind(loaded) == "image"
         )
-    if view_mode in {"clinical", "both"}:
-        _validate_clinical_color_doppler_pair(loaded_arrays)
-        panels.extend(_panel_spec(loaded, view="clinical") for loaded in _clinical_arrays(loaded_arrays))
+    if view_mode in {"cartesian", "both"}:
+        _validate_cartesian_color_doppler_pair(loaded_arrays)
+        panels.extend(_panel_spec(loaded, view="cartesian") for loaded in _cartesian_arrays(loaded_arrays))
     return tuple(panels)
 
 
@@ -1076,13 +1076,13 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
     acquisition_stitch_beat_count = (
         None if loaded.stream is None else loaded.stream.metadata.stitch_beat_count
     ) or prepared.stitch_beat_count
-    if view_mode == "pre_converted":
-        mosaic = preconverted_spherical_mosaic(prepared.volumes).frames
-        view: PanelView = "pre_converted"
+    if view_mode == "beamspace":
+        mosaic = beamspace_spherical_mosaic(prepared.volumes).frames
+        view: PanelView = "beamspace"
     else:
         geometry = spherical_geometry_from_metadata(raw)
-        mosaic = clinical_spherical_mosaic(prepared.volumes, geometry).frames
-        view = "clinical"
+        mosaic = cartesian_spherical_mosaic(prepared.volumes, geometry).frames
+        view = "cartesian"
     attrs = {
         **dict(loaded.attrs),
         "3d_mosaic_rows": 3,
@@ -1093,7 +1093,7 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
     if prepared.source_timestamps is not None:
         attrs["ecg_marker_timestamps"] = prepared.source_timestamps
     mesh_annotation = attrs.get("mesh_annotation")
-    if view == "clinical" and isinstance(mesh_annotation, PackedMeshAnnotation):
+    if view == "cartesian" and isinstance(mesh_annotation, PackedMeshAnnotation):
         try:
             geometry = spherical_geometry_from_metadata(raw)
             lines = mesh_mosaic_annotation_lines(
@@ -1122,25 +1122,25 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
     )
 
 
-def _clinical_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
+def _cartesian_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
     visual = tuple(loaded for loaded in loaded_arrays if _panel_kind(loaded) == "image")
     temporal = tuple(loaded for loaded in loaded_arrays if _panel_kind(loaded) != "image")
     if not visual:
         return loaded_arrays
-    clinical = clinical_loaded_arrays(visual)
-    return (*(clinical or visual), *temporal)
+    cartesian = cartesian_loaded_arrays(visual)
+    return (*(cartesian or visual), *temporal)
 
 
-def _preconverted_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
+def _beamspace_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
     color = _first_loaded(loaded_arrays, "data/2d_color_doppler_velocity") or _first_loaded(
         loaded_arrays, "data/2d_color_doppler_power"
     )
     if color is None:
         return loaded_arrays
-    return tuple(_with_preconverted_color_extent(loaded, color) for loaded in loaded_arrays)
+    return tuple(_with_beamspace_color_extent(loaded, color) for loaded in loaded_arrays)
 
 
-def _with_preconverted_color_extent(loaded: LoadedArray, color: LoadedArray) -> LoadedArray:
+def _with_beamspace_color_extent(loaded: LoadedArray, color: LoadedArray) -> LoadedArray:
     attrs: dict[str, object] = {}
     color_sector = _loaded_sector_metadata(color)
     if color_sector is None:
@@ -1148,10 +1148,10 @@ def _with_preconverted_color_extent(loaded: LoadedArray, color: LoadedArray) -> 
     if loaded.data_path.startswith("data/2d_brightness_mode"):
         reference_sector = _loaded_sector_metadata(loaded)
         if reference_sector is not None:
-            attrs["preconverted_reference_sector"] = reference_sector
-            attrs["preconverted_color_doppler_sector"] = color_sector
+            attrs["beamspace_reference_sector"] = reference_sector
+            attrs["beamspace_color_doppler_sector"] = color_sector
     elif loaded.data_path in {"data/2d_color_doppler_velocity", "data/2d_color_doppler_power"}:
-        attrs["preconverted_color_doppler_sector"] = color_sector
+        attrs["beamspace_color_doppler_sector"] = color_sector
     if not attrs:
         return loaded
     return replace(loaded, attrs={**dict(loaded.attrs), **attrs})
@@ -1167,7 +1167,7 @@ def _loaded_sector_metadata(loaded: LoadedArray) -> object | None:
     return loaded.stream.metadata.raw
 
 
-def _validate_clinical_color_doppler_pair(loaded_arrays: tuple[LoadedArray, ...]) -> None:
+def _validate_cartesian_color_doppler_pair(loaded_arrays: tuple[LoadedArray, ...]) -> None:
     paths = {loaded.data_path for loaded in loaded_arrays}
     has_velocity = "data/2d_color_doppler_velocity" in paths
     has_power = "data/2d_color_doppler_power" in paths
@@ -1176,7 +1176,7 @@ def _validate_clinical_color_doppler_pair(loaded_arrays: tuple[LoadedArray, ...]
     missing = "data/2d_color_doppler_power" if has_velocity else "data/2d_color_doppler_velocity"
     present = "data/2d_color_doppler_velocity" if has_velocity else "data/2d_color_doppler_power"
     raise ValueError(
-        "Clinical color Doppler plotting requires velocity and power arrays together; "
+        "Cartesian color Doppler plotting requires velocity and power arrays together; "
         f"{present} was provided without {missing}."
     )
 
@@ -1243,10 +1243,10 @@ def _normalize_data_path(path: str) -> str:
 
 def _normalize_view_mode(view_mode: PlotViewMode | str) -> PlotViewMode:
     text = str(view_mode).strip().lower().replace("-", "_")
-    if text in {"pre_converted", "preconverted", "raw"}:
-        return "pre_converted"
-    if text in {"clinical", "cartesian"}:
-        return "clinical"
+    if text in {"beamspace", "raw"}:
+        return "beamspace"
+    if text == "cartesian":
+        return "cartesian"
     if text == "both":
         return "both"
     raise ValueError(f"Unsupported plot view mode `{view_mode}`")
@@ -1254,6 +1254,6 @@ def _normalize_view_mode(view_mode: PlotViewMode | str) -> PlotViewMode:
 
 def _label(path: str) -> str:
     name = path.removeprefix("data/")
-    for prefix in ("clinical_", "1d_", "2d_", "3d_"):
+    for prefix in ("cartesian_", "1d_", "2d_", "3d_"):
         name = name.removeprefix(prefix)
     return name.replace("_", " ")

@@ -78,7 +78,7 @@ def _array_ref_path(value: object) -> str | None:
     return str(path).strip("/") if path else None
 
 
-def preconverted_spherical_mosaic(
+def beamspace_spherical_mosaic(
     volumes: np.ndarray,
     *,
     output_size: tuple[int, int] = (120, 120),
@@ -93,7 +93,7 @@ def preconverted_spherical_mosaic(
     return SphericalMosaic(frames=_mosaic_frames(tuple(panels), rows=3, cols=4, fill_value=0.0))
 
 
-def clinical_spherical_mosaic(
+def cartesian_spherical_mosaic(
     volumes: np.ndarray,
     geometry: SphericalGeometry,
     *,
