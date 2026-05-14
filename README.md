@@ -86,7 +86,7 @@ export ECHOXFLOW_DATA_ROOT=/path/to/EchoXFlow
 
 ## Reproduce Our Results
 
-This workflow is under development. Generate the dataset statistics table with
+Generate the dataset statistics table with
 [scripts/croissant_summary_table.py](scripts/croissant_summary_table.py):
 
 ```bash
@@ -126,7 +126,7 @@ catalog = load_croissant("/path/to/EchoXFlow/croissant.json")
 
 records = find_recordings(
     croissant=catalog,
-    content_types=(
+    array_paths=(
         "2d_brightness_mode",
         "2d_color_doppler_velocity",
         "2d_color_doppler_power",
@@ -159,8 +159,12 @@ uv run pre-commit run --all-files
 ## Citation
 
 ```bibtex
-@dataset{echoxflow,
-  title = {EchoXFlow},
-  year = {2026}
+@misc{stenhede_2026_echoxflow,
+  title = {EchoXFlow: A Beamspace Echocardiography Dataset for Cardiac Motion, Flow, and Function},
+  author = {Stenhede, Elias and Sulkowska, Joanna and Orstad, Eivind Bj{\o}rkan and Schirmer, Henrik and Ranjbar, Arian},
+  year = {2026},
+  eprint = {2605.05447},
+  doi = {10.48550/arXiv.2605.05447},
+  url = {https://arxiv.org/abs/2605.05447}
 }
 ```
