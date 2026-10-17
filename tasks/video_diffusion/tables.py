@@ -211,7 +211,9 @@ def compare_camus(
                 for arm in ARMS
             }
             deltas[replicate] += (values["cartesian"] - values["beamspace"]) / len(views)
-    return _summary(observed, deltas, clusters=len(patients), views=views)
+    result = _summary(observed, deltas, clusters=len(patients), views=views)
+    result["bootstrap_patient_ids"] = patients
+    return result
 
 
 def _summary(

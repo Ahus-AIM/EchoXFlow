@@ -6,11 +6,12 @@ resolution and feature space:
 - the beamspace and Cartesian distances as the mean over folds +- SD across folds;
 - the cross-validated difference ``mean_k (D_cartesian,k - D_beamspace,k)`` and its relative difference
   ``100 x difference / mean_k D_cartesian,k`` (positive favours beamspace);
-- a two-sided, fold-stratified exam-cluster bootstrap test of that difference. Validation folds hold disjoint exams, so
+- a two-sided cluster-bootstrap test of that difference. EchoXFlow validation folds hold disjoint exams, so
   each fold's 2,000 paired exam-bootstrap replicates are independent of the other folds'. Replicate ``r`` of the pooled
   difference averages one replicate per fold, drawn through a fixed per-fold permutation so that equal replicate indices
-  of different folds are not coupled. The p-value is the recentered two-sided bootstrap p-value; Holm's step-down
-  correction runs across all reported feature-space x resolution comparisons, as in the per-fold tables;
+  of different folds are not coupled. CAMUS folds share patients, so the same replicate index is averaged across folds
+  after verifying their ordered patient cohorts match. The p-value is the recentered two-sided bootstrap p-value; Holm's
+  step-down correction runs across all reported feature-space x resolution comparisons, as in the per-fold tables;
 - how many folds favour each arm, and how many of those are significant after the per-fold Holm correction.
 
 Every fold must have finished every comparison with the same replicate count and seed; otherwise the build fails.
@@ -40,7 +41,23 @@ from tasks.video_diffusion.tables import replicate_key
 ALPHA = 0.05
 
 
-def load_fold(directory: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+def _legacy_camus_patients(directory: Path, row: dict[str, Any]) -> list[str]:
+    """Recover the bootstrap order from saved feature metadata without recomputing distances."""
+    patients: list[str] = []
+    for arm in ("beamspace", "cartesian"):
+        evaluation = directory.parent / f"{arm}_{int(row['resolution']):04d}" / "evaluation" / "camus"
+        path = evaluation / "features" / f"{row['extractor']}.npz"
+        if not path.is_file():
+            raise SystemExit(f"cannot verify CAMUS patients: missing {path}; rebuild this fold's CAMUS tables")
+        with np.load(path) as data:
+            cohort = sorted(set(data["generated_exam_ids"].tolist()) | set(data["real_exam_ids"].tolist()))
+        if arm == "cartesian" and cohort != patients:
+            raise SystemExit(f"{directory}: CAMUS arms have different bootstrap patient cohorts")
+        patients = cohort
+    return patients
+
+
+def load_fold(directory: Path, *, camus: bool = False) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     comparison, replicates = directory / "comparison.json", directory / "comparison_replicates.npz"
     for path in (comparison, replicates):
         if not path.is_file():
@@ -48,6 +65,10 @@ def load_fold(directory: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     payload = json.loads(comparison.read_text(encoding="utf-8"))
     with np.load(replicates) as data:
         deltas = {key: np.asarray(data[key], dtype=np.float64) for key in data.files}
+    if camus or directory.name == "tables_camus":
+        for row in payload["rows"]:
+            if "bootstrap_patient_ids" not in row:
+                row["bootstrap_patient_ids"] = _legacy_camus_patients(directory, row)
     return payload, deltas
 
 
@@ -69,12 +90,18 @@ def pool(folds: dict[int, tuple[dict[str, Any], dict[str, np.ndarray]]]) -> tupl
     rows: list[dict[str, Any]] = []
     for resolution, extractor in order:
         per_fold = {fold: keyed[fold][(resolution, extractor)] for fold in sorted(folds)}
+        cohorts = [row.get("bootstrap_patient_ids") for row in per_fold.values()]
+        shared_patients = any(cohort is not None for cohort in cohorts)
+        if shared_patients and (not cohorts[0] or any(cohort != cohorts[0] for cohort in cohorts)):
+            raise SystemExit(
+                f"CAMUS folds have missing or different bootstrap patient cohorts for {resolution} {extractor}"
+            )
         draws = []
         for fold, row in per_fold.items():
             deltas = folds[fold][1].get(replicate_key(resolution, extractor))
             if deltas is None or deltas.shape != (replicates,) or not np.isfinite(deltas).all():
                 raise SystemExit(f"fold {fold}: bad or missing replicates for {resolution} {extractor}")
-            draws.append(deltas[permutations[fold]])
+            draws.append(deltas if shared_patients else deltas[permutations[fold]])
         pooled = np.mean(draws, axis=0)
         beam = np.array([row["beamspace"] for row in per_fold.values()], dtype=np.float64)
         cart = np.array([row["cartesian"] for row in per_fold.values()], dtype=np.float64)
@@ -87,6 +114,11 @@ def pool(folds: dict[int, tuple[dict[str, Any], dict[str, np.ndarray]]]) -> tupl
                 "resolution": resolution,
                 "extractor": extractor,
                 "label": next(iter(per_fold.values()))["label"],
+                "bootstrap": (
+                    "paired patient-cluster bootstrap shared across folds"
+                    if shared_patients
+                    else "fold-stratified paired exam-cluster bootstrap"
+                ),
                 "n_folds": len(per_fold),
                 "folds": ";".join(str(fold) for fold in per_fold),
                 "beamspace_mean": float(beam.mean()),
@@ -163,7 +195,7 @@ def write_outputs(rows: list[dict[str, Any]], output_dir: Path, *, stem: str, re
     output_dir.mkdir(parents=True, exist_ok=True)
     protocol = (
         f"mean over {rows[0]['n_folds']} validation folds +- SD across folds; difference = D_cartesian - D_beamspace "
-        f"averaged over folds (positive favours beamspace); fold-stratified paired exam-cluster bootstrap, "
+        f"averaged over folds (positive favours beamspace); {rows[0]['bootstrap']}, "
         f"{replicates} replicates per fold, seed {seed}; recentered two-sided p, Holm across {len(rows)} comparisons"
     )
     _write_atomic(
@@ -176,7 +208,8 @@ def write_outputs(rows: list[dict[str, Any]], output_dir: Path, *, stem: str, re
         writer.writerows(rows)
     os.replace(output_dir / f"{stem}.csv.tmp", output_dir / f"{stem}.csv")
 
-    lines = ["# ECG-conditioned generation quality, cross-validated", "", protocol + ".", ""]
+    cohort = "CAMUS" if "patient-cluster" in rows[0]["bootstrap"] else "ECG-conditioned"
+    lines = [f"# {cohort} generation quality, cross-validated", "", protocol + ".", ""]
     for resolution in sorted({row["resolution"] for row in rows}):
         lines += [
             f"## {resolution} x {resolution}",
@@ -225,6 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tables-name", default="tables", help="per-fold table directory (tables_camus for the CAMUS evaluation)"
     )
+    parser.add_argument("--camus", action="store_true", help="verify CAMUS cohorts for a custom --tables-name")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--stem", default="comparison_cv", help="output file name without extension")
     return parser
@@ -234,7 +268,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if len(set(args.folds)) < 2:
         raise SystemExit("a cross-validated table needs at least two folds")
-    folds = {fold: load_fold(args.root / f"fold{fold}" / args.tables_name) for fold in sorted(set(args.folds))}
+    folds = {
+        fold: load_fold(args.root / f"fold{fold}" / args.tables_name, camus=args.camus)
+        for fold in sorted(set(args.folds))
+    }
     rows, replicates, seed = pool(folds)
     write_outputs(rows, args.output_dir, stem=args.stem, replicates=replicates, seed=seed)
     return 0

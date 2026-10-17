@@ -121,6 +121,20 @@ uv run python -m tasks.video_diffusion.tables --camus --pair 128 <beam-128>/eval
 
 CAMUS results are written to `<run>/evaluation/camus/`.
 
+The cross-validated CAMUS table uses the same patients in every fold, so it averages matching patient-bootstrap
+replicate indices across folds after verifying the ordered patient cohorts, replicate counts and seeds match.
+Rebuild this table from existing per-fold `comparison.json` and `comparison_replicates.npz` files with:
+
+```bash
+uv run python -m tasks.video_diffusion.cv_table --root outputs/video_diffusion --folds 0 1 2 3 4 \
+  --tables-name tables_camus --output-dir outputs/video_diffusion/tables_camus
+```
+
+This only recalculates pooled uncertainty and significance; mean distances remain unchanged. It does not rerun
+training, generation, feature extraction or per-fold bootstrap distances. Older per-fold tables lack patient IDs;
+the command reads them from the saved `fold<k>/<space>_<size>/evaluation/camus/features/*.npz` metadata instead.
+For a custom per-fold table directory, also pass `--camus`.
+
 ## Media
 
 [scripts/render_task4_media.py](../../scripts/render_task4_media.py) renders the README examples from saved

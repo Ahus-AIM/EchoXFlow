@@ -128,6 +128,92 @@ def test_cv_table_pooled_replicates_average_one_permuted_replicate_per_fold(tmp_
     assert rows[0]["ci95_low"] == float(np.quantile(pooled, 0.025))
 
 
+def test_camus_cv_preserves_shared_patient_uncertainty(tmp_path: Path) -> None:
+    arms = _arms()
+    for arm in arms.values():
+        arm["real_views"] = arm["generated_views"]
+    result = tables.compare_camus(arms, kind="frame", replicates=20, seed=31, kid={}, device=torch.device("cpu"))
+    assert result["bootstrap_patient_ids"] == [f"exam{index}" for index in range(8)]
+    deltas = result.pop("replicate_deltas")
+    row = {"resolution": 128, "extractor": "inception", "label": "Inception", **result, "p_holm": 0.5}
+    for fold in range(3):
+        tables.write_tables(
+            [row],
+            tmp_path / f"fold{fold}" / "tables_camus",
+            title="CAMUS",
+            replicates=20,
+            seed=31,
+            replicate_deltas={"r0128_inception": deltas},
+        )
+    folds = {fold: cv_table.load_fold(tmp_path / f"fold{fold}" / "tables_camus") for fold in range(3)}
+    pooled, _, _ = cv_table.pool(folds)
+
+    # Repeating the same patient draws across folds must not narrow their uncertainty.
+    assert [pooled[0]["ci95_low"], pooled[0]["ci95_high"]] == pytest.approx(result["ci95"])
+    assert pooled[0]["p_two_sided"] == result["p_two_sided"]
+    assert pooled[0]["beamspace_mean"] == pytest.approx(result["beamspace"])
+    assert pooled[0]["cartesian_mean"] == pytest.approx(result["cartesian"])
+
+
+@pytest.mark.parametrize("tables_name", ["tables_camus", "external"])
+def test_camus_cv_reuses_legacy_replicates_and_feature_metadata(tmp_path: Path, tables_name: str) -> None:
+    root = _three_folds(tmp_path)
+    draws = []
+    for fold in range(3):
+        directory = root / f"fold{fold}"
+        (directory / "tables").rename(directory / tables_name)
+        with np.load(directory / tables_name / "comparison_replicates.npz") as data:
+            draws.append(data["r0128_inception"])
+        for arm in ("beamspace", "cartesian"):
+            features = directory / f"{arm}_0128" / "evaluation" / "camus" / "features"
+            features.mkdir(parents=True)
+            for extractor in ("inception", "echoclip"):
+                np.savez(
+                    features / f"{extractor}.npz",
+                    generated_exam_ids=["patient2", "patient1", "patient1"],
+                    real_exam_ids=["patient3", "patient1", "patient2"],
+                )
+    output = root / "out"
+    args = ["--root", str(root), "--folds", "0", "1", "2", "--tables-name", tables_name, "--output-dir", str(output)]
+    assert cv_table.main(args + (["--camus"] if tables_name == "external" else [])) == 0
+
+    payload = json.loads((output / "comparison_cv.json").read_text())
+    row = payload["rows"][0]
+    pooled = np.mean(draws, axis=0)
+    assert row["ci95_low"] == float(np.quantile(pooled, 0.025))
+    assert row["ci95_high"] == float(np.quantile(pooled, 0.975))
+    assert row["p_two_sided"] == stats.recentered_p_value(pooled, 11.0)
+    assert row["beamspace_mean"] == 11.0 and row["cartesian_mean"] == 22.0
+    assert "patient-cluster bootstrap shared across folds" in payload["protocol"]
+    assert (output / "comparison_cv.md").read_text().startswith("# CAMUS generation quality")
+
+
+@pytest.mark.parametrize("cohort", [None, [], ["patient1"], ["patient2", "patient1"]])
+def test_camus_cv_rejects_missing_or_different_patient_order(tmp_path: Path, cohort: list[str] | None) -> None:
+    root = _three_folds(tmp_path)
+    folds = {fold: cv_table.load_fold(root / f"fold{fold}" / "tables") for fold in range(3)}
+    for payload, _ in folds.values():
+        for row in payload["rows"]:
+            row["bootstrap_patient_ids"] = ["patient1", "patient2"]
+    folds[2][0]["rows"][0]["bootstrap_patient_ids"] = cohort
+    with pytest.raises(SystemExit, match="missing or different bootstrap patient cohorts"):
+        cv_table.pool(folds)
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_legacy_camus_cv_requires_matching_feature_cohorts(tmp_path: Path, missing: bool) -> None:
+    directory = tmp_path / "fold0" / "tables_camus"
+    _write_fold(directory, [_row(128, "inception", 1.0, 2.0, 0.01)], {"r0128_inception": np.zeros(50)})
+    for arm in ("beamspace", "cartesian"):
+        if arm == "cartesian" and missing:
+            continue
+        features = directory.parent / f"{arm}_0128" / "evaluation" / "camus" / "features"
+        features.mkdir(parents=True)
+        np.savez(features / "inception.npz", generated_exam_ids=[arm], real_exam_ids=["patient1"])
+    with pytest.raises(SystemExit, match="cannot verify CAMUS patients" if missing else "different bootstrap patient"):
+        cv_table.load_fold(directory)
+
+
 def test_cv_table_refuses_incomplete_or_inconsistent_folds(tmp_path: Path) -> None:
     root = _three_folds(tmp_path)
     _write_fold(root / "fold3" / "tables", [_row(128, "inception", 1.0, 2.0, 0.01)], {"r0128_inception": np.zeros(50)})
