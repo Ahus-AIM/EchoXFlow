@@ -20,6 +20,27 @@ def sample_image(image: np.ndarray, rows: np.ndarray, cols: np.ndarray, *, inter
     raise ValueError(f"Unsupported interpolation: {interpolation}")
 
 
+def sample_image_stack(
+    frames: np.ndarray, rows: np.ndarray, cols: np.ndarray, *, interpolation: Interpolation
+) -> np.ndarray:
+    """Sample every frame of a ``[T,H,W]`` or ``[T,H,W,C]`` stack at the same coordinates in one vectorized pass.
+
+    The result equals stacking :func:`sample_image` of each frame: the kernels are elementwise, so moving the frame
+    axis behind the sampled axes changes nothing but the loop.
+    """
+    stack = np.asarray(frames)
+    if stack.ndim not in {3, 4}:
+        raise ValueError(f"Expected frame stack [T,H,W] or [T,H,W,C], got {stack.shape}")
+    channels_last = np.moveaxis(stack, 0, -1)
+    if interpolation == "nearest":
+        sampled = _sample_image_nearest(channels_last, rows, cols)
+    elif interpolation == "linear":
+        sampled = _sample_image_linear(channels_last, rows, cols)
+    else:
+        raise ValueError(f"Unsupported interpolation: {interpolation}")
+    return np.moveaxis(sampled, -1, 0)
+
+
 def sample_volume(volume: np.ndarray, zyx: np.ndarray, *, interpolation: Interpolation) -> np.ndarray:
     vol = np.asarray(volume)
     if vol.ndim not in {3, 4}:

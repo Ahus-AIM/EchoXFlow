@@ -10,7 +10,7 @@ import numpy as np
 
 from echoxflow.loading import LoadedArray
 
-PanelKind = Literal["image", "matrix", "line"]
+PanelKind = Literal["image", "matrix", "line", "strain_curves", "bullseye"]
 PlotViewMode = Literal["beamspace", "cartesian", "both"]
 PanelView = Literal["beamspace", "cartesian"]
 

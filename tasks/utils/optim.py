@@ -104,6 +104,22 @@ class AdamMuon(Optimizer):
             self.adam.step()
         return loss
 
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Load state, then re-share it with the delegated Muon and AdamW optimizers.
+
+        ``Optimizer.load_state_dict`` replaces ``self.state`` and ``self.param_groups`` with new objects, which would
+        leave the delegates stepping with their old, empty state and stale hyperparameters.
+        """
+        super().load_state_dict(state_dict)
+        self._link_delegates()
+
+    def _link_delegates(self) -> None:
+        for name, delegate in (("muon", self.muon), ("adam", self.adam)):
+            if delegate is None:
+                continue
+            delegate.state = self.state
+            delegate.param_groups = [group for group in self.param_groups if group.get("optimizer") == name]
+
     def zero_grad(self, set_to_none: bool = False) -> None:
         if self.muon is not None:
             self.muon.zero_grad(set_to_none=set_to_none)

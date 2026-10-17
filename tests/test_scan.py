@@ -11,6 +11,7 @@ from echoxflow.scan import (
     SphericalGeometry,
     VolumeGrid,
     beamspace_spherical_mosaic,
+    cartesian_mosaic_layout,
     cartesian_spherical_mosaic,
     compose_layers,
     opacity_from_values,
@@ -219,8 +220,10 @@ def test_spherical_mosaics_return_twelve_temporal_slices() -> None:
     beamspace = beamspace_spherical_mosaic(volumes, output_size=(8, 10))
     cartesian = cartesian_spherical_mosaic(volumes, geometry, output_size=(8, 10), interpolation="nearest")
 
-    assert beamspace.frames.shape == (2, 24, 40)
-    assert cartesian.frames.shape == (2, 24, 40)
+    assert beamspace.frames.shape == (2, 24, 37)
+    assert cartesian.frames.shape[:2] == (2, 24)
+    assert cartesian.layout is not None
+    assert cartesian.frames.shape[2] == cartesian.layout.width
     assert float(np.max(beamspace.frames)) > 0.0
     assert float(np.nanmax(cartesian.frames)) > 0.0
     assert np.isnan(cartesian.frames).any()
@@ -471,3 +474,107 @@ def _constant_elevation_volume(planes: tuple[float, float]) -> np.ndarray:
 def _assert_elevation_planes(volumes: np.ndarray, expected: list[float]) -> None:
     for frame in volumes:
         np.testing.assert_allclose(frame[:, 0, 0], expected)
+
+
+def test_cartesian_mosaic_cuts_fill_their_cells() -> None:
+    volumes = np.ones((1, 9, 9, 40), dtype=np.float32)
+    geometry = SphericalGeometry(
+        depth_start_m=0.01,
+        depth_end_m=0.12,
+        azimuth_width_rad=0.8,
+        elevation_width_rad=0.8,
+    )
+
+    mosaic = cartesian_spherical_mosaic(volumes, geometry, output_size=(60, 60), interpolation="nearest")
+    layout = mosaic.layout
+    assert layout is not None
+    assert len(layout.cells) == 12
+    for cell in layout.cells:
+        assert cell.image_height <= cell.height and cell.image_width <= cell.width
+        patch = mosaic.frames[
+            0,
+            cell.image_y0 : cell.image_y0 + cell.image_height,
+            cell.image_x0 : cell.image_x0 + cell.image_width,
+        ]
+        if cell.kind == "depth_slice":
+            assert cell.image_width == cell.width
+            # the deepest cut of each row spans the whole cell; shallower cuts still fill most of it
+            assert float(np.isfinite(patch).mean()) > 0.6
+    cells = {(cell.row, cell.col): cell for cell in layout.cells}
+    assert all(cells[row, 0].x0 == 0 for row in range(3))
+    assert cells[0, 1].x0 == cells[0, 0].width
+
+
+def test_cartesian_mosaic_cell_height_sets_resolution_and_cells_are_isotropic() -> None:
+    geometry = SphericalGeometry(
+        depth_start_m=0.0,
+        depth_end_m=0.16,
+        azimuth_width_rad=np.deg2rad(60.0),
+        elevation_width_rad=np.deg2rad(40.0),
+    )
+    default = cartesian_mosaic_layout(geometry)
+    fine = cartesian_mosaic_layout(geometry, cell_height=300)
+
+    assert max(cell.image_height for cell in default.cells) == 120
+    assert max(cell.image_height for cell in fine.cells) == 300
+    assert fine.height == 900
+    for cell in fine.cells:
+        plane = cell.plane
+        assert plane is not None
+        metres_per_pixel_x = (plane.x_max - plane.x_min) / (cell.image_width - 1)
+        metres_per_pixel_y = (plane.y_max - plane.y_min) / (cell.image_height - 1)
+        assert abs(metres_per_pixel_x / metres_per_pixel_y - 1.0) < 0.01
+
+
+def test_cartesian_mosaic_sector_edge_is_anti_aliased() -> None:
+    volumes = np.full((1, 9, 9, 40), 100.0, dtype=np.float32)
+    geometry = SphericalGeometry(
+        depth_start_m=0.01,
+        depth_end_m=0.12,
+        azimuth_width_rad=0.8,
+        elevation_width_rad=0.8,
+    )
+
+    mosaic = cartesian_spherical_mosaic(volumes, geometry, cell_height=200)
+    frame = mosaic.frames[0]
+    valid = frame[np.isfinite(frame)]
+
+    assert valid.max() == 100.0
+    # edge pixels carry fractional coverage between fully outside (NaN) and fully inside (100)
+    assert np.count_nonzero((valid > 1.0) & (valid < 99.0)) > 100
+    assert np.isnan(frame).any()
+
+
+def test_cartesian_mosaic_displays_the_volume_rotated_about_the_depth_axis() -> None:
+    from echoxflow.plotting.annotations import _mesh_plane_segments, _segments_to_mosaic_lines
+
+    geometry = SphericalGeometry(depth_start_m=0.02, depth_end_m=0.12, azimuth_width_rad=0.8, elevation_width_rad=0.8)
+    volumes = np.zeros((1, 41, 41, 50), dtype=np.float32)  # (elevation, azimuth, radial)
+    volumes[0, 28:35, 28:35, :] = 1.0  # bright column at +azimuth (x) and +elevation (y)
+    mosaic = cartesian_spherical_mosaic(volumes, geometry, output_size=(80, 80), interpolation="nearest")
+    layout = mosaic.layout
+    assert layout is not None
+    cell = next(c for c in layout.cells if c.kind == "depth_slice" and c.row == 0 and c.col == 2)
+    plane = cell.plane
+    assert plane is not None
+    patch = np.nan_to_num(
+        mosaic.frames[
+            0, cell.image_y0 : cell.image_y0 + cell.image_height, cell.image_x0 : cell.image_x0 + cell.image_width
+        ]
+    )
+    rows, cols = np.nonzero(patch > 0.5)
+    assert rows.size
+    # the +x, +y blob is displayed at the -x, -y pixel position (left-top)
+    assert cols.mean() < cell.image_width / 2 and rows.mean() < cell.image_height / 2
+
+    # a mesh triangle at the same +x, +y position lands on the blob
+    z = float(plane.plane_point[2])
+    x, y = 0.4 * plane.x_max, 0.4 * plane.y_max
+    tri = np.asarray([[x, y, z - 0.01], [x + 0.002, y, z + 0.01], [x, y + 0.002, z + 0.01]], dtype=np.float64)
+    segments = _mesh_plane_segments(
+        tri, np.asarray([[0, 1, 2]]), plane.plane_point, plane.plane_normal, plane.basis_u, plane.basis_v
+    )
+    (line,) = _segments_to_mosaic_lines(cell, segments)
+    px = float(line[:, 0].mean() - cell.image_x0)
+    py = float(line[:, 1].mean() - cell.image_y0)
+    assert patch[int(round(py)), int(round(px))] > 0.5

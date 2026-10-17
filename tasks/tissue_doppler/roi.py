@@ -1,55 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
-import torch
-from torch import Tensor
 
-from echoxflow import RecordingStore, open_recording
+from echoxflow import RecordingStore
 from echoxflow.manifest import manifest_documents
 from echoxflow.scan import SectorGeometry
 
 BMODE_PATH = "data/2d_brightness_mode"
-
-
-@dataclass(frozen=True)
-class RoiMask:
-    mask: Tensor
-    spatial_pixel_count: int
-    metadata: Mapping[str, object]
-
-
-def tissue_doppler_roi_mask_for_sample(sample: object) -> RoiMask | None:
-    """Return a beamspace sampling-gate ROI mask for one tissue Doppler sample."""
-    record = getattr(sample, "record", None)
-    if record is None:
-        return None
-    if str(getattr(sample, "coordinate_space", "")).strip().lower() != "beamspace":
-        return None
-
-    target = getattr(sample, "doppler_target", None)
-    if not isinstance(target, Tensor) or target.ndim < 5:
-        return None
-    target_shape = (int(target.shape[-2]), int(target.shape[-1]))
-
-    store = open_recording(record, root=getattr(sample, "data_root", None))
-    gate = tissue_doppler_sampling_gate_metadata(store)
-    if gate is None:
-        return None
-    geometry = _bmode_geometry_for_sample(store, sample)
-    if geometry is None:
-        return None
-    mask = sampling_gate_roi_mask(gate, geometry=geometry, target_shape=target_shape)
-    if mask is None:
-        return None
-    return RoiMask(
-        mask=torch.from_numpy(mask[None, None, None, :, :].astype(np.float32)),
-        spatial_pixel_count=int(np.count_nonzero(mask)),
-        metadata=dict(gate),
-    )
 
 
 def tissue_doppler_sampling_gate_metadata(store: RecordingStore) -> Mapping[str, object] | None:
@@ -105,18 +65,6 @@ def sampling_gate_roi_mask(
     col_mask = (cols >= angle0) & (cols <= angle1)
     mask = row_mask[:, None] & col_mask[None, :]
     return np.asarray(mask, dtype=bool) if bool(np.any(mask)) else None
-
-
-def _bmode_geometry_for_sample(store: RecordingStore, sample: object) -> SectorGeometry | None:
-    clip_start = getattr(sample, "clip_start", None)
-    clip_stop = getattr(sample, "clip_stop", None)
-    bmode = store.load_stream_slice(
-        BMODE_PATH,
-        None if clip_start is None else int(clip_start),
-        None if clip_stop is None else int(clip_stop),
-    )
-    geometry = getattr(getattr(bmode, "metadata", None), "geometry", None)
-    return geometry if isinstance(geometry, SectorGeometry) else None
 
 
 def _sampling_gate_from_tracks(document: Mapping[str, Any]) -> Mapping[str, object] | None:

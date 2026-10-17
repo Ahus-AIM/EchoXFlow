@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
 from importlib import import_module
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, cast
 
 from tasks._config import TrainingConfig, load_training_config
@@ -88,11 +86,6 @@ def available_task_names() -> tuple[str, ...]:
     return tuple(sorted(_task_specs()))
 
 
-def task_package(task: str) -> Any:
-    _validate_task_name(task)
-    return import_module(f"tasks.{task}")
-
-
 def task_train_yaml(task: str) -> Path:
     return _task_spec(task).train_yaml
 
@@ -126,10 +119,6 @@ def task_run_training_step(task: str) -> RunTraining:
     return cast(RunTraining, partial(_run_training_step_for_task, task))
 
 
-def task_run_cpu_training_step(task: str) -> RunTraining:
-    return task_run_training_step(task)
-
-
 def task_benchmark_loss_fn(task: str) -> LossFn:
     return _task_spec(task).loss_fn
 
@@ -151,19 +140,6 @@ def task_baseline_spec(task: str, baseline: str) -> BaselineSpec:
     if spec is None:
         raise UnsupportedBaselineError(f"Task {task!r} does not support baseline {baseline!r}")
     return spec
-
-
-def bind_task_api(task_name: str, namespace: dict[str, Any] | None = None) -> SimpleNamespace:
-    api = {
-        "load_config": task_load_config(task_name),
-        "run_training": task_run_training(task_name),
-        "evaluate": task_evaluate(task_name),
-        "run_training_step": task_run_training_step(task_name),
-        "run_cpu_training_step": task_run_cpu_training_step(task_name),
-    }
-    if namespace is not None:
-        namespace.update(api)
-    return SimpleNamespace(**api)
 
 
 def _run_training_for_task(task: str, **kwargs: Any) -> TrainingStepResult:
@@ -214,9 +190,9 @@ def _validate_task_name(task: str, *, specs: Mapping[str, TaskSpec] | None = Non
 
 def _task_specs() -> dict[str, TaskSpec]:
     specs: dict[str, TaskSpec] = {}
-    for task_dir in _task_module_dirs():
+    for task_dir in sorted(Path(__file__).resolve().parent.iterdir()):
         name = task_dir.name
-        if name.startswith("_"):
+        if name.startswith("_") or not (task_dir / "task.py").is_file():
             continue
         module = import_module(f"tasks.{name}.task")
         raw_spec = getattr(module, "TASK_SPEC", None)
@@ -226,28 +202,3 @@ def _task_specs() -> dict[str, TaskSpec]:
             raise ValueError(f"tasks.{name}.task TASK_SPEC.name must be {name!r}, got {raw_spec.name!r}")
         specs.setdefault(name, replace(raw_spec, _task_dir=task_dir))
     return specs
-
-
-def _task_module_dirs() -> tuple[Path, ...]:
-    import tasks as tasks_package
-
-    roots: list[Path] = []
-    package_path = getattr(tasks_package, "__path__", ())
-    for entry in sys.path:
-        root = Path(entry or ".").resolve() / "tasks"
-        if root.is_dir() and root not in roots:
-            roots.append(root)
-    if hasattr(package_path, "__setitem__"):
-        package_path[:] = [str(root) for root in roots]
-
-    task_dirs: list[Path] = []
-    for root in roots:
-        for child in sorted(root.iterdir()):
-            if (
-                not child.name.startswith("_")
-                and child.is_dir()
-                and (child / "task.py").is_file()
-                and child not in task_dirs
-            ):
-                task_dirs.append(child)
-    return tuple(task_dirs)

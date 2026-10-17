@@ -1,56 +1,43 @@
+"""Shared dataset helpers.
+
+Recording cache: ``data.recording_cache_dir`` (or ``data.recording_cache: true``
+for ``outputs/cache/recordings``) stores
+each complete pre-resize training array once under ``arrays/``; windows are sliced from the cached arrays. By default
+only the task's training arrays are cached (B-mode plus the task's targets, including their stored locations).
+``data.recording_cache_read_only`` reads without writing misses; ``data.recording_cache_include`` and
+``data.recording_cache_exclude`` take shell-style path patterns.
+"""
+
 from __future__ import annotations
 
-import csv
 import hashlib
 import inspect
-import json
 import logging
-import os
 import random
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass, replace
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from threading import get_ident
 from typing import Any, Protocol, TypeVar, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
 from tqdm.auto import tqdm
 
-from echoxflow import RecordingRecord
+from echoxflow import RecordingRecord, load_exam_folds, open_recording
 from echoxflow import data_root as resolve_data_root
-from echoxflow import open_recording, resample_sector_stack, sector_lookup
+from echoxflow.scan import CartesianGrid
 from echoxflow.scan.geometry import SectorGeometry
+from tasks.utils.batching import attach_batch_items, collated_items
+from tasks.utils.deferred import DeferredBatch, DeferredSample
 from tasks.utils.seed import seed_everything, seeded_dataloader_kwargs
 
-DEFAULT_FOLD_SPLIT_FILENAMES = ("splits.csv", "five_fold_split.csv")
+DEFAULT_FOLD_SPLIT_FILENAME = "splits.csv"
 DEFAULT_VALIDATION_FOLD = 0
-DEFAULT_SAMPLE_CACHE_DIR = Path("outputs/cache/samples")
+DEFAULT_SELECTION_SEED = 0
+EXAM_IDS_ATTR = "exam_ids"
 DEFAULT_RECORDING_CACHE_DIR = Path("outputs/cache/recordings")
-_SAMPLE_CACHE_VERSION = 1
-_SAMPLE_CACHE_CONTROL_KEYS = {
-    "sample_cache",
-    "sample_cache_dir",
-    "sample_cache_read_only",
-    "sample_cache_version",
-    "recording_cache",
-    "recording_cache_dir",
-    "recording_cache_read_only",
-    "recording_cache_include",
-    "recording_cache_exclude",
-}
-_DATALOADER_ONLY_CONFIG_KEYS = {
-    "batch_size",
-    "train_batch_size",
-    "val_batch_size",
-    "num_workers",
-    "prefetch_factor",
-    "pin_memory",
-    "persistent_workers",
-    "multiprocessing_sharing_strategy",
-}
 
 
 @dataclass(frozen=True)
@@ -72,7 +59,6 @@ class CaseIndexedDataset(Protocol):
         raise NotImplementedError
 
 
-RefT = TypeVar("RefT", bound=HasRecord)
 SampleT = TypeVar("SampleT")
 ItemT = TypeVar("ItemT")
 
@@ -147,74 +133,11 @@ class OneSamplePerCaseSampler(Sampler[int]):
         return sum(1 for indices in self.dataset.sample_indices_by_case.values() if indices)
 
 
-class CachedDataset(Dataset[SampleT]):
-    """On-disk sample cache wrapper for task datasets.
-
-    Task datasets still own discovery and sample construction. This wrapper only
-    memoizes completed ``__getitem__`` results, which keeps it independent of the
-    concrete task sample schema.
-    """
-
-    def __init__(
-        self,
-        dataset: Dataset[SampleT],
-        *,
-        cache_dir: str | Path,
-        namespace: str,
-        item_keys: Sequence[str] | None = None,
-        read_only: bool = False,
-    ) -> None:
-        self.dataset = dataset
-        self.cache_dir = Path(cache_dir)
-        self.namespace = str(namespace)
-        self.read_only = bool(read_only)
-        self.sample_indices_by_case = getattr(dataset, "sample_indices_by_case", {})
-        self._root = self.cache_dir / "objects"
-        self._item_keys = list(item_keys) if item_keys is not None else _dataset_item_cache_keys(dataset)
-
-    def __len__(self) -> int:
-        return _safe_len(self.dataset)
-
-    def __getitem__(self, index: int) -> SampleT:
-        cache_path = self._cache_path(index)
-        if cache_path.exists():
-            try:
-                return cast(SampleT, _torch_load_sample(cache_path))
-            except Exception:
-                if self.read_only:
-                    raise
-        sample = self.dataset[index]
-        if not self.read_only:
-            try:
-                self._write_sample(cache_path, sample)
-            except (OSError, RuntimeError) as exc:
-                logging.getLogger("tasks.dataset.cache").warning(
-                    "could not write sample cache %s: %s",
-                    cache_path,
-                    exc,
-                )
-        return sample
-
-    def __getattr__(self, name: str) -> Any:
-        dataset = self.__dict__.get("dataset")
-        if dataset is None:
-            raise AttributeError(name)
-        return getattr(dataset, name)
-
-    def _cache_path(self, index: int) -> Path:
-        key = self._item_keys[index] if 0 <= int(index) < len(self._item_keys) else str(index)
-        return self._root / key[:2] / f"{key}.pt"
-
-    def _write_sample(self, path: Path, sample: SampleT) -> None:
-        if path.exists():
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{get_ident()}.tmp")
-        try:
-            torch.save(sample, temporary)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+def _sample_selection(value: object, *, name: str) -> str:
+    selection = "one_per_case" if value is None else str(value).strip().lower()
+    if selection not in {"one_per_case", "all"}:
+        raise ValueError(f"{name} must be 'one_per_case' or 'all', got {value!r}")
+    return selection
 
 
 def sample_indices_by_case(refs: Sequence[HasRecord]) -> dict[str, list[int]]:
@@ -231,7 +154,17 @@ def progress_iter(
     total: int | None = None,
     unit: str = "item",
 ) -> Iterator[ItemT]:
-    with tqdm(items, desc=description, total=total, unit=unit, leave=False, dynamic_ncols=True) as progress:
+    from tasks.utils.training.progress import interactive_output
+
+    with tqdm(
+        items,
+        desc=description,
+        total=total,
+        unit=unit,
+        leave=False,
+        dynamic_ncols=True,
+        disable=not interactive_output(),
+    ) as progress:
         for item in progress:
             yield item
 
@@ -274,31 +207,6 @@ def records_matching_exam_ids(
     return tuple(record for record in records if record.exam_id in wanted_exam_ids)
 
 
-def build_window_sample_refs(
-    *,
-    records: Sequence[RecordingRecord],
-    window_length: int,
-    stride: int,
-    min_frames_per_case: int = 1,
-    data_root: str | Path | None,
-    max_samples: int | None,
-    frame_count_fn: Callable[[RecordingRecord, str | Path | None], int],
-    make_ref: Callable[[RecordingRecord, int, int], RefT],
-    description: str = "Scanning samples",
-) -> list[RefT]:
-    refs: list[RefT] = []
-    min_count = max(int(window_length), int(min_frames_per_case))
-    for record in progress_iter(records, description=description, total=len(records), unit="case"):
-        frame_count = frame_count_fn(record, data_root)
-        if frame_count < min_count:
-            continue
-        for start in range(0, frame_count - int(window_length) + 1, int(stride)):
-            refs.append(make_ref(record, start, start + int(window_length)))
-            if max_samples is not None and len(refs) >= int(max_samples):
-                return refs
-    return refs
-
-
 def resize_stack(frames: np.ndarray, shape: tuple[int, int], *, interpolation: str = "linear") -> np.ndarray:
     tensor = torch.from_numpy(np.asarray(frames, dtype=np.float32))[:, None]
     if interpolation == "linear":
@@ -310,77 +218,88 @@ def resize_stack(frames: np.ndarray, shape: tuple[int, int], *, interpolation: s
     return np.asarray(resized[:, 0].numpy(), dtype=np.float32)
 
 
-def preprocess_bmode_frames(
-    bmode_data_or_stream: object,
-    *,
-    transform: SharedTrainingTransform | None,
-    input_spatial_shape: tuple[int, int],
-) -> np.ndarray:
-    del transform
-    if hasattr(bmode_data_or_stream, "to_float"):
-        frames = cast(Any, bmode_data_or_stream).to_float().data
-    else:
-        frames = bmode_data_or_stream
-    values = np.asarray(frames, dtype=np.float32)
-    return minmax_normalize(resize_stack(values, input_spatial_shape))
-
-
-def resample_to_reference_geometry(
-    frames: np.ndarray,
-    *,
-    source_geometry: SectorGeometry | None,
-    reference_geometry: SectorGeometry | None,
-    target_shape: tuple[int, int],
-    return_region_mask: bool = False,
-    interpolation: str = "linear",
-) -> np.ndarray | tuple[np.ndarray, np.ndarray | None]:
-    if source_geometry is None or reference_geometry is None:
-        values = resize_stack(frames, target_shape, interpolation=interpolation)
-        return (values, None) if return_region_mask else values
-    target_geometry = replace(reference_geometry, grid_shape=target_shape)
-    values = np.asarray(
-        resample_sector_stack(
-            np.asarray(frames, dtype=np.float32),
-            source_geometry,
-            target_geometry,
-            output_shape=target_shape,
-            interpolation=cast(Any, interpolation),
-        ),
-        dtype=np.float32,
-    )
-    if not return_region_mask:
-        return values
-    lookup = sector_lookup(
-        source_geometry,
-        target_geometry,
-        source_shape=np.asarray(frames).shape[1:3],
-        output_shape=target_shape,
-    )
-    return values, np.asarray(lookup.mask, dtype=bool)
-
-
-def resize_volume_window(window: np.ndarray, *, spatial_shape: tuple[int, int, int]) -> np.ndarray:
-    e_idx = nearest_indices(window.shape[1], spatial_shape[0])
-    a_idx = nearest_indices(window.shape[2], spatial_shape[1])
-    r_idx = nearest_indices(window.shape[3], spatial_shape[2])
-    return window[:, e_idx][:, :, a_idx][:, :, :, r_idx].astype(np.float32, copy=False)
-
-
 def training_transform_from_args(
     *, training_transform: SharedTrainingTransform | None
 ) -> SharedTrainingTransform | None:
     return training_transform
 
 
-def velocity_limit_from_stream(stream: object) -> float:
-    metadata = getattr(stream, "metadata")
+class _VelocityStream(Protocol):
+    @property
+    def metadata(self) -> object: ...
+
+    @property
+    def data(self) -> np.ndarray: ...
+
+
+def cartesian_grid_sample_grid(
+    geometry: SectorGeometry,
+    grid: CartesianGrid,
+    *,
+    source_shape: tuple[int, int],
+    output_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    out_h, out_w = grid.shape if output_shape is None else (int(output_shape[0]), int(output_shape[1]))
+    src_h, src_w = int(source_shape[0]), int(source_shape[1])
+    xs = np.linspace(grid.x_range_m[0], grid.x_range_m[1], out_w, dtype=np.float64)
+    ys = np.linspace(grid.y_range_m[0], grid.y_range_m[1], out_h, dtype=np.float64)
+    xx, yy = np.meshgrid(xs, ys)
+    radii = np.sqrt(xx**2 + yy**2)
+    angles = np.arctan2(xx, yy)
+    rows = (radii - geometry.depth_start_m) / geometry.depth_span_m * max(0, src_h - 1)
+    cols = (angles - geometry.angle_start_rad) / geometry.angle_span_rad * max(0, src_w - 1)
+    x = cols / max(1, src_w - 1) * 2.0 - 1.0
+    y = rows / max(1, src_h - 1) * 2.0 - 1.0
+    return np.stack([x, y], axis=-1).astype(np.float32)
+
+
+def cartesian_image_sample_grid(grid: CartesianGrid) -> np.ndarray:
+    out_h, out_w = grid.shape
+    x = np.linspace(-1.0, 1.0, out_w, dtype=np.float64)
+    y = np.linspace(-1.0, 1.0, out_h, dtype=np.float64)
+    xx, yy = np.meshgrid(x, y)
+    return np.stack([xx, yy], axis=-1).astype(np.float32)
+
+
+def timestamps_or_index(timestamps: np.ndarray | None, count: int) -> np.ndarray:
+    if timestamps is None:
+        return np.arange(int(count), dtype=np.float64)
+    return np.asarray(timestamps, dtype=np.float64)
+
+
+def velocity_limit_from_stream(stream: _VelocityStream) -> float:
+    metadata = stream.metadata
     velocity_limit_mps = getattr(metadata, "velocity_limit_mps", None)
     if velocity_limit_mps is not None:
         return float(velocity_limit_mps)
     value_range = getattr(metadata, "value_range", None)
     if value_range is not None:
         return max(abs(float(value_range[0])), abs(float(value_range[1])))
-    return max(float(np.nanmax(np.abs(getattr(stream, "data")))), 1e-6)
+    return max(float(np.nanmax(np.abs(stream.data))), 1e-6)
+
+
+def cartesian_sector_mask(
+    geometry: SectorGeometry,
+    grid: CartesianGrid,
+    *,
+    shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Boolean ``[H,W]`` mask of the Cartesian grid pixels that lie inside the ultrasound sector."""
+    out_h, out_w = grid.shape if shape is None else (int(shape[0]), int(shape[1]))
+    xs = np.linspace(grid.x_range_m[0], grid.x_range_m[1], out_w, dtype=np.float64)
+    ys = np.linspace(grid.y_range_m[0], grid.y_range_m[1], out_h, dtype=np.float64)
+    xx, yy = np.meshgrid(xs, ys)
+    radii = np.sqrt(xx**2 + yy**2)
+    angles = np.arctan2(xx, yy)
+    return cast(
+        np.ndarray,
+        (
+            (radii >= geometry.depth_start_m)
+            & (radii <= geometry.depth_end_m)
+            & (angles >= geometry.angle_start_rad)
+            & (angles <= geometry.angle_end_rad)
+        ),
+    )
 
 
 def minmax_normalize(frames: np.ndarray) -> np.ndarray:
@@ -396,31 +315,11 @@ def minmax_normalize(frames: np.ndarray) -> np.ndarray:
     return np.asarray(np.clip((arr - low) / value_range, 0.0, 1.0), dtype=np.float32)
 
 
-def midpoint_timestamps(
-    timestamps: np.ndarray | None,
-    start: int,
-    stop: int,
-    target_count: int,
-) -> np.ndarray:
-    sliced = slice_timestamps(timestamps, start, stop)
-    if sliced.size >= 2:
-        return np.asarray((sliced[:-1] + sliced[1:]) * 0.5, dtype=np.float32)
-    return np.arange(target_count, dtype=np.float32)
-
-
 def target_timestamps(timestamps: np.ndarray | None, start: int, stop: int, target_count: int) -> np.ndarray:
     sliced = slice_timestamps(timestamps, start, stop)
     if sliced.size >= 2:
         return np.linspace(float(sliced[0]), float(sliced[-1]), target_count + 2, dtype=np.float32)[1:-1]
     return np.arange(target_count, dtype=np.float32)
-
-
-def nearest_time_indices(source: np.ndarray | None, target: np.ndarray | None, fallback_count: int) -> np.ndarray:
-    if target is None or source is None:
-        return np.arange(min(len(target) if target is not None else fallback_count, fallback_count), dtype=np.int64)
-    source_values = np.asarray(source, dtype=np.float32).reshape(-1)
-    target_values = np.asarray(target, dtype=np.float32).reshape(-1)
-    return np.asarray([int(np.argmin(np.abs(source_values - value))) for value in target_values], dtype=np.int64)
 
 
 def slice_timestamps(timestamps: np.ndarray | None, start: int, stop: int) -> np.ndarray:
@@ -462,27 +361,15 @@ def optional_ordered_float_pair(value: object, *, name: str = "value") -> tuple[
     return ordered_float_pair(value, name=name)
 
 
-def local_std_3x3(values: np.ndarray) -> np.ndarray:
-    tensor = torch.from_numpy(values[:, None])
-    mean = F.avg_pool2d(tensor, kernel_size=3, stride=1, padding=1)
-    mean_sq = F.avg_pool2d(tensor * tensor, kernel_size=3, stride=1, padding=1)
-    return np.asarray(torch.sqrt(torch.clamp(mean_sq - mean * mean, min=0.0))[:, 0].numpy(), dtype=np.float32)
-
-
-def nearest_indices(source_size: int, target_size: int) -> np.ndarray:
-    if target_size == source_size:
-        return np.arange(source_size, dtype=np.int64)
-    return np.clip(np.rint(np.linspace(0, source_size - 1, target_size)), 0, source_size - 1).astype(np.int64)
-
-
 def two_dimensional_frame_count(
     record: RecordingRecord, data_root: str | Path | None, data_path: str = "data/2d_brightness_mode"
 ) -> int:
     count = record.frame_counts_by_content_type.get(data_path.removeprefix("data/"))
     if count is not None:
         return int(count)
-    stream = open_recording(record, root=data_root).load_stream(data_path)
-    return int(stream.data.shape[0])
+    # The stream header has the stored shape without loading the samples.
+    header = open_recording(record, root=data_root).load_stream_header(data_path)
+    return int(header.shape[0])
 
 
 def recording_cache_kwargs(data_config: Mapping[str, object]) -> dict[str, object]:
@@ -549,7 +436,15 @@ def selected_fold_split_exam_ids(
     validation_fold: object = DEFAULT_VALIDATION_FOLD,
     fraction: object | None = None,
     seed: int | None = None,
+    selection_fraction: object = 0.0,
+    selection_seed: int = DEFAULT_SELECTION_SEED,
 ) -> set[str]:
+    """Return the exam ids used for one fold, optionally limited by ``fraction``.
+
+    With ``selection_fraction > 0`` the model-selection exams (see :func:`is_selection_exam`) are drawn from the
+    training folds first, and ``fraction`` then limits training, selection, and validation exams separately, so a
+    small smoke fraction still keeps a non-empty selection split.
+    """
     val_fold = int(cast(Any, validation_fold))
     train_exam_ids = [exam_id for exam_id, fold in fold_by_exam_id.items() if int(fold) != val_fold]
     val_exam_ids = [exam_id for exam_id, fold in fold_by_exam_id.items() if int(fold) == val_fold]
@@ -557,37 +452,88 @@ def selected_fold_split_exam_ids(
         raise ValueError(f"Fold split leaves no training exams for validation fold {val_fold}")
     if not val_exam_ids:
         raise ValueError(f"Fold split leaves no validation exams for validation fold {val_fold}")
+    selection_value = validated_selection_fraction(selection_fraction)
+    selection_exam_ids = [
+        exam_id
+        for exam_id in train_exam_ids
+        if is_selection_exam(exam_id, fraction=selection_value, seed=selection_seed)
+    ]
+    selected = set(selection_exam_ids)
+    train_exam_ids = [exam_id for exam_id in train_exam_ids if exam_id not in selected]
     train_exam_ids = limit_items_by_fraction(train_exam_ids, fraction, seed=seed)
+    selection_exam_ids = limit_items_by_fraction(selection_exam_ids, fraction, seed=seed)
     val_exam_ids = limit_items_by_fraction(val_exam_ids, fraction, seed=seed)
-    return set(train_exam_ids) | set(val_exam_ids)
+    return set(train_exam_ids) | set(selection_exam_ids) | set(val_exam_ids)
 
 
-def load_exam_folds(path: str | Path) -> dict[str, int]:
-    split_path = Path(path).expanduser()
-    with split_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        fields = set(reader.fieldnames or ())
-        if "exam_id" not in fields:
-            raise ValueError(f"Fold split CSV must contain exam_id: {split_path}")
-        fold_field = "five_fold_split" if "five_fold_split" in fields else "fold" if "fold" in fields else None
-        if fold_field is None:
-            raise ValueError(f"Fold split CSV must contain five_fold_split: {split_path}")
-        fold_by_exam_id: dict[str, int] = {}
-        for row_number, row in enumerate(reader, start=2):
-            exam_id = str(row.get("exam_id") or "").strip()
-            if not exam_id:
-                raise ValueError(f"Fold split CSV has an empty exam_id at row {row_number}: {split_path}")
-            try:
-                fold = int(str(row.get(fold_field) or "").strip())
-            except ValueError as exc:
-                raise ValueError(f"Fold split CSV has a non-integer fold at row {row_number}: {split_path}") from exc
-            existing = fold_by_exam_id.get(exam_id)
-            if existing is not None and existing != fold:
-                raise ValueError(f"Fold split CSV has conflicting folds for {exam_id}: {split_path}")
-            fold_by_exam_id[exam_id] = fold
-    if not fold_by_exam_id:
-        raise ValueError(f"Fold split CSV has no rows: {split_path}")
-    return fold_by_exam_id
+def validated_selection_fraction(value: object) -> float:
+    """Return ``data.selection_fraction`` as a float in ``[0, 1)``; ``None`` means disabled (0)."""
+    fraction = 0.0 if value is None else float(cast(Any, value))
+    if not np.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise ValueError(f"data.selection_fraction must be in [0, 1), got {value!r}")
+    return fraction
+
+
+def is_selection_exam(exam_id: str, *, fraction: float, seed: int = DEFAULT_SELECTION_SEED) -> bool:
+    """Whether a training exam belongs to the inner model-selection split.
+
+    The rule hashes ``f"{seed}:{exam_id}"`` with SHA-1 and keeps the exam when the hash, read as a fraction of
+    ``2**160``, is below ``fraction``. It depends only on the exam id and ``seed`` (default 0, independent of the
+    training seed), so every method and every run of one fold shares the same selection exams.
+    """
+    if fraction <= 0.0:
+        return False
+    digest = hashlib.sha1(f"{int(seed)}:{exam_id}".encode()).hexdigest()
+    return int(digest, 16) / 2**160 < float(fraction)
+
+
+def split_selection_records(
+    train_records: Sequence[RecordingRecord],
+    *,
+    selection_fraction: object,
+    selection_seed: int = DEFAULT_SELECTION_SEED,
+) -> tuple[list[RecordingRecord], list[RecordingRecord]]:
+    """Move the records of selection exams out of ``train_records``; return ``(train, selection)``."""
+    fraction = validated_selection_fraction(selection_fraction)
+    train: list[RecordingRecord] = []
+    selection: list[RecordingRecord] = []
+    for record in train_records:
+        if is_selection_exam(record.exam_id, fraction=fraction, seed=selection_seed):
+            selection.append(record)
+        else:
+            train.append(record)
+    return train, selection
+
+
+def require_disjoint_exam_splits(splits: Mapping[str, Iterable[str]]) -> None:
+    """Raise when any two named exam-id sets overlap."""
+    named = [(name, set(exam_ids)) for name, exam_ids in splits.items()]
+    for index, (left_name, left) in enumerate(named):
+        for right_name, right in named[index + 1 :]:
+            overlap = sorted(left & right)
+            if overlap:
+                preview = ", ".join(overlap[:5])
+                raise ValueError(f"{left_name} and {right_name} exams overlap ({len(overlap)}): {preview}")
+
+
+def dataloader_exam_ids(dataloader: object) -> frozenset[str] | None:
+    """Exam ids of the records behind a loader built by :func:`build_task_dataloaders`."""
+    exam_ids = getattr(dataloader, EXAM_IDS_ATTR, None)
+    return None if exam_ids is None else frozenset(str(exam_id) for exam_id in exam_ids)
+
+
+def exam_split_summary(*, train: object, val: object | None, selection: object | None) -> dict[str, object]:
+    """Exam counts of the train, selection, and validation loaders, after checking they are pairwise disjoint."""
+    named = {"train": train, "selection": selection, "val": val}
+    exam_ids = {name: dataloader_exam_ids(loader) for name, loader in named.items() if loader is not None}
+    require_disjoint_exam_splits({name: ids for name, ids in exam_ids.items() if ids is not None})
+    summary: dict[str, object] = {}
+    for name in named:
+        ids = exam_ids.get(name)
+        summary[f"n_{name}_exams"] = None if ids is None else len(ids)
+    selection_ids = exam_ids.get("selection")
+    summary["selection_exam_ids"] = [] if selection_ids is None else sorted(selection_ids)
+    return summary
 
 
 def resolve_fold_split_path(root: str | Path, data_config: Mapping[str, object]) -> Path | None:
@@ -603,11 +549,8 @@ def resolve_fold_split_path(root: str | Path, data_config: Mapping[str, object])
         if not path.exists():
             raise FileNotFoundError(f"Fold split CSV not found: {path}")
         return path
-    for filename in DEFAULT_FOLD_SPLIT_FILENAMES:
-        path = Path(root) / filename
-        if path.exists():
-            return path
-    return None
+    path = Path(root) / DEFAULT_FOLD_SPLIT_FILENAME
+    return path if path.exists() else None
 
 
 def limit_records_by_fraction(
@@ -665,6 +608,26 @@ def dataloader_kwargs(data_config: Mapping[str, object]) -> dict[str, Any]:
     return kwargs
 
 
+def shutdown_dataloader_workers(*loaders: object) -> None:
+    """Stop the worker processes that persistent-worker data loaders keep between epochs.
+
+    A ``DataLoader`` with ``persistent_workers=True`` keeps its iterator (and its worker processes) alive after an
+    epoch so the next epoch starts without respawning workers. Call this when a loader is no longer iterated, so the
+    workers exit now instead of whenever the loader is garbage collected. A later ``iter(loader)`` starts new
+    workers. Other loaders and ``None`` are ignored.
+    """
+    for loader in loaders:
+        if not isinstance(loader, DataLoader):
+            continue
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is None:
+            continue
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        loader._iterator = None
+
+
 def _configure_multiprocessing_sharing_strategy(data_config: Mapping[str, object]) -> None:
     value = data_config.get("multiprocessing_sharing_strategy")
     if value is None or value == "":
@@ -697,6 +660,8 @@ def collate_samples(samples: Sequence[SampleT]) -> SampleT:
     if not samples:
         raise ValueError("Cannot collate an empty batch")
     first = samples[0]
+    if isinstance(first, DeferredSample):
+        return cast(SampleT, DeferredBatch(tuple(cast(Sequence[DeferredSample], samples))))
     if not is_dataclass(first):
         raise TypeError(f"Expected dataclass samples, got {type(first).__name__}")
     values: dict[str, object] = {}
@@ -709,7 +674,9 @@ def collate_samples(samples: Sequence[SampleT]) -> SampleT:
             values[field.name] = "|".join(str(value) for value in field_values)
         else:
             values[field.name] = first_value
-    return cast(SampleT, cast(Any, type(first))(**values))
+    batch = cast(Any, type(first))(**values)
+    attach_batch_items(batch, collated_items(samples))
+    return cast(SampleT, batch)
 
 
 def _cat_tensors_with_padding(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -739,7 +706,6 @@ def build_task_dataloaders(
     dataset_cls: Any,
     discover_records: Callable[..., list[RecordingRecord]],
     empty_message: str,
-    validate_data_config: Callable[[Mapping[str, object]], None] | None = None,
     discover_kwargs_fn: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
     dataset_kwargs_fn: Callable[[Any, Mapping[str, object], str | Path], Mapping[str, object]] | None = None,
     train_dataset_kwargs_fn: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
@@ -749,15 +715,30 @@ def build_task_dataloaders(
     extra_fields_fn: (
         Callable[[Mapping[str, object], Mapping[str, object], object, object], Mapping[str, object]] | None
     ) = None,
-) -> tuple[DataLoader[SampleT], DataLoader[SampleT]]:
+) -> tuple[DataLoader[SampleT], ...]:
+    """Build ``(train, val)`` loaders, or ``(train, val, selection)`` when ``data.selection_fraction > 0``.
+
+    The selection loader covers the inner model-selection exams drawn from the training folds (see
+    :func:`is_selection_exam`); those exams are removed from training. It uses the validation dataset options,
+    sampler, and batch size, so its per-clip loss is computed exactly like the reported validation loss. Selection
+    only uses the loss, so its samples skip the Cartesian metric targets (``include_cartesian_metrics``), which only
+    the validation metrics read.
+    """
     data_config = config.section("data")
-    if validate_data_config is not None:
-        validate_data_config(data_config)
     seed = int(cast(Any, data_config.get("seed", 0)))
+    selection_fraction = validated_selection_fraction(data_config.get("selection_fraction"))
+    selection_seed = int(cast(Any, data_config.get("selection_seed", DEFAULT_SELECTION_SEED)))
     seed_everything(seed)
     root = data_root or data_config.get("root_dir")
     root_path = dataset_root(root)
     fold_split_path = resolve_fold_split_path(root_path, data_config)
+    if fold_split_path is None:
+        logging.getLogger(__name__).warning(
+            "%s: no fold split file (data.fold_split_path or splits.csv in %s); using a random %s validation split",
+            task_name,
+            root_path,
+            data_config.get("val_fraction", 0.2),
+        )
     extra_discover_kwargs = dict(discover_kwargs_fn(data_config) if discover_kwargs_fn is not None else {})
     fraction_limited_discovery = (
         fold_split_path is None
@@ -770,6 +751,8 @@ def build_task_dataloaders(
             validation_fold=data_config.get("validation_fold", DEFAULT_VALIDATION_FOLD),
             fraction=data_config.get("data_fraction"),
             seed=seed,
+            selection_fraction=selection_fraction,
+            selection_seed=selection_seed,
         )
         extra_discover_kwargs.setdefault("exam_ids", selected_exam_ids)
     elif fraction_limited_discovery:
@@ -799,6 +782,24 @@ def build_task_dataloaders(
             validation_fold=data_config.get("validation_fold", DEFAULT_VALIDATION_FOLD),
         )
         records = train_records + val_records
+    train_records, selection_records = split_selection_records(
+        train_records,
+        selection_fraction=selection_fraction,
+        selection_seed=selection_seed,
+    )
+    if selection_fraction > 0.0 and not selection_records:
+        raise ValueError(
+            f"{task_name}: data.selection_fraction={selection_fraction} selected no training exams for model selection"
+        )
+    if not train_records:
+        raise ValueError(f"{task_name}: no training records remain after removing the selection exams")
+    require_disjoint_exam_splits(
+        {
+            "train": {record.exam_id for record in train_records},
+            "selection": {record.exam_id for record in selection_records},
+            "val": {record.exam_id for record in val_records},
+        }
+    )
     dataset_kwargs = dict(dataset_kwargs_fn(config, data_config, root_path) if dataset_kwargs_fn is not None else {})
     dataset_kwargs.update(recording_cache_kwargs(data_config))
     train_kwargs = {
@@ -825,25 +826,20 @@ def build_task_dataloaders(
             **val_kwargs,
         ),
     )
-    train_dataset = _maybe_cached_dataset(
-        task_name=task_name,
-        split="train",
-        dataset=train_dataset,
-        data_config=data_config,
-        root=root_path,
-        records=train_records,
-        dataset_kwargs=dataset_kwargs,
-        split_kwargs=train_kwargs,
-    )
-    val_dataset = _maybe_cached_dataset(
-        task_name=task_name,
-        split="val",
-        dataset=val_dataset,
-        data_config=data_config,
-        root=root_path,
-        records=val_records,
-        dataset_kwargs=dataset_kwargs,
-        split_kwargs=val_kwargs,
+    selection_kwargs = dict(val_kwargs)
+    if "include_cartesian_metrics" in selection_kwargs:
+        selection_kwargs["include_cartesian_metrics"] = False
+    selection_dataset = (
+        None
+        if not selection_records
+        else cast(
+            Dataset[SampleT],
+            dataset_cls(
+                records=selection_records,
+                max_samples=optional_int(data_config.get("max_val_samples")),
+                **selection_kwargs,
+            ),
+        )
     )
     return build_train_val_dataloaders(
         task_name=task_name,
@@ -853,6 +849,8 @@ def build_task_dataloaders(
         val_records=val_records,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        selection_records=selection_records,
+        selection_dataset=selection_dataset,
         data_config=data_config,
         seed=seed,
         train_batch_size=(
@@ -887,22 +885,49 @@ def build_train_val_dataloaders(
     train_batch_size: int | None,
     val_batch_size: int | None,
     extra_fields: Mapping[str, object] | None = None,
-) -> tuple[DataLoader[SampleT], DataLoader[SampleT]]:
+    selection_records: Sequence[RecordingRecord] = (),
+    selection_dataset: Dataset[SampleT] | None = None,
+) -> tuple[DataLoader[SampleT], ...]:
+    """Return ``(train, val)`` loaders, plus a selection loader when ``selection_dataset`` is given."""
+    train_sample_selection = _sample_selection(
+        data_config.get("train_sample_selection"),
+        name="data.train_sample_selection",
+    )
+    val_sample_selection = _sample_selection(
+        data_config.get("val_sample_selection"),
+        name="data.val_sample_selection",
+    )
+    train_sampler: Sampler[int]
+    if train_sample_selection == "all":
+        train_sampler = ShuffledCaseSampler(cast(CaseIndexedDataset, train_dataset), seed=seed)
+    else:
+        train_sampler = OneSamplePerCaseSampler(cast(CaseIndexedDataset, train_dataset), seed=seed)
     train_loader = DataLoader(
         train_dataset,
-        sampler=OneSamplePerCaseSampler(cast(CaseIndexedDataset, train_dataset), seed=seed),
+        sampler=train_sampler,
         **batched_dataloader_kwargs(data_config, batch_size=train_batch_size),
     )
-    val_loader = DataLoader(
+    val_loader = _evaluation_dataloader(
         val_dataset,
-        sampler=OneSamplePerCaseSampler(
-            cast(CaseIndexedDataset, val_dataset),
-            seed=seed,
-            shuffle=False,
-            randomize=False,
-        ),
-        **batched_dataloader_kwargs(data_config, batch_size=val_batch_size),
+        sample_selection=val_sample_selection,
+        data_config=data_config,
+        seed=seed,
+        batch_size=val_batch_size,
     )
+    setattr(train_loader, EXAM_IDS_ATTR, frozenset(record.exam_id for record in train_records))
+    setattr(val_loader, EXAM_IDS_ATTR, frozenset(record.exam_id for record in val_records))
+    selection_loader = None
+    if selection_dataset is not None:
+        # The selection split is scored exactly like the reported validation split: same dataset options,
+        # deterministic sampler, and batch size.
+        selection_loader = _evaluation_dataloader(
+            selection_dataset,
+            sample_selection=val_sample_selection,
+            data_config=data_config,
+            seed=seed,
+            batch_size=val_batch_size,
+        )
+        setattr(selection_loader, EXAM_IDS_ATTR, frozenset(record.exam_id for record in selection_records))
     log_dataset_summary(
         task_name=task_name,
         root=root,
@@ -914,9 +939,44 @@ def build_train_val_dataloaders(
         train_loader=train_loader,
         val_loader=val_loader,
         data_config=data_config,
-        extra_fields=extra_fields,
+        extra_fields={
+            **dict(extra_fields or {}),
+            **(
+                {}
+                if selection_loader is None
+                else {
+                    "selection_records": len(selection_records),
+                    "selection_exams": len({record.exam_id for record in selection_records}),
+                    "selection_samples": _safe_len(selection_dataset),
+                    "selection_batches": _safe_len_or_na(selection_loader),
+                }
+            ),
+        },
     )
-    return train_loader, val_loader
+    if selection_loader is None:
+        return train_loader, val_loader
+    return train_loader, val_loader, selection_loader
+
+
+def _evaluation_dataloader(
+    dataset: Dataset[SampleT],
+    *,
+    sample_selection: str,
+    data_config: Mapping[str, object],
+    seed: int,
+    batch_size: int | None,
+) -> DataLoader[SampleT]:
+    sampler: Sampler[int]
+    if sample_selection == "all":
+        sampler = SequentialSampler(cast(Sized, dataset))
+    else:
+        sampler = OneSamplePerCaseSampler(
+            cast(CaseIndexedDataset, dataset),
+            seed=seed,
+            shuffle=False,
+            randomize=False,
+        )
+    return DataLoader(dataset, sampler=sampler, **batched_dataloader_kwargs(data_config, batch_size=batch_size))
 
 
 def log_dataset_summary(
@@ -969,62 +1029,20 @@ def _supports_keyword(func: Callable[..., object], keyword: str) -> bool:
 
 def _safe_len(value: object) -> int:
     try:
-        return int(len(value))  # type: ignore[arg-type]
+        return len(value)  # type: ignore[arg-type]
     except TypeError:
         return 0
 
 
 def _safe_len_or_na(value: object) -> str:
     try:
-        return str(int(len(value)))  # type: ignore[arg-type]
+        return str(len(value))  # type: ignore[arg-type]
     except TypeError:
         return "n/a"
 
 
 def _limit_value(value: object) -> str:
     return "none" if value is None else str(value)
-
-
-def _maybe_cached_dataset(
-    *,
-    task_name: str,
-    split: str,
-    dataset: Dataset[SampleT],
-    data_config: Mapping[str, object],
-    root: str | Path,
-    records: Sequence[RecordingRecord],
-    dataset_kwargs: Mapping[str, object],
-    split_kwargs: Mapping[str, object],
-) -> Dataset[SampleT]:
-    del records
-    cache_dir = _sample_cache_dir(data_config)
-    if cache_dir is None:
-        return dataset
-    cache_context = _sample_cache_context(
-        task_name=task_name,
-        dataset=dataset,
-        data_config=data_config,
-        root=root,
-        dataset_kwargs=dataset_kwargs,
-        split_kwargs=split_kwargs,
-    )
-    return CachedDataset(
-        dataset,
-        cache_dir=cache_dir,
-        namespace=split,
-        item_keys=_dataset_item_cache_keys(dataset, context=cache_context),
-        read_only=_config_bool(data_config.get("sample_cache_read_only", False)),
-    )
-
-
-def _sample_cache_dir(data_config: Mapping[str, object]) -> Path | None:
-    enabled = data_config.get("sample_cache")
-    configured_dir = data_config.get("sample_cache_dir")
-    if enabled is not None and not _config_bool(enabled):
-        return None
-    if configured_dir is None or str(configured_dir).strip() == "":
-        return DEFAULT_SAMPLE_CACHE_DIR if _config_bool(enabled) else None
-    return Path(str(configured_dir)).expanduser()
 
 
 def _recording_cache_dir(data_config: Mapping[str, object]) -> Path | None:
@@ -1047,117 +1065,10 @@ def _config_string_tuple(value: object) -> tuple[str, ...]:
     return (str(value).strip(),)
 
 
-def _sample_cache_context(
-    *,
-    task_name: str,
-    dataset: object,
-    data_config: Mapping[str, object],
-    root: str | Path,
-    dataset_kwargs: Mapping[str, object],
-    split_kwargs: Mapping[str, object],
-) -> Mapping[str, object]:
-    version = int(cast(Any, data_config.get("sample_cache_version", _SAMPLE_CACHE_VERSION)))
-    return {
-        "version": version,
-        "task": task_name,
-        "dataset_class": f"{type(dataset).__module__}.{type(dataset).__qualname__}",
-        "root": str(root),
-        "data_config": {
-            str(key): _cache_json_value(value)
-            for key, value in data_config.items()
-            if key not in _SAMPLE_CACHE_CONTROL_KEYS and key not in _DATALOADER_ONLY_CONFIG_KEYS
-        },
-        "dataset_kwargs": _cache_json_value(_cache_relevant_kwargs(dataset_kwargs)),
-        "split_kwargs": _cache_json_value(_cache_relevant_kwargs(split_kwargs)),
-    }
-
-
-def _dataset_item_cache_keys(dataset: object, *, context: object | None = None) -> list[str]:
-    refs = getattr(dataset, "sample_refs", None)
-    try:
-        count = len(dataset)  # type: ignore[arg-type]
-    except TypeError:
-        count = 0
-    keys: list[str] = []
-    for index in range(int(count)):
-        ref = refs[index] if isinstance(refs, Sequence) and index < len(refs) else None
-        value = {
-            "context": _cache_json_value(context),
-            "index": index,
-            "sample_id": getattr(ref, "sample_id", None),
-            "ref": _cache_json_value(ref),
-        }
-        keys.append(_hash_cache_payload(value))
-    return keys
-
-
-def _record_cache_value(record: RecordingRecord) -> Mapping[str, object]:
-    return {
-        "exam_id": record.exam_id,
-        "recording_id": record.recording_id,
-        "zarr_path": record.zarr_path,
-        "array_paths": tuple(record.array_paths),
-        "content_types": tuple(record.content_types),
-        "frame_counts_by_content_type": dict(record.frame_counts_by_content_type),
-        "median_delta_time_by_content_type": dict(record.median_delta_time_by_content_type),
-    }
-
-
-def _cache_json_value(value: object) -> object:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return {
-            "__ndarray__": True,
-            "shape": tuple(int(dim) for dim in value.shape),
-            "dtype": str(value.dtype),
-            "values": value.tolist(),
-        }
-    if isinstance(value, torch.Tensor):
-        tensor = value.detach().cpu()
-        return {
-            "__tensor__": True,
-            "shape": tuple(int(dim) for dim in tensor.shape),
-            "dtype": str(tensor.dtype),
-            "values": tensor.tolist(),
-        }
-    if isinstance(value, Mapping):
-        return {str(key): _cache_json_value(value[key]) for key in sorted(value, key=lambda item: str(item))}
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _cache_json_value(getattr(value, field.name))
-            for field in fields(value)
-            if hasattr(value, field.name)
-        }
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_cache_json_value(item) for item in value]
-    return repr(value)
-
-
-def _cache_relevant_kwargs(values: Mapping[str, object]) -> Mapping[str, object]:
-    return {str(key): value for key, value in values.items() if str(key) not in _SAMPLE_CACHE_CONTROL_KEYS}
-
-
-def _hash_cache_payload(payload: object) -> str:
-    encoded = json.dumps(_cache_json_value(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()[:24]
-
-
 def _config_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off", "none"}
     return bool(value)
-
-
-def _torch_load_sample(path: Path) -> Any:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
 
 
 def as_spatial_shape(value: tuple[int, int]) -> tuple[int, int]:
@@ -1174,24 +1085,6 @@ def spatial_shape_from_config(value: object) -> tuple[int, int]:
     if len(result) != 2:
         raise ValueError(f"Expected 2D shape, got {value}")
     return as_spatial_shape((result[0], result[1]))
-
-
-def as_3d_shape(value: tuple[int, int, int]) -> tuple[int, int, int]:
-    result = tuple(int(item) for item in value)
-    if len(result) != 3 or min(result) <= 0:
-        raise ValueError(f"spatial_shape must contain three positive ints, got {value}")
-    return result
-
-
-def optional_3d_shape(value: object) -> tuple[int, int, int] | None:
-    if value is None:
-        return None
-    if not isinstance(value, (list, tuple)):
-        raise TypeError(f"spatial_shape must be a sequence of three ints, got {type(value).__name__}")
-    items = tuple(int(cast(Any, item)) for item in value)
-    if len(items) != 3:
-        raise ValueError(f"spatial_shape must contain three ints, got {value}")
-    return as_3d_shape((items[0], items[1], items[2]))
 
 
 def optional_int(value: object) -> int | None:

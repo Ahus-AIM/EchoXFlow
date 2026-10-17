@@ -36,3 +36,6 @@ class Sample:
     cartesian_metric_velocity_loss_mask: Tensor | None = None
     cartesian_metric_color_box_target: Tensor | None = None
     cartesian_metric_sample_grid: Tensor | None = None
+    # [1,T] exported Nyquist scale (m/s) of each target frame. Clips only span frames sharing one calibrated scale,
+    # so every entry equals nyquist_mps; it is kept to make the calibration of each frame explicit.
+    nyquist_mps_per_frame: Tensor | None = None

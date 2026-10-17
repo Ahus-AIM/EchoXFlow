@@ -28,6 +28,20 @@ def manifest_documents(group_attrs: Mapping[str, Any]) -> tuple[Mapping[str, Any
     return (recording_manifest,) if isinstance(recording_manifest, Mapping) else ()
 
 
+def annotation_documents(group_attrs: Mapping[str, Any]) -> tuple[tuple[tuple[int, ...], Mapping[str, Any]], ...]:
+    """Root-first annotation documents with stable tree locations; acquisition lookup stays root-only."""
+    documents: list[tuple[tuple[int, ...], Mapping[str, Any]]] = [
+        ((), document) for document in manifest_documents(group_attrs)
+    ]
+    for location, document in documents:
+        merged = document.get("merged_documents")
+        if isinstance(merged, list):
+            documents.extend(
+                ((*location, index), child) for index, child in enumerate(merged) if isinstance(child, Mapping)
+            )
+    return tuple(documents)
+
+
 def normalize_public_manifest_attrs(attrs: Mapping[str, Any] | None) -> dict[str, Any]:
     """Normalize exported public attrs to the current `recording_manifest` schema."""
     normalized = dict(attrs or {})

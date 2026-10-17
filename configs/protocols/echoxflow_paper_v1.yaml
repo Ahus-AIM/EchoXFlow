@@ -1,0 +1,47 @@
+---
+# Benchmark protocol of the article, applied on top of the task defaults by `tasks.bench --protocol-profile`.
+# `common` applies to every task; `tasks.<task>` is merged over it.
+common:
+  data:
+    # Validation is evaluated per clip; one clip per batch for every task and method.
+    val_batch_size: 1
+    # One window per recording per epoch and one deterministic sample per recording for validation.
+    train_sample_selection: one_per_case
+    val_sample_selection: one_per_case
+    # Workers stay alive across epochs; samplers shuffle in the main process and the datasets draw no random numbers,
+    # so this changes no samples or model updates.
+    persistent_workers: true
+    # Model selection: 12.5% of the training-fold exams (fixed exam-id hash, shared by every method) select the best
+    # epoch and stop training after 3 epochs without improvement, within a budget of 25 epochs.
+    selection_fraction: 0.125
+  trainer:
+    max_epochs: 25
+    early_stopping_patience: 3
+    early_stopping_min_delta: 0.0
+  optimizer:
+    muon_momentum: 0.95
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+tasks:
+  color_doppler: {}
+  tissue_doppler:
+    data:
+      train_sampling_mode: sliding
+      val_sampling_mode: full_case
+      train_full_case_max_frames: 48
+      val_full_case_max_frames: 96
+      doppler_interval_assignment: release_strict
+  segmentation:
+    data:
+      train_sampling_mode: sliding
+      val_sampling_mode: annotation
+      train_target_frame_policy: all
+      val_target_frame_policy: annotated
+      cartesian_preprocessing: full_scan_then_resize
+      allowed_roles: []
+      bmode_link_resolution: manifest_only
+    loss:
+      dice_reduction: spatiotemporal
+    metrics:
+      dice_reduction: spatiotemporal

@@ -65,9 +65,7 @@ def _write_tensor_channels(
         _write_frame_grid(
             values,
             output=output_dir / f"{stem}_b{batch_index:02d}_c{channel_index:02d}.png",
-            title=(
-                f"{label} b={batch_index} c={channel_index} " f"dims=[B,C,T,H,W]={tuple(int(v) for v in tensor.shape)}"
-            ),
+            title=(f"{label} b={batch_index} c={channel_index} dims=[B,C,T,H,W]={tuple(int(v) for v in tensor.shape)}"),
         )
 
 

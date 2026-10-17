@@ -8,19 +8,6 @@ repos:
       - id: end-of-file-fixer
       - id: trailing-whitespace
 
-  - repo: https://github.com/psf/black
-    rev: 25.1.0
-    hooks:
-      - id: black
-
-  - repo: https://github.com/pycqa/flake8
-    rev: 7.3.0
-    hooks:
-      - id: flake8
-        args: ["src", "tests", "tasks"]
-        additional_dependencies:
-          - flake8-pyproject==1.2.3
-
   - repo: https://github.com/adrienverge/yamllint
     rev: v1.37.1
     hooks:
@@ -28,10 +15,18 @@ repos:
 
   - repo: local
     hooks:
-      - id: isort
-        name: isort
+      - id: ruff-check
+        name: ruff check
         entry: uv
-        args: ["run", "isort", "."]
+        args: ["run", "ruff", "check", "--fix", "."]
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv
+        args: ["run", "ruff", "format", "."]
         language: system
         pass_filenames: false
         types: [python]

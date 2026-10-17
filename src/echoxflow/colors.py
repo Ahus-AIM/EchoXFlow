@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence, cast
 import numpy as np
 import yaml
 
+from echoxflow.schema import display_array_path
+
 if TYPE_CHECKING:
     from matplotlib.colors import ListedColormap
 
@@ -190,7 +192,12 @@ def data_modality_colormap_name(name: str) -> str | None:
     """Return the configured colormap name for a Croissant data modality."""
     colors = get_colors()
     normalized = _normalize_data_modality(name)
-    return colors.data_modalities.get(normalized) or colors.data_modalities.get(str(name))
+    base, _, index = display_array_path(normalized).rpartition("_")
+    return (
+        colors.data_modalities.get(normalized)
+        or colors.data_modalities.get(str(name))
+        or (colors.data_modalities.get(base) if base == "data/2d_brightness_mode" and index.isdigit() else None)
+    )
 
 
 def _resolve_colormap_spec(name: str, *, seen: set[str] | None = None) -> NamedColormapConfig | None:

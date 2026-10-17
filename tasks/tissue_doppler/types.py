@@ -31,6 +31,13 @@ class DenseSectorSample:
     coordinate_space: str | None = None
     cartesian_metric_doppler_target: Tensor | None = None
     cartesian_metric_sample_grid: Tensor | None = None
+    # [1,1,1,H,W] metric-grid pixels inside the scan sector; outside it the Cartesian target is fill, not data.
+    cartesian_metric_valid_mask: Tensor | None = None
+    # [1,1,1,H,W] training-target pixels inside the scan sector (Cartesian domain only); None trains on every pixel.
+    loss_valid_mask: Tensor | None = None
+    # [1,T] exported velocity scale (m/s) of each target frame. Clips only span frames sharing one calibrated scale,
+    # so every entry equals sector_velocity_limit_mps; it is kept to make the calibration of each frame explicit.
+    doppler_velocity_limit_mps_per_frame: Tensor | None = None
 
 
 Sample = DenseSectorSample

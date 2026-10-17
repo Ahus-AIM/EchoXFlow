@@ -12,7 +12,8 @@ import numpy as np
 
 from echoxflow.loading import LoadedArray, PackedMeshAnnotation, RecordingStore
 from echoxflow.plotting.specs import PanelView
-from echoxflow.scan import SphericalGeometry, mesh_frame_indices_for_volume_timestamps
+from echoxflow.scan import SphericalMosaicLayout, mesh_frame_indices_for_volume_timestamps
+from echoxflow.scan.spherical import MosaicCell
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ def _attach_annotation_overlay(
     show_sampling_line: bool,
 ) -> LoadedArray:
     overlays: list[dict[str, object]] = []
-    annotation_metadata = _annotation_metadata_by_value_path(store)
+    annotation_records = _annotation_records_by_value_path(store)
     for path in _annotation_paths_for_loaded(store, loaded):
         try:
             values = store.load_array(path)
@@ -54,12 +55,26 @@ def _attach_annotation_overlay(
         except (TypeError, ValueError) as exc:
             logger.warning("could not parse annotation overlay `%s`: %s", path, exc)
             continue
-        metadata = annotation_metadata.get(_normalize_annotation_path(path))
-        overlay_metadata = _annotation_overlay_metadata(metadata, array_attrs=_array_attrs(store, path))
-        if _is_spectral_annotation_path(loaded.data_path, path):
-            overlays.append({"kind": "spectral_points", "points": points, "path": path, **overlay_metadata})
-        else:
-            overlays.append({"kind": "physical_points", "points": points, "path": path, **overlay_metadata})
+        records = annotation_records.get(_normalize_annotation_path(path), ())
+        for metadata in records or (None,):
+            if metadata is not None and _resolved_annotation_alias(store, loaded, metadata):
+                continue
+            if (
+                metadata is not None
+                and loaded.data_path in _SPECTRAL_VELOCITY_STRIPS
+                and not _spectral_owner_matches(store, loaded, metadata)
+            ):
+                continue
+            overlay_metadata = _annotation_overlay_metadata(metadata, array_attrs=_array_attrs(store, path))
+            if (
+                _is_spectral_annotation_path(loaded.data_path, path)
+                or _metadata_is_spectral(metadata or {})
+                or _is_spectral_trace(metadata)
+            ):
+                kind = "spectral_trace" if _is_spectral_trace(metadata) else "spectral_points"
+            else:
+                kind = "physical_points"
+            overlays.append({"kind": kind, "points": points, "path": path, **overlay_metadata})
     if show_sampling_gate:
         gate_overlay = _sampling_gate_overlay(store, loaded)
         if gate_overlay is not None:
@@ -69,29 +84,37 @@ def _attach_annotation_overlay(
     attrs = dict(loaded.attrs)
     if overlays:
         attrs["annotation_overlays"] = tuple(overlays)
-    mesh_sequences = store.load_object().mesh_sequences if loaded.data_path == "data/3d_brightness_mode" else ()
-    if mesh_sequences:
-        try:
-            mesh_sequence = mesh_sequences[0]
-            mesh = store.load_packed_mesh_annotation(mesh_sequence.mesh_group.path)
-            timestamps = mesh_sequence.timestamps
-            if timestamps is not None:
-                timestamp_values = (
-                    store.group[timestamps.path][:]
-                    if timestamps.path in store.group
-                    else store.load_array(timestamps.path)
-                )
-                mesh = replace(
-                    mesh,
-                    timestamps_path=timestamps.path,
-                    timestamps=np.asarray(timestamp_values, dtype=np.float32).reshape(-1),
-                )
+    if loaded.data_path == "data/3d_brightness_mode":
+        mesh = load_mesh_annotation(store)
+        if mesh is not None:
             attrs["mesh_annotation"] = mesh
-        except (FileNotFoundError, KeyError) as exc:
-            logger.warning("could not load mesh annotation: %s", exc)
-        except (TypeError, ValueError) as exc:
-            logger.warning("could not parse mesh annotation: %s", exc)
     return replace(loaded, attrs=attrs) if attrs != dict(loaded.attrs) else loaded
+
+
+def load_mesh_annotation(store: RecordingStore) -> PackedMeshAnnotation | None:
+    """Load the first linked LV mesh sequence of a recording, or None when it has none or cannot be read."""
+    mesh_sequences = store.load_object().mesh_sequences
+    if not mesh_sequences:
+        return None
+    try:
+        mesh_sequence = mesh_sequences[0]
+        mesh = store.load_packed_mesh_annotation(mesh_sequence.mesh_group.path)
+        timestamps = mesh_sequence.timestamps
+        if timestamps is not None:
+            timestamp_values = (
+                store.group[timestamps.path][:] if timestamps.path in store.group else store.load_array(timestamps.path)
+            )
+            mesh = replace(
+                mesh,
+                timestamps_path=timestamps.path,
+                timestamps=np.asarray(timestamp_values, dtype=np.float32).reshape(-1),
+            )
+        return mesh
+    except (FileNotFoundError, KeyError) as exc:
+        logger.warning("could not load mesh annotation: %s", exc)
+    except (TypeError, ValueError) as exc:
+        logger.warning("could not parse mesh annotation: %s", exc)
+    return None
 
 
 def _has_sample_volume_gate(loaded_arrays: tuple[LoadedArray, ...]) -> bool:
@@ -105,24 +128,94 @@ def _has_sampling_line_source(loaded_arrays: tuple[LoadedArray, ...]) -> bool:
 
 
 def _annotation_paths_for_loaded(store: RecordingStore, loaded: LoadedArray) -> tuple[str, ...]:
-    paths = tuple(path for path in store.array_paths if path.startswith("data/"))
     name = loaded.data_path.removeprefix("data/")
     if name.startswith("1d_"):
-        prefix = f"data/{name}_annotation_"
-        return tuple(path for path in paths if path.startswith(prefix))
+        paths = []
+        annotation_records = _annotation_records_by_value_path(store)
+        for path in store.array_paths:
+            items = annotation_records.get(_normalize_annotation_path(path), ())
+            if items:
+                if any(_spectral_owner_matches(store, loaded, item) for item in items):
+                    paths.append(path)
+            elif _is_spectral_annotation_path(loaded.data_path, path):
+                paths.append(path)
+        return tuple(dict.fromkeys(paths))
     if name.startswith("2d_brightness_mode"):
-        return tuple(path for path in paths if "overlay_physical_points" in path)
+        return tuple(
+            path for path in store.array_paths if path.startswith("data/") and "overlay_physical_points" in path
+        )
     return ()
 
 
 def _is_spectral_annotation_path(data_path: str, annotation_path: str) -> bool:
+    """Whether `annotation_path` is a traced-envelope array of the 1D stream `data_path`.
+
+    Exports store these either as `data/<stream>_annotation_NN` (older layout) or as
+    `annotations/<stream>_annotation_NN` (optionally inside `annotations/<document>/`).
+    """
     name = data_path.removeprefix("data/")
-    return name.startswith("1d_") and annotation_path.startswith(f"data/{name}_annotation_")
+    if not name.startswith("1d_"):
+        return False
+    parts = annotation_path.split("/")
+    if parts[0] not in {"data", "annotations"}:
+        return False
+    return parts[-1].startswith(f"{name}_annotation_")
 
 
-def _annotation_metadata_by_value_path(store: RecordingStore) -> dict[str, Mapping[str, object]]:
-    metadata: dict[str, Mapping[str, object]] = {}
-    for document in _render_documents(getattr(store.group, "attrs", {})):
+def _is_spectral_trace(metadata: Mapping[str, object] | None) -> bool:
+    return metadata is not None and metadata.get("kind") == "spectral_trace"
+
+
+_SPECTRAL_VELOCITY_STRIPS = frozenset({"data/1d_pulsed_wave_doppler", "data/1d_continuous_wave_doppler"})
+
+
+def _metadata_is_spectral(metadata: Mapping[str, object]) -> bool:
+    links = metadata.get("links")
+    return isinstance(links, Mapping) and links.get("coordinate_type") == "spectral"
+
+
+def _spectral_owner_matches(store: RecordingStore, loaded: LoadedArray, metadata: Mapping[str, object]) -> bool:
+    if isinstance(metadata.get("target_data"), Mapping):
+        return _targets_data_path(metadata, loaded.data_path)
+    target = metadata.get("target")
+    if isinstance(target, Mapping) and target.get("type") == "track":
+        role = target.get("semantic_id")
+        owners = set()
+        for document in _render_documents(getattr(store.group, "attrs", {})):
+            tracks = document.get("tracks")
+            if not isinstance(tracks, (list, tuple)):
+                continue
+            for track in tracks:
+                if isinstance(track, Mapping) and _semantic_id(track) == role:
+                    path = _annotation_value_path(track.get("data"))
+                    if path:
+                        owners.add(_normalize_annotation_path(path))
+        return owners == {loaded.data_path}
+    value_path = _annotation_value_path(metadata.get("value"))
+    if not (
+        _metadata_is_spectral(metadata)
+        or _is_spectral_trace(metadata)
+        or (value_path and _is_spectral_annotation_path(loaded.data_path, value_path))
+    ):
+        return False
+    owners = set(store.array_paths) & _SPECTRAL_VELOCITY_STRIPS
+    return owners == {loaded.data_path}
+
+
+def _targets_data_path(metadata: Mapping[str, object], data_path: str) -> bool:
+    target_data = metadata.get("target_data")
+    if not isinstance(target_data, Mapping):
+        return False
+    raw = _annotation_value_path(target_data)
+    return raw is not None and _normalize_annotation_path(raw) == data_path
+
+
+def _annotation_records_by_value_path(store: RecordingStore) -> dict[str, tuple[Mapping[str, object], ...]]:
+    """Preserve every semantic reference; shared arrays do not imply identical measurements."""
+    from echoxflow.manifest import annotation_documents
+
+    records: dict[str, list[Mapping[str, object]]] = {}
+    for location, document in annotation_documents(getattr(store.group, "attrs", {})):
         annotations = document.get("annotations")
         if not isinstance(annotations, list):
             continue
@@ -131,8 +224,25 @@ def _annotation_metadata_by_value_path(store: RecordingStore) -> dict[str, Mappi
                 continue
             path = _annotation_value_path(item.get("value"))
             if path is not None:
-                metadata[_normalize_annotation_path(path)] = item
-    return metadata
+                records.setdefault(_normalize_annotation_path(path), []).append({**item, "document_path": location})
+    return {path: tuple(items) for path, items in records.items()}
+
+
+def _resolved_annotation_alias(store: RecordingStore, loaded: LoadedArray, metadata: Mapping[str, object]) -> bool:
+    alias = metadata.get("alias_of")
+    if not isinstance(alias, str) or not alias:
+        return False
+    for records in _annotation_records_by_value_path(store).values():
+        for canonical in records:
+            if (
+                canonical.get("document_path") == metadata.get("document_path")
+                and canonical.get("annotation_identity") == alias
+                and not canonical.get("alias_of")
+                and _annotation_value_path(canonical.get("value")) in store.array_paths
+                and _spectral_owner_matches(store, loaded, canonical)
+            ):
+                return True
+    return False
 
 
 def _annotation_value_path(value: object) -> str | None:
@@ -166,7 +276,13 @@ def _annotation_overlay_metadata(
         return {}
     overlay: dict[str, object] = {}
     if metadata is not None:
+        for key in ("annotation_identity", "alias_of", "document_path", "target_data"):
+            if key in metadata:
+                overlay[key] = metadata[key]
         label = _non_empty_string(metadata.get("label"))
+        measure = metadata.get("links")
+        if label is None and isinstance(measure, Mapping):
+            label = _non_empty_string(measure.get("measure_id"))
         if label is not None:
             overlay["label"] = label
         target = metadata.get("target")
@@ -262,8 +378,13 @@ def _sampling_line_overlays(store: RecordingStore, loaded: LoadedArray) -> tuple
     return ({"kind": "sampling_line", "points": points, "metadata": dict(metadata)},)
 
 
+_SAMPLING_OVERLAY_PANEL_PATHS = frozenset(
+    {"data/tissue_doppler", "data/2d_color_doppler_velocity", "data/2d_color_doppler_power"}
+)
+
+
 def _supports_sampling_gate_overlay(loaded: LoadedArray) -> bool:
-    return loaded.data_path == "data/tissue_doppler" or loaded.data_path.startswith("data/2d_brightness_mode")
+    return loaded.data_path in _SAMPLING_OVERLAY_PANEL_PATHS or loaded.data_path.startswith("data/2d_brightness_mode")
 
 
 def _physical_sampling_line_overlays(store: RecordingStore, loaded: LoadedArray) -> tuple[dict[str, object], ...]:
@@ -337,24 +458,52 @@ def _line_points(value: object) -> np.ndarray | None:
 
 def _sampling_gate_metadata(store: RecordingStore, loaded: LoadedArray) -> Mapping[str, object] | None:
     for document in _render_documents(getattr(store.group, "attrs", {})):
-        tracks = document.get("tracks")
-        if isinstance(tracks, list):
-            for track in tracks:
-                if not isinstance(track, Mapping):
-                    continue
-                derived = track.get("derived_from")
-                if _semantic_id(track) == "tissue_doppler_gate":
-                    return derived if isinstance(derived, Mapping) else track
-                if isinstance(derived, Mapping) and str(derived.get("kind", "")).strip() == "tissue_doppler_gate":
-                    return derived
-        gate = document.get("sampling_gate_metadata")
-        if isinstance(gate, Mapping):
-            return gate
+        found = _gate_metadata_from_tracks(document) or _gate_metadata_from_document(document)
+        if found is not None:
+            return found
     raw = None if loaded.stream is None else loaded.stream.metadata.raw
     if isinstance(raw, Mapping):
         gate = raw.get("sampling_gate_metadata")
         if isinstance(gate, Mapping):
             return gate
+    return None
+
+
+def _has_sampling_gate_pose(metadata: Mapping[object, object]) -> bool:
+    return (
+        _finite_float(metadata.get("gate_center_depth_m")) is not None
+        and _finite_float(metadata.get("gate_tilt_rad")) is not None
+    )
+
+
+def _gate_metadata_from_tracks(document: Mapping[str, object]) -> Mapping[str, object] | None:
+    tracks = document.get("tracks")
+    if not isinstance(tracks, list):
+        return None
+    for track in tracks:
+        if not isinstance(track, Mapping):
+            continue
+        derived = track.get("derived_from")
+        is_gate = _semantic_id(track) == "tissue_doppler_gate"
+        if isinstance(derived, Mapping) and (is_gate or str(derived.get("kind", "")).strip() == "tissue_doppler_gate"):
+            if _has_sampling_gate_pose(derived):
+                return derived
+        if is_gate and _has_sampling_gate_pose(track):
+            return track
+    return None
+
+
+def _gate_metadata_from_document(document: Mapping[str, object]) -> Mapping[str, object] | None:
+    gate = document.get("sampling_gate_metadata")
+    if isinstance(gate, Mapping) and _has_sampling_gate_pose(gate):
+        return gate
+    sectors = document.get("sectors")
+    if isinstance(sectors, list):
+        for sector in sectors:
+            if isinstance(sector, Mapping):
+                gate = sector.get("sampling_gate_metadata")
+                if isinstance(gate, Mapping) and _has_sampling_gate_pose(gate):
+                    return gate
     return None
 
 
@@ -501,11 +650,14 @@ def _render_documents(group_attrs: Mapping[object, object]) -> tuple[Mapping[str
         metadata = group_attrs.get("metadata")
         if isinstance(metadata, Mapping):
             render_inputs = metadata.get("render_inputs")
-    if not isinstance(render_inputs, list):
-        return tuple(documents)
-    for item in render_inputs:
-        if isinstance(item, Mapping) and isinstance(item.get("document"), Mapping):
-            documents.append(item["document"])
+    if isinstance(render_inputs, list):
+        for item in render_inputs:
+            if isinstance(item, Mapping) and isinstance(item.get("document"), Mapping):
+                documents.append(item["document"])
+    for document in documents:
+        merged = document.get("merged_documents")
+        if isinstance(merged, list):
+            documents.extend(item for item in merged if isinstance(item, Mapping))
     return tuple(documents)
 
 
@@ -523,10 +675,14 @@ def _finite_float(value: object) -> float | None:
     return result if np.isfinite(result) else None
 
 
+#: Mesh points are ``physical_xyz_m`` with depth along mesh y. The render frame has depth along
+#: z, azimuth along x and elevation along y, so mesh (x, y, z) maps to render (x, -z, y). Checked
+#: against the linked volumes of six exams: the contour encloses the dark cavity in the long-axis
+#: and short-axis slices, while the 180-degree rotation about depth crosses the septum.
 _MESH_RENDER_FRAME_TRANSFORM = np.asarray(
     [
-        [-1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
         [0.0, 1.0, 0.0],
     ],
     dtype=np.float64,
@@ -535,15 +691,17 @@ _MESH_RENDER_FRAME_TRANSFORM = np.asarray(
 
 def mesh_mosaic_annotation_lines(
     annotation: PackedMeshAnnotation,
-    geometry: SphericalGeometry,
     *,
     frame_count: int,
-    mosaic_shape: tuple[int, int],
+    layout: SphericalMosaicLayout,
     view: PanelView,
     volume_timestamps: np.ndarray | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[tuple[np.ndarray, ...], ...]:
-    """Build per-frame mesh intersection lines in cartesian 3D mosaic pixel coordinates."""
+    """Build per-frame mesh intersection lines in cartesian 3D mosaic pixel coordinates.
+
+    `layout` is the layout the mosaic pixels were built with, so the lines register with the slices.
+    """
     if view != "cartesian":
         return tuple(() for _ in range(max(0, int(frame_count))))
     if frame_count > 1:
@@ -557,12 +715,7 @@ def mesh_mosaic_annotation_lines(
             or not np.any(np.isfinite(mesh_times))
         ):
             return tuple(() for _ in range(max(0, int(frame_count))))
-    rows, cols = 3, 4
-    cell_h = max(1, int(mosaic_shape[0]) // rows)
-    cell_w = max(1, int(mosaic_shape[1]) // cols)
-    panel_sizes = _mesh_panel_sizes_from_volume(geometry, height=cell_h, width=cell_h, cover_depth_fraction=1.0)
-    plane_specs = _mesh_slice_plane_specs_from_volume(geometry, cover_depth_fraction=1.0)
-    panel_count = min(rows * cols, len(panel_sizes), len(plane_specs))
+    cells = tuple(cell for cell in layout.cells if cell.plane is not None)
     mesh_indices = mesh_frame_indices_for_volume_timestamps(
         annotation.timestamps,
         volume_timestamps,
@@ -580,142 +733,21 @@ def mesh_mosaic_annotation_lines(
             overlays.append(())
             continue
         lines: list[np.ndarray] = []
-        for panel_idx, (plane_spec, panel_size) in enumerate(zip(plane_specs[:panel_count], panel_sizes[:panel_count])):
+        for cell in cells:
+            plane = cell.plane
+            if plane is None:
+                continue
             segments = _mesh_plane_segments(
                 points,
                 faces,
-                np.asarray(plane_spec["plane_point"], dtype=np.float64),
-                np.asarray(plane_spec["plane_normal"], dtype=np.float64),
-                np.asarray(plane_spec["basis_u"], dtype=np.float64),
-                np.asarray(plane_spec["basis_v"], dtype=np.float64),
+                plane.plane_point,
+                plane.plane_normal,
+                plane.basis_u,
+                plane.basis_v,
             )
-            lines.extend(
-                _segments_to_mosaic_lines(
-                    panel_idx=panel_idx,
-                    segments=segments,
-                    plane_spec=plane_spec,
-                    panel_size_hw=panel_size,
-                    cell_shape=(cell_h, cell_w),
-                )
-            )
+            lines.extend(_segments_to_mosaic_lines(cell, segments))
         overlays.append(tuple(lines))
     return tuple(overlays)
-
-
-def _mesh_slice_plane_specs_from_volume(
-    geometry: SphericalGeometry,
-    *,
-    cover_depth_fraction: float,
-) -> tuple[dict[str, np.ndarray | float], ...]:
-    depth_fractions = np.linspace(4.0 / 15.0, 10.0 / 15.0, 9, dtype=np.float64).tolist()
-    radial_axis_angles_deg = (0.0, -60.0, -120.0)
-    radial_axis_half_width = max(
-        _radial_axis_half_width_m_3d(geometry, cover_depth_fraction, angle) for angle in radial_axis_angles_deg
-    )
-    cover_depth_m = geometry.depth_start_m + float(np.clip(cover_depth_fraction, 0.0, 1.0)) * (
-        geometry.depth_end_m - geometry.depth_start_m
-    )
-    normal_half_width_x_m = cover_depth_m * math.tan(0.5 * geometry.azimuth_width_rad)
-    normal_half_width_y_m = cover_depth_m * math.tan(0.5 * geometry.elevation_width_rad)
-    plane_specs: list[dict[str, np.ndarray | float]] = []
-    for row_idx, angle_deg in enumerate(radial_axis_angles_deg):
-        basis_u, basis_v, plane_normal = _slice_plane_basis_radial_axis(float(angle_deg))
-        plane_specs.append(
-            {
-                "plane_point": np.asarray([0.0, 0.0, 0.0], dtype=np.float64),
-                "plane_normal": plane_normal,
-                "basis_u": basis_u,
-                "basis_v": basis_v,
-                "x_min": -float(radial_axis_half_width),
-                "x_max": float(radial_axis_half_width),
-                "y_min": float(geometry.depth_start_m),
-                "y_max": float(geometry.depth_end_m),
-            }
-        )
-        start = row_idx * 3
-        basis_u, basis_v, plane_normal = _slice_plane_basis_normal_slice()
-        for depth_fraction in depth_fractions[start : start + 3]:
-            depth_m = geometry.depth_start_m + float(depth_fraction) * (geometry.depth_end_m - geometry.depth_start_m)
-            plane_specs.append(
-                {
-                    "plane_point": np.asarray([0.0, 0.0, depth_m], dtype=np.float64),
-                    "plane_normal": plane_normal,
-                    "basis_u": basis_u,
-                    "basis_v": basis_v,
-                    "x_min": -float(normal_half_width_x_m),
-                    "x_max": float(normal_half_width_x_m),
-                    "y_min": -float(normal_half_width_y_m),
-                    "y_max": float(normal_half_width_y_m),
-                }
-            )
-    return tuple(plane_specs)
-
-
-def _mesh_panel_sizes_from_volume(
-    geometry: SphericalGeometry,
-    *,
-    height: int,
-    width: int,
-    cover_depth_fraction: float,
-) -> tuple[tuple[int, int], ...]:
-    radial_axis_angles_deg = (0.0, -60.0, -120.0)
-    radial_axis_size = _radial_axis_output_size_3d(
-        (height, width),
-        geometry,
-        cover_depth_fraction,
-        radial_axis_angles_deg,
-    )
-    slice_size = (int(height), int(width))
-    row = (radial_axis_size, slice_size, slice_size, slice_size)
-    sizes: list[tuple[int, int]] = []
-    for _ in range(3):
-        sizes.extend(row)
-    return tuple(sizes)
-
-
-def _radial_axis_output_size_3d(
-    depth_slice_size: tuple[int, int],
-    geometry: SphericalGeometry,
-    cover_depth_fraction: float,
-    angles_deg: tuple[float, ...],
-) -> tuple[int, int]:
-    depth_slice_height, _ = depth_slice_size
-    depth_span_m = max(geometry.depth_end_m - geometry.depth_start_m, 1e-6)
-    lateral_half_width_m = max(
-        _radial_axis_half_width_m_3d(geometry, cover_depth_fraction, angle) for angle in angles_deg
-    )
-    return max(2, int(depth_slice_height)), max(
-        2, int(round(max(2, int(depth_slice_height)) * (2.0 * lateral_half_width_m) / depth_span_m))
-    )
-
-
-def _radial_axis_half_width_m_3d(
-    geometry: SphericalGeometry,
-    cover_depth_fraction: float,
-    angle_deg: float,
-) -> float:
-    depth_span_m = max(geometry.depth_end_m - geometry.depth_start_m, 1e-6)
-    cover_depth_m = geometry.depth_start_m + float(np.clip(cover_depth_fraction, 0.0, 1.0)) * depth_span_m
-    az_half_width_m = cover_depth_m * math.tan(0.5 * geometry.azimuth_width_rad)
-    el_half_width_m = cover_depth_m * math.tan(0.5 * geometry.elevation_width_rad)
-    angle_rad = math.radians(float(angle_deg))
-    return float(az_half_width_m * abs(math.cos(angle_rad)) + el_half_width_m * abs(math.sin(angle_rad)))
-
-
-def _slice_plane_basis_radial_axis(angle_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    angle_rad = math.radians(float(angle_deg))
-    basis_u = np.asarray([math.cos(angle_rad), math.sin(angle_rad), 0.0], dtype=np.float64)
-    basis_v = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-    normal = np.cross(basis_u, basis_v)
-    normal /= max(float(np.linalg.norm(normal)), 1e-8)
-    return basis_u, basis_v, normal
-
-
-def _slice_plane_basis_normal_slice() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    basis_u = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
-    basis_v = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
-    normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-    return basis_u, basis_v, normal
 
 
 def _mesh_plane_segments(
@@ -818,35 +850,20 @@ def _project_points_to_plane(
     return np.stack([x, y], axis=-1)
 
 
-def _segments_to_mosaic_lines(
-    *,
-    panel_idx: int,
-    segments: tuple[np.ndarray, ...],
-    plane_spec: dict[str, np.ndarray | float],
-    panel_size_hw: tuple[int, int],
-    cell_shape: tuple[int, int],
-) -> tuple[np.ndarray, ...]:
-    row = int(panel_idx) // 4
-    col = int(panel_idx) % 4
-    height = int(panel_size_hw[0])
-    width = int(panel_size_hw[1])
-    x_min = float(plane_spec["x_min"])
-    x_max = float(plane_spec["x_max"])
-    y_min = float(plane_spec["y_min"])
-    y_max = float(plane_spec["y_max"])
-    x_span = max(x_max - x_min, 1e-8)
-    y_span = max(y_max - y_min, 1e-8)
+def _segments_to_mosaic_lines(cell: MosaicCell, segments: tuple[np.ndarray, ...]) -> tuple[np.ndarray, ...]:
+    plane = cell.plane
+    if plane is None:
+        return ()
+    x_span = max(plane.x_max - plane.x_min, 1e-8)
+    y_span = max(plane.y_max - plane.y_min, 1e-8)
     lines: list[np.ndarray] = []
     for segment in segments:
         pts = np.asarray(segment, dtype=np.float64).reshape(-1, 2)
         if pts.shape[0] < 2:
             continue
-        px = (pts[:, 0] - x_min) / x_span * float(width - 1)
-        py = (pts[:, 1] - y_min) / y_span * float(height - 1)
-        line = np.stack([px, py], axis=-1).astype(np.float32)
-        line[:, 0] += col * int(cell_shape[1])
-        line[:, 1] += row * int(cell_shape[0])
-        lines.append(line)
+        px = (pts[:, 0] - plane.x_min) / x_span * float(cell.image_width - 1) + cell.image_x0
+        py = (pts[:, 1] - plane.y_min) / y_span * float(cell.image_height - 1) + cell.image_y0
+        lines.append(np.stack([px, py], axis=-1).astype(np.float32))
     return tuple(lines)
 
 

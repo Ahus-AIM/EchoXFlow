@@ -31,6 +31,11 @@ class FitResult:
     val_loss: float | None
     log_path: str | None
     checkpoint_path: str | None = None
+    optimizer_steps_completed: int = 0
+    best_epoch: int | None = None
+    best_selection_loss: float | None = None
+    stopped_early: bool = False
+    training_state_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,11 @@ class EpochMetrics:
     elapsed_seconds: float
     device: str
     precision: str
+    optimizer_steps: int = 0
+    selection_loss: float | None = None
+    train_examples: int = 0
+    val_examples: int = 0
+    accumulate_grad_batches: int = 1
 
 
 @dataclass(frozen=True)
@@ -61,6 +71,8 @@ class BatchMetrics:
     step_seconds: float
     device: str
     precision: str
+    # Number of steps aggregated into this row (``step`` is the last); loss values are their clip-weighted mean.
+    window_steps: int = 1
 
 
 @dataclass(frozen=True)

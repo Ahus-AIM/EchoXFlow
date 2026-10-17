@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import make_record, strain_document
 
-from echoxflow import RecordingRecord, load_recording_object, open_recording
+from echoxflow import load_recording_object, open_recording
 from echoxflow.objects import ArrayRef, RecordingObject
 
 zarr = pytest.importorskip("zarr")
+
+_strain_document = partial(strain_document, depth_end_m=0.1, curves=False, contour_kind=True)
+_record = make_record
 
 
 def test_strain_object_parses_self_referenced_rv_panel(tmp_path: Path) -> None:
@@ -206,65 +211,3 @@ def test_bmode_stream_does_not_expose_reverse_annotation_ownership(tmp_path: Pat
 
     assert not hasattr(stream, "annotations")
     assert not hasattr(stream, "mesh_sequences")
-
-
-def _strain_document(roles: tuple[str, ...], *, self_recording_id: str | None = None) -> dict[str, object]:
-    return {
-        "manifest_type": "strain",
-        "schema_version": 4,
-        "annotation_type": "right_ventricular_strain" if roles == ("rv",) else "left_ventricular_strain",
-        "linked_panels": [
-            {
-                "role_id": role,
-                "view_code": role.upper(),
-                "geometry": {
-                    "depth_start_m": 0.0,
-                    "depth_end_m": 0.1,
-                    "tilt_rad": 0.0,
-                    "width_rad": 0.5,
-                },
-                "frame_timestamps": {"zarr_path": "timestamps/2d_brightness_mode", "format": "zarr_array"},
-                "linked_recording": {
-                    "recording_id": self_recording_id or f"{role}_source",
-                    "recording_zarr_path": f"{role}.zarr" if self_recording_id is None else "rv.zarr",
-                    "relative_zarr_path": f"{role}.zarr" if self_recording_id is None else "rv.zarr",
-                    "frames_array_path": "data/2d_brightness_mode",
-                    "timestamps_array_path": "timestamps/2d_brightness_mode",
-                },
-            }
-            for role in roles
-        ],
-        "annotations": [
-            {
-                "kind": "contour",
-                "target": {
-                    "type": "linked_panel",
-                    "semantic_id": role,
-                    "field": "contour_points",
-                },
-                "target_data": {"zarr_path": "data/2d_brightness_mode", "format": "zarr_array"},
-                "time": {"zarr_path": f"timestamps/{role}_contour", "format": "zarr_array"},
-                "value": {"zarr_path": f"data/{role}_contour", "format": "zarr_array"},
-            }
-            for role in roles
-        ],
-    }
-
-
-def _record(
-    recording_id: str,
-    zarr_path: str,
-    *,
-    content_types: tuple[str, ...] = ("2d_right_ventricular_strain",),
-    array_paths: tuple[str, ...] = (),
-) -> RecordingRecord:
-    return RecordingRecord(
-        exam_id="exam",
-        recording_id=recording_id,
-        zarr_path=zarr_path,
-        modes=("2d", "aps"),
-        content_types=content_types,
-        frame_counts_by_content_type={content_type: 1 for content_type in content_types},
-        median_delta_time_by_content_type={},
-        array_paths=array_paths,
-    )

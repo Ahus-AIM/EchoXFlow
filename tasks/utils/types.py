@@ -15,3 +15,7 @@ class TrainingStepResult:
     val_loss: float | None = None
     log_path: str | None = None
     checkpoint_path: str | None = None
+    best_epoch: int | None = None
+    best_selection_loss: float | None = None
+    stopped_early: bool = False
+    training_state_path: str | None = None

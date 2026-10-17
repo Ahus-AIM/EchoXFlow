@@ -10,7 +10,8 @@ import torch.nn.functional as F
 from monai.networks.layers.simplelayers import SkipConnection
 from torch import Tensor, nn
 
-Int3 = tuple[int, int, int]
+from tasks.utils.models.backbone import DenseVideoBackbone, Int3
+
 Spec3 = int | Sequence[int]
 
 
@@ -212,7 +213,7 @@ class SegmentationHead(TaskHead):
 KernelSpec = int | Sequence[int]
 
 
-class DenseSectorUNet(nn.Module):
+class DenseSectorUNet(DenseVideoBackbone):
     def __init__(
         self,
         *,
@@ -519,7 +520,11 @@ class ReplicateResidualUnit3d(nn.Module):
 
 
 class TaskModel(nn.Module):
-    """Shared sector-video pipeline: optional conditioning, padded backbone, crop, head."""
+    """Shared sector-video pipeline: optional conditioning, padded backbone, crop, head.
+
+    ``network`` may be any :class:`DenseVideoBackbone` mapping ``[B,C,T,H,W]`` to ``[B,F,T,H,W]`` with
+    ``F == head.expected_out_channels``; when omitted, the built-in U-Net is constructed from the U-Net arguments.
+    """
 
     def __init__(
         self,
@@ -534,6 +539,8 @@ class TaskModel(nn.Module):
         num_res_units: int = 0,
         output_spatial_stride: int | Sequence[int] = (1, 1),
         conditioning_features: int = 0,
+        framewise: bool = False,
+        network: DenseVideoBackbone | None = None,
     ) -> None:
         super().__init__()
         self.head = head
@@ -547,17 +554,23 @@ class TaskModel(nn.Module):
             if self.conditioning_features > 0
             else None
         )
-        self.network = DenseSectorUNet(
-            in_channels=self.in_channels_per_frame,
-            out_channels=head.expected_out_channels,
-            channels=channels,
-            strides=strides,
-            kernel_sizes=kernel_sizes,
-            up_kernel_sizes=up_kernel_sizes,
-            transpose_post_conv_kernel_size=transpose_post_conv_kernel_size,
-            output_spatial_stride=self.output_spatial_stride,
-            num_res_units=int(num_res_units),
+        self.network = (
+            DenseSectorUNet(
+                in_channels=self.in_channels_per_frame,
+                out_channels=head.expected_out_channels,
+                channels=channels,
+                strides=strides,
+                kernel_sizes=kernel_sizes,
+                up_kernel_sizes=up_kernel_sizes,
+                transpose_post_conv_kernel_size=transpose_post_conv_kernel_size,
+                output_spatial_stride=self.output_spatial_stride,
+                num_res_units=int(num_res_units),
+            )
+            if network is None
+            else network
         )
+        # Fold time into the batch so a 2D U-Net (temporal kernels/strides of 1) also normalizes per frame.
+        self.framewise = _validated_framewise_setting(self.network, enabled=bool(framewise))
 
     @property
     def out_channels(self) -> int:
@@ -578,14 +591,42 @@ class TaskModel(nn.Module):
             require_conditioning=self.head.requires_conditioning,
         )
         padded_input, padding = _pad_to_stride_multiple(conditioned, stride_multiple=_stride_multiple(self.network))
-        prediction = self.network(padded_input)
         output_hw = output_spatial_shape(
             input_shape=(int(height), int(width)),
             output_spatial_stride=self.output_spatial_stride,
         )
         pad_t, pad_h, pad_w = padding
-        if pad_t != 0 or pad_h != 0 or pad_w != 0:
-            prediction = prediction[..., : int(time_steps), : output_hw[0], : output_hw[1]]
+        if self.framewise:
+            if pad_t != 0:
+                raise RuntimeError(f"framewise backbone unexpectedly required temporal padding of {pad_t}")
+            padded_height, padded_width = (int(value) for value in padded_input.shape[-2:])
+            frame_batch = (
+                padded_input.permute(0, 2, 1, 3, 4)
+                .reshape(int(frames.shape[0]) * int(time_steps), int(frames.shape[1]), padded_height, padded_width)
+                .unsqueeze(2)
+            )
+            frame_prediction = self.network(frame_batch)
+            if int(frame_prediction.shape[2]) != 1:
+                raise RuntimeError(
+                    "framewise backbone must return exactly one temporal plane per input frame, "
+                    f"got {frame_prediction.shape[2]}"
+                )
+            prediction = (
+                frame_prediction[:, :, 0, : output_hw[0], : output_hw[1]]
+                .reshape(
+                    int(frames.shape[0]),
+                    int(time_steps),
+                    int(frame_prediction.shape[1]),
+                    output_hw[0],
+                    output_hw[1],
+                )
+                .permute(0, 2, 1, 3, 4)
+                .contiguous()
+            )
+        else:
+            prediction = self.network(padded_input)
+            if pad_t != 0 or pad_h != 0 or pad_w != 0:
+                prediction = prediction[..., : int(time_steps), : output_hw[0], : output_hw[1]]
         return cast(Tensor, self.head(prediction, frames=frames, conditioning=conditioning, **head_kwargs))
 
 
@@ -608,20 +649,37 @@ _BACKBONE_KEYS = {
     "num_res_units",
     "output_spatial_stride",
     "conditioning_features",
+    "framewise",
 }
+_TASK_MODEL_KEYS = ("in_channels_per_frame", "conditioning_features", "output_spatial_stride")
 
 
 def build_model(*, kind: str, head: str | type[TaskHead] | None = None, **kwargs: object) -> TaskModel:
+    """Build a task model whose dense backbone is selected by ``backbone`` (default: the built-in U-Net)."""
     if kind in _HEAD_REGISTRY and head is None:
         head_cls, head_keys = _HEAD_REGISTRY[kind]
         head_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in head_keys}
     else:
         head_cls = _resolve_head_class(head or kind)
-        head_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key not in _BACKBONE_KEYS}
+        head_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key not in {*_BACKBONE_KEYS, "backbone"}}
+    head_module = cast(TaskHead, head_cls(**cast(Any, head_kwargs)))
+    backbone = str(kwargs.pop("backbone", "unet"))
+    if backbone != "unet":
+        from tasks.utils.models.registry import build_backbone
+
+        model_kwargs = {key: kwargs.pop(key) for key in _TASK_MODEL_KEYS if key in kwargs}
+        if as_2tuple(cast(Any, model_kwargs.get("output_spatial_stride", 1)), name="output_spatial_stride") != (1, 1):
+            raise ValueError(f"backbone {backbone!r} requires output_spatial_stride=(1, 1)")
+        model_kwargs["network"] = build_backbone(
+            backbone,
+            in_channels=int(cast(Any, model_kwargs.get("in_channels_per_frame", 1))),
+            out_channels=head_module.expected_out_channels,
+            **kwargs,
+        )
+        return TaskModel(head=head_module, **cast(Any, model_kwargs))
     backbone_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in _BACKBONE_KEYS}
     if kwargs:
         raise ValueError(f"Unknown model config keys for kind={kind!r}: {sorted(kwargs)}")
-    head_module = cast(TaskHead, head_cls(**cast(Any, head_kwargs)))
     return TaskModel(head=head_module, **cast(Any, backbone_kwargs))
 
 
@@ -646,7 +704,21 @@ def framewise_temporal_config(raw: dict[str, object]) -> dict[str, object]:
         raise ValueError("framewise_temporal_config requires model.channels when model.up_kernel_sizes is absent")
     if "transpose_post_conv_kernel_size" in model:
         model["transpose_post_conv_kernel_size"] = _framewise_kernel_spec(model["transpose_post_conv_kernel_size"])
+    model["framewise"] = True
     return config
+
+
+def _validated_framewise_setting(network: DenseVideoBackbone, *, enabled: bool) -> bool:
+    if enabled and (not isinstance(network, DenseSectorUNet) or not _network_is_framewise(network)):
+        raise ValueError("framewise execution requires temporal kernel sizes and strides of 1 throughout the backbone")
+    return enabled
+
+
+def _network_is_framewise(network: DenseSectorUNet) -> bool:
+    kernels = (*network.kernel_sizes, *network.up_kernel_sizes)
+    if network.transpose_post_conv_kernel_size is not None:
+        kernels = (*kernels, network.transpose_post_conv_kernel_size)
+    return all(int(kernel[0]) == 1 for kernel in kernels) and all(int(stride[0]) == 1 for stride in network.strides)
 
 
 def _framewise_kernel_specs(value: object) -> object:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -70,16 +71,21 @@ def build_contour_masks(
     myo_mask = np.zeros((height, width), dtype=bool)
     start_col = min(group_layout.endo_index, group_layout.outer_index)
     stop_col = max(group_layout.endo_index, group_layout.outer_index)
-    quad = np.empty((4, 2), dtype=np.float32)
-    for row in range(point_grid.shape[0] - 1):
-        for col in range(start_col, stop_col):
-            quad[0] = point_grid[row, col]
-            quad[1] = point_grid[row + 1, col]
-            quad[2] = point_grid[row + 1, col + 1]
-            quad[3] = point_grid[row, col + 1]
-            if abs(_polygon_area(quad)) <= 1e-6:
-                continue
-            _rasterize_polygon_into(myo_mask, quad)
+    # The myocardium is the union of the quads between neighbouring contour rows and columns, each filled and
+    # outlined like any polygon; quads of (near) zero area are skipped.
+    quads = np.stack(
+        (
+            point_grid[:-1, start_col:stop_col],
+            point_grid[1:, start_col:stop_col],
+            point_grid[1:, start_col + 1 : stop_col + 1],
+            point_grid[:-1, start_col + 1 : stop_col + 1],
+        ),
+        axis=2,
+    ).reshape(-1, 4, 2)
+    quads = quads[np.abs(_quad_areas(quads)) > 1e-6]
+    if quads.shape[0]:
+        _fill_polygons_scanlines(myo_mask, quads)
+        _rasterize_polygons_boundary(myo_mask, quads)
     myo_mask &= ~endo_mask
 
     return ContourMaskResult(
@@ -102,8 +108,8 @@ def _rasterize_polygon_into(mask: np.ndarray, vertices: np.ndarray) -> None:
     if polygon.shape[0] == 0:
         return
     if polygon.shape[0] >= 3 and abs(_polygon_area(polygon)) > 1e-6:
-        _fill_polygon_scanlines(mask, polygon)
-    _rasterize_polygon_boundary(mask, polygon)
+        _fill_polygons_scanlines(mask, polygon[None])
+    _rasterize_polygons_boundary(mask, polygon[None])
 
 
 def _reshape_valid_point_grid(points: np.ndarray, *, group_layout: ContourGroupLayout) -> np.ndarray:
@@ -118,56 +124,117 @@ def _reshape_valid_point_grid(points: np.ndarray, *, group_layout: ContourGroupL
     return np.asarray(grid[finite_rows], dtype=np.float32)
 
 
-def _fill_polygon_scanlines(mask: np.ndarray, polygon: np.ndarray) -> None:
+def _fill_polygons_scanlines(mask: np.ndarray, polygons: np.ndarray) -> None:
+    """Fill ``polygons`` (``[P,V,2]`` float32 ``x,y`` pixel vertices) into ``mask`` with the even-odd scanline rule.
+
+    Pixel ``(row, col)`` has its centre at ``x = col, y = row``, the convention of the contour pixel coordinates
+    (:class:`~echoxflow.scan.coordinates.BeamspacePixelGrid`, :class:`~echoxflow.scan.coordinates.CartesianPixelGrid`)
+    and of the outline in :func:`_mark_points`. Each pixel row is sampled at ``y = row``; an edge crosses it when ``y``
+    lies in ``[min(y0, y1), max(y0, y1))`` (horizontal edges never do). The sorted crossings pair up into spans, and a
+    span ``[left, right]`` covers the columns ``ceil(left) .. floor(right)``. The arithmetic is done in float64
+    in the same order as a per-edge evaluation, so the result is independent of how polygons are batched.
+    """
     height, width = mask.shape
-    y_min = max(0, int(np.floor(float(np.min(polygon[:, 1])))))
-    y_max = min(height - 1, int(np.ceil(float(np.max(polygon[:, 1])))))
-    if y_max < y_min:
+    if polygons.shape[0] == 0 or height == 0 or width == 0:
         return
-    vertex_count = int(polygon.shape[0])
-    for row in range(y_min, y_max + 1):
-        y = float(row) + 0.5
-        intersections: list[float] = []
-        for index in range(vertex_count):
-            start = polygon[index]
-            end = polygon[(index + 1) % vertex_count]
-            y0 = float(start[1])
-            y1 = float(end[1])
-            if y0 == y1:
-                continue
-            if (y0 <= y < y1) or (y1 <= y < y0):
-                x0 = float(start[0])
-                x1 = float(end[0])
-                intersections.append(x0 + (y - y0) * (x1 - x0) / (y1 - y0))
-        intersections.sort()
-        for left, right in zip(intersections[0::2], intersections[1::2]):
-            col_start = max(0, int(np.ceil(min(left, right) - 0.5)))
-            col_stop = min(width - 1, int(np.floor(max(left, right) - 0.5)))
-            if col_stop >= col_start:
-                mask[row, col_start : col_stop + 1] = True
-
-
-def _rasterize_polygon_boundary(mask: np.ndarray, polygon: np.ndarray) -> None:
-    if polygon.shape[0] == 1:
-        _mark_point(mask, polygon[0])
+    vertices = np.asarray(polygons, dtype=np.float32)
+    x0 = vertices[:, :, 0].astype(np.float64)
+    y0 = vertices[:, :, 1].astype(np.float64)
+    x1 = np.roll(x0, -1, axis=1)
+    y1 = np.roll(y0, -1, axis=1)
+    # Only the rows within a polygon's vertical extent can have crossings: scan each polygon over its own rows.
+    first_row = np.clip(np.floor(np.min(y0, axis=1)), 0.0, float(height - 1)).astype(np.int64)
+    last_row = np.clip(np.ceil(np.max(y0, axis=1)), -1.0, float(height - 1)).astype(np.int64)
+    row_count = int(np.max(last_row - first_row)) + 1
+    if row_count <= 0:
         return
-    vertex_count = int(polygon.shape[0])
-    for index in range(vertex_count):
-        _rasterize_segment(mask, polygon[index], polygon[(index + 1) % vertex_count])
+    rows = first_row[:, None] + np.arange(row_count)[None, :]
+    in_extent = rows <= last_row[:, None]
+    y = rows.astype(np.float64)[:, :, None]
+    y0b, y1b, x0b, x1b = (values[:, None, :] for values in (y0, y1, x0, x1))
+    crosses = in_extent[:, :, None] & (y0b != y1b) & (((y0b <= y) & (y < y1b)) | ((y1b <= y) & (y < y0b)))
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        x = x0b + (y - y0b) * (x1b - x0b) / (y1b - y0b)
+    intersections = np.sort(np.where(crosses, x, np.inf), axis=-1)
+    counts = crosses.sum(axis=-1)
+    pair_count = intersections.shape[-1] // 2
+    if pair_count == 0:
+        return
+    left = intersections[..., 0 : 2 * pair_count : 2]
+    right = intersections[..., 1 : 2 * pair_count : 2]
+    paired = (2 * np.arange(pair_count) + 1)[None, None, :] < counts[..., None]
+    with np.errstate(invalid="ignore"):
+        col_start = np.maximum(0.0, np.ceil(np.minimum(left, right)))
+        col_stop = np.minimum(float(width - 1), np.floor(np.maximum(left, right)))
+    spans = paired & (col_stop >= col_start)
+    if not bool(spans.any()):
+        return
+    span_rows = np.broadcast_to(rows[:, :, None], spans.shape)[spans]
+    starts = col_start[spans].astype(np.int64)
+    stops = col_stop[spans].astype(np.int64) + 1
+    stride = width + 1
+    size = height * stride
+    edges = np.bincount(span_rows * stride + starts, minlength=size + 1)[:size]
+    edges -= np.bincount(span_rows * stride + stops, minlength=size + 1)[:size]
+    mask |= np.cumsum(edges.reshape(height, stride), axis=1)[:, :width] > 0
 
 
-def _rasterize_segment(mask: np.ndarray, start: np.ndarray, end: np.ndarray) -> None:
-    delta = np.asarray(end, dtype=np.float32) - np.asarray(start, dtype=np.float32)
-    steps = max(1, int(np.ceil(float(np.max(np.abs(delta))) * 2.0)))
-    for t in np.linspace(0.0, 1.0, steps + 1, dtype=np.float32):
-        _mark_point(mask, np.asarray(start, dtype=np.float32) + t * delta)
+def _rasterize_polygons_boundary(mask: np.ndarray, polygons: np.ndarray) -> None:
+    """Mark the closed outline of each polygon (``[P,V,2]``): every edge, including the last-to-first one."""
+    vertices = np.asarray(polygons, dtype=np.float32)
+    if vertices.shape[0] == 0 or vertices.shape[1] == 0:
+        return
+    if vertices.shape[1] == 1:
+        _mark_points(mask, vertices[:, 0, :])
+        return
+    starts = vertices.reshape(-1, 2)
+    ends = np.roll(vertices, -1, axis=1).reshape(-1, 2)
+    _rasterize_segments(mask, starts, ends)
 
 
-def _mark_point(mask: np.ndarray, point: np.ndarray) -> None:
-    col = int(np.rint(float(point[0])))
-    row = int(np.rint(float(point[1])))
-    if 0 <= row < mask.shape[0] and 0 <= col < mask.shape[1]:
-        mask[row, col] = True
+def _rasterize_segments(mask: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> None:
+    """Mark the pixels nearest to ``2 * max(|dx|, |dy|)`` evenly spaced float32 samples along each segment."""
+    starts = np.asarray(starts, dtype=np.float32)
+    deltas = np.asarray(ends, dtype=np.float32) - starts
+    steps = np.maximum(1, np.ceil(np.max(np.abs(deltas), axis=1).astype(np.float64) * 2.0)).astype(np.int64)
+    points: list[np.ndarray] = []
+    for step_count in np.unique(steps):
+        selected = steps == step_count
+        samples = _segment_samples(int(step_count))
+        sampled = starts[selected][:, None, :] + samples[None, :, None] * deltas[selected][:, None, :]
+        points.append(sampled.reshape(-1, 2))
+    if points:
+        _mark_points(mask, np.concatenate(points))
+
+
+@lru_cache(maxsize=1024)
+def _segment_samples(step_count: int) -> np.ndarray:
+    samples = np.linspace(0.0, 1.0, step_count + 1, dtype=np.float32)
+    samples.setflags(write=False)
+    return samples
+
+
+def _mark_points(mask: np.ndarray, points: np.ndarray) -> None:
+    """Set the pixels nearest (round half to even) to ``x,y`` points that fall inside ``mask``."""
+    rounded = np.rint(np.asarray(points, dtype=np.float32))
+    cols = rounded[:, 0]
+    rows = rounded[:, 1]
+    inside = (rows >= 0) & (rows < mask.shape[0]) & (cols >= 0) & (cols < mask.shape[1])
+    mask[rows[inside].astype(np.int64), cols[inside].astype(np.int64)] = True
+
+
+def _quad_areas(quads: np.ndarray) -> np.ndarray:
+    """Signed shoelace areas of ``[Q,4,2]`` quads, equal to :func:`_polygon_area` of each quad."""
+    x = quads[:, :, 0].astype(np.float64)
+    y = quads[:, :, 1].astype(np.float64)
+    terms = x * np.roll(y, -1, axis=1) - np.roll(x, -1, axis=1) * y
+    areas = 0.5 * (((terms[:, 0] + terms[:, 1]) + terms[:, 2]) + terms[:, 3])
+    # The summation order of numpy's reduction is an implementation detail; near the 1e-6 threshold use the exact
+    # per-quad computation so the zero-area test matches it bit for bit.
+    near = np.abs(np.abs(areas) - 1e-6) <= 1e-6 + 1e-9 * np.max(np.abs(terms), axis=1, initial=0.0)
+    for index in np.flatnonzero(near):
+        areas[index] = _polygon_area(quads[index])
+    return areas
 
 
 def _finite_vertices(vertices: np.ndarray) -> np.ndarray:

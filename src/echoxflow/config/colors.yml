@@ -137,21 +137,21 @@ colormaps:
   tissue_doppler:
     stops:
       - position: 0.0
-        color: [254, 254, 223]
-      - position: 0.095
-        color: [254, 254, 1]
-      - position: 0.47
-        color: [254, 0, 0]
-      - position: 0.5
-        color: [254, 0, 0]
-      - position: 0.5
-        color: [0, 0, 254]
-      - position: 0.605
-        color: [0, 0, 254]
-      - position: 0.86
-        color: [0, 254, 254]
-      - position: 1.0
         color: [0, 254, 3]
+      - position: 0.14
+        color: [0, 254, 254]
+      - position: 0.395
+        color: [0, 0, 254]
+      - position: 0.5
+        color: [0, 0, 254]
+      - position: 0.5
+        color: [254, 0, 0]
+      - position: 0.53
+        color: [254, 0, 0]
+      - position: 0.905
+        color: [254, 254, 1]
+      - position: 1.0
+        color: [254, 254, 223]
 
   strain_contour:
     stops:

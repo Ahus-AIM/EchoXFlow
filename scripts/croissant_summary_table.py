@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
+"""Dataset statistics tables from an EchoXFlow export: tab:modality-stats and (with --view-csv) tab:view-stats.
+
+Reads the Croissant record sets (sizes are uncompressed shape x dtype; stream timing from the streams record
+set) and, where the catalog cannot resolve a row, the recordings' .zattrs and a few small timestamp arrays.
+
+    uv run python scripts/croissant_summary_table.py "$DATA/croissant.json" \
+        --view-csv "$DATA/view_classifier_probabilities.csv"
+"""
+
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import re
-import zipfile
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
-DEFAULT_OUTPUT = Path("outputs/tables/croissant_summary_table.tex")
+import numpy as np
+
+from echoxflow import open_recording
+from echoxflow.schema import ECHOPRIME_LABELS, consensus_view
+
+DEFAULT_OUTPUT_DIR = Path("outputs/tables")
 
 
 @dataclass(frozen=True)
@@ -119,7 +136,7 @@ TABLE_ROWS = (
     ),
     ModalityRow(
         key="lv_alax_strain",
-        label=r"\qquad Left ventricle, ALAX",
+        label=r"\qquad Left ventricle, A3C",
         content_types=("2d_left_ventricular_strain",),
         timing_content_types=("2d_left_ventricular_strain",),
         path_markers=("data/3ch_contour", "data/3ch_curve"),
@@ -272,18 +289,14 @@ def main() -> int:
     )
     parser.add_argument("croissant", type=Path, help="Path to croissant.json.")
     parser.add_argument(
-        "--output",
+        "--output-dir",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help=f"Write LaTeX to this file. Defaults to {DEFAULT_OUTPUT}.",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for croissant_summary_table.tex (and the _views files).",
     )
     parser.add_argument(
         "--caption",
-        default=(
-            "Per-modality statistics. Values are reported as medians and interquartile ranges. "
-            "The dense annotations are defined over one heart cycle, but can be expanded to the full underlying "
-            "recording using beat-stitching via the ECG under the (verifiable) assumption of regular heart rhythm."
-        ),
+        default="Per-modality statistics.",
         help="LaTeX table caption.",
     )
     parser.add_argument("--label", default="tab:modality-stats", help="LaTeX table label.")
@@ -297,34 +310,241 @@ def main() -> int:
         default="Exams",
         help="Header label for the unique subject/exam column.",
     )
+    parser.add_argument(
+        "--view-csv",
+        type=Path,
+        default=None,
+        help=(
+            "view_classifier_probabilities.csv from build_view_classifier_csv.py. Writes the per-view table next "
+            "to the main one (croissant_summary_table_views.tex and .csv) and assigns views to 2D annotation "
+            "panels that carry no view of their own."
+        ),
+    )
     args = parser.parse_args()
 
-    table = build_table(
+    output = args.output_dir / "croissant_summary_table.tex"
+    if args.view_csv is not None:
+        write_view_tables(
+            croissant_path=args.croissant,
+            view_csv=args.view_csv,
+            output=output.with_name(f"{output.stem}_views.tex"),
+        )
+    table, report = build_table(
         croissant_path=args.croissant,
         caption=args.caption,
         label=args.label,
         subject_field=args.subject_field,
         subject_label=args.subject_label,
+        view_csv=args.view_csv,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(table + "\n", encoding="utf-8")
-    print(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(table + "\n", encoding="utf-8")
+    output.with_name(f"{output.stem}_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(output)
     return 0
 
 
-def build_table(*, croissant_path: Path, caption: str, label: str, subject_field: str, subject_label: str) -> str:
+def build_table(
+    *,
+    croissant_path: Path,
+    caption: str,
+    label: str,
+    subject_field: str,
+    subject_label: str,
+    view_csv: Path | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """The tab:modality-stats LaTeX (published layout) and a summary of how document rows were resolved."""
     croissant_path = croissant_path.expanduser()
     metadata = load_json(croissant_path)
     recordings = normalized_rows(metadata, record_set_name="recordings")
     arrays = normalized_rows(metadata, record_set_name="arrays", required=False)
     arrays_by_recording = group_arrays_by_recording(arrays)
+    index_croissant(croissant_path.parent, recordings, arrays, normalized_rows(metadata, record_set_name="streams"))
     stats = collect_stats(
         recordings=recordings,
         arrays_by_recording=arrays_by_recording,
         croissant_dir=croissant_path.parent,
         subject_field=subject_field,
     )
-    return render_latex_table(stats=stats, caption=caption, label=label, subject_label=subject_label)
+    report = resolve_document_rows(
+        stats=stats, recordings=recordings, arrays=arrays, root=croissant_path.parent, view_csv=view_csv
+    )
+    table = render_latex_table(stats=stats, caption=caption, label=label, subject_label=subject_label)
+    return paper_layout(table, caption=caption, subject_label=subject_label), report
+
+
+VIEW_GROUPS = ("A2C", "A3C", "A4C", "PLAX", "PSAX", "Other", "Apical bi-/triplane", "Uncertain")
+VIEW_COLUMNS = ("All", *VIEW_GROUPS)
+VIEW_HEADERS = ("All", "A2C", "A3C", "A4C", "PLAX", "PSAX", "Other", "Apical bi-/triplane", "Uncertain/ambiguous")
+VIEW_SUBSETS = (
+    ("All source recordings", None),
+    ("Color Doppler subset", "2d_color_doppler"),
+    ("Tissue Doppler subset", "2d_tissue_doppler"),
+)
+
+
+def write_view_tables(*, croissant_path: Path, view_csv: Path, output: Path) -> None:
+    """Recordings per view (all source recordings, colour and tissue Doppler subsets) as LaTeX and CSV.
+
+    Source recordings are those with an ECG of at least two samples (the electrocardiogram row). The view is the coarse
+    class on which EchoPrime and EchoFine agree (``echoxflow.schema.consensus_view``), else uncertain/ambiguous;
+    bi-/triplane recordings form their own group. The Doppler subsets hold the items of the 2D Color and 2D Tissue
+    rows: the content type with at least two Doppler frames. Per-examination counts include examinations with zero.
+    """
+    metadata = load_json(croissant_path.expanduser())
+    recordings = normalized_rows(metadata, record_set_name="recordings")
+    arrays = normalized_rows(metadata, record_set_name="arrays", required=False)
+    with_ecg = {
+        clean_text(row.get("recording_id"))
+        for row in arrays
+        if clean_text(row.get("array_path")) == "data/ecg"
+        and isinstance(row.get("shape"), list)
+        and row["shape"]
+        and int(row["shape"][0]) >= 2
+    }
+    labels: dict[str, str] = {}
+    with view_csv.expanduser().open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if (row.get("skip_reason") or "").strip():
+                continue
+            prime = (row.get("echoprime_top1") or "").strip()
+            view = consensus_view((row.get("echofine_top1") or "").strip(), ECHOPRIME_LABELS.get(prime, prime))
+            labels[clean_text(row.get("recording_id"))] = view or "Uncertain"
+    exam_ids = sorted({clean_text(r.get("exam_id")) for r in recordings} - {""})
+    counts: dict[str, dict[str, Counter[str]]] = {
+        title: {exam_id: Counter() for exam_id in exam_ids} for title, _ in VIEW_SUBSETS
+    }
+    for recording in recordings:
+        recording_id, exam_id = clean_text(recording.get("recording_id")), clean_text(recording.get("exam_id"))
+        if not exam_id or recording_id not in with_ecg:
+            continue
+        array_paths = string_list(recording.get("array_paths"))
+        if any("2d_brightness_mode_plane_" in path for path in array_paths):
+            group = "Apical bi-/triplane"
+        else:
+            group = labels.get(recording_id, "Uncertain")
+        content_types = set(string_list(recording.get("content_types")))
+        frame_counts = dict_value(recording.get("frame_counts_by_content_type"))
+        for title, content_type in VIEW_SUBSETS:
+            if content_type is not None and (
+                content_type not in content_types or (positive_int(frame_counts.get(content_type)) or 0) < 2
+            ):
+                continue
+            counts[title][exam_id].update(["All", group])
+
+    def quartiles(values: list[int]) -> tuple[str, str, str]:
+        """Median, lower and upper quartile; whole counts stay integers."""
+        q25, q50, q75 = (float(np.quantile(values, q)) for q in (0.25, 0.5, 0.75))
+        text = [f"{v:.0f}" if float(v).is_integer() else f"{v:.1f}" for v in (q50, q25, q75)]
+        return text[0], text[1], text[2]
+
+    csv_rows, blocks = [], []
+    for title, _ in VIEW_SUBSETS:
+        per_exam = counts[title]
+        totals = [sum(c[column] for c in per_exam.values()) for column in VIEW_COLUMNS]
+        stats = [quartiles([c[column] for c in per_exam.values()]) for column in VIEW_COLUMNS]
+        medians = [f"{median} ({low}--{high})" for median, low, high in stats]
+        csv_rows.append({"subset": title, "statistic": "total", **dict(zip(VIEW_HEADERS, totals, strict=True))})
+        csv_rows.append(
+            {"subset": title, "statistic": "per_exam_median_iqr", **dict(zip(VIEW_HEADERS, medians, strict=True))}
+        )
+        blocks.append(
+            "\n".join(
+                [
+                    rf"\multicolumn{{{len(VIEW_HEADERS) + 1}}}{{@{{}}l}}{{\textbf{{{title}}}}} \\",
+                    r"\quad Total recordings, $n$ & " + " & ".join(rf"\num{{{t}}}" for t in totals) + r" \\",
+                    r"\quad Per examination, median & " + " & ".join(median for median, _, _ in stats) + r" \\",
+                    r"\quad Per examination, IQR & " + " & ".join(f"{low}--{high}" for _, low, high in stats) + r" \\",
+                ]
+            )
+        )
+    table = "\n".join(
+        [
+            r"\begin{table}[ht]",
+            r"\centering",
+            r"\caption{Recordings per view.}",
+            r"\label{tab:view-stats}",
+            r"\scriptsize",
+            r"\setlength{\tabcolsep}{3pt}",
+            r"\resizebox{\linewidth}{!}{%",
+            r"\begin{tabular}{@{}l" + "r" * len(VIEW_HEADERS) + r"@{}}",
+            r"\toprule",
+            " & ".join([r"\textbf{Statistic}"] + [rf"\textbf{{{h}}}" for h in VIEW_HEADERS]) + r" \\",
+            r"\midrule",
+            "\n\\addlinespace\n".join(blocks),
+            r"\bottomrule",
+            r"\end{tabular}}",
+            r"\par\vspace{2pt}",
+            r"\begin{minipage}{\linewidth}",
+            r"\footnotesize",
+            r"Views are the coarse classes on which the EchoPrime and EchoFine view classifiers agree; "
+            r"recordings where they disagree are uncertain/ambiguous.\\",
+            r"Doppler subsets count recordings with at least two Doppler frames.\\",
+            r"Per-examination counts are medians and interquartile ranges over all examinations.",
+            r"\end{minipage}",
+            r"\end{table}",
+        ]
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(table + "\n", encoding="utf-8")
+    with output.with_suffix(".csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["subset", "statistic", *VIEW_HEADERS])
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    print(output)
+
+
+def format_plain_zero(value: float) -> str:
+    return str(int(math.floor(float(value) + 0.5)))
+
+
+# Croissant-only lookups (filled by index_croissant): sizes are uncompressed (shape x dtype); stream timing comes from
+# the "streams" record set. Zarr is only touched for .zattrs (gate metadata, stitch counts, marker labels) and for
+# timestamp arrays that the streams record set does not cover (dense annotation contours and meshes).
+ARRAY_BYTES: dict[tuple[Path, str], int] = {}
+STREAM_DELTA: dict[tuple[Path, str], float] = {}
+
+
+def index_croissant(
+    root: Path, recordings: list[dict[str, Any]], arrays: list[dict[str, Any]], streams: list[dict[str, Any]]
+) -> None:
+    zarr_by_recording = {clean_text(r.get("recording_id")): root / clean_text(r.get("zarr_path")) for r in recordings}
+    path_by_array_id: dict[str, tuple[Path, str]] = {}
+    for row in arrays:
+        key = (zarr_by_recording.get(clean_text(row.get("recording_id")), root), clean_text(row.get("array_path")))
+        path_by_array_id[clean_text(row.get("array_id"))] = key
+        shape = row.get("shape")
+        if isinstance(shape, list) and row.get("dtype"):
+            ARRAY_BYTES[key] = int(np.prod([int(n) for n in shape], dtype=np.int64)) * np.dtype(row["dtype"]).itemsize
+    for row in streams:
+        key = path_by_array_id.get(clean_text(row.get("timestamp_array_id")))
+        delta = finite_float(row.get("median_delta_s"))
+        if key is not None and delta is not None and delta > 0.0:
+            STREAM_DELTA[key] = delta
+
+
+class LazyAttrs(dict):
+    """Reads a store's .zattrs only when a value is actually requested."""
+
+    def __init__(self, zarr_path: Path) -> None:
+        super().__init__()
+        self._path, self._loaded = zarr_path, False
+
+    def _load(self) -> None:
+        if not self._loaded:
+            self._loaded = True
+            try:
+                self.update(json.loads((self._path / ".zattrs").read_text(encoding="utf-8")))
+            except OSError:
+                pass
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self._load()
+        return super().get(key, default)
+
+    def __getitem__(self, key: Any) -> Any:
+        self._load()
+        return super().__getitem__(key)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -407,7 +627,7 @@ def collect_stats(
         recording_id = clean_text(recording.get("recording_id"))
         array_rows = arrays_by_recording.get(recording_id, [])
         zarr_path = croissant_dir / clean_text(recording.get("zarr_path"))
-        zarr_attrs = zarr_attrs_cache.setdefault(zarr_path, read_zarr_attrs(zarr_path))
+        zarr_attrs = zarr_attrs_cache.setdefault(zarr_path, LazyAttrs(zarr_path))
         content_types = string_list(recording.get("content_types")) or string_list(zarr_attrs.get("content_types"))
         frame_counts = dict_value(recording.get("frame_counts_by_content_type")) or dict_value(
             zarr_attrs.get("frame_counts_by_content_type")
@@ -581,9 +801,8 @@ def recording_has_modality(
         has_content_type = bool(content_type_set & set(modality.content_types))
         return has_content_type or paths_contain(array_paths, modality.path_markers)
     if modality.key == "2d_color_doppler":
-        if paths_contain(array_paths, modality.path_markers):
-            return True
-        return "2d_color_doppler" in content_type_set and not paths_contain(array_paths, modality.path_exclusions)
+        # Content type only: B-mode recordings can carry an empty colour segment-offset coordinate array.
+        return "2d_color_doppler" in content_type_set
     if modality.path_markers and modality.content_types:
         has_content_type = bool(content_type_set & set(modality.content_types))
         return has_content_type and paths_contain(array_paths, modality.path_markers)
@@ -763,6 +982,9 @@ def positive_int(value: Any) -> int | None:
 
 def modality_delta_s(*, modality: ModalityRow, median_delta: dict[str, Any], zarr_path: Path) -> float | None:
     for timestamp_path in modality.timestamp_paths:
+        if (zarr_path, timestamp_path) in STREAM_DELTA:
+            return STREAM_DELTA[(zarr_path, timestamp_path)]
+    for timestamp_path in modality.timestamp_paths:
         delta = zarr_timestamp_delta_s(zarr_path=zarr_path, array_path=timestamp_path)
         if delta is not None and delta > 0.0:
             return delta
@@ -781,114 +1003,35 @@ def finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+@contextmanager
+def open_group(zarr_path: Path) -> Iterator[Any]:
+    """Keep a recording store open only while extracting summary metadata."""
+    group = open_recording(zarr_path).group
+    try:
+        yield group
+    finally:
+        group.store.close()
+
+
 def zarr_timestamp_delta_s(*, zarr_path: Path, array_path: str) -> float | None:
     try:
-        import numpy as np
-        from numcodecs import get_codec
-    except ImportError:
+        with open_group(zarr_path) as group:
+            values = np.asarray(group[array_path][...], dtype=np.float64)
+    except Exception:
         return None
-
-    zarray = read_zarr_array_metadata(zarr_path=zarr_path, array_path=array_path)
-    if not zarray:
-        return None
-    shape = [positive_int(item) for item in zarray.get("shape", [])]
-    chunks = [positive_int(item) for item in zarray.get("chunks", [])]
-    if len(shape) != 1 or len(chunks) != 1 or shape[0] is None or chunks[0] is None:
-        return None
-    try:
-        dtype = np.dtype(str(zarray.get("dtype", "")))
-    except TypeError:
-        return None
-    if dtype.kind not in {"f", "i", "u"}:
-        return None
-
-    arrays = []
-    chunk_count = int(math.ceil(shape[0] / chunks[0]))
-    for chunk_index in range(chunk_count):
-        chunk_bytes = read_zarr_chunk(zarr_path=zarr_path, array_path=array_path, chunk_name=str(chunk_index))
-        if chunk_bytes is None:
-            return None
-        compressor = zarray.get("compressor")
-        if isinstance(compressor, dict):
-            try:
-                chunk_bytes = get_codec(compressor).decode(chunk_bytes)
-            except Exception:
-                return None
-        arrays.append(np.frombuffer(chunk_bytes, dtype=dtype))
-    if not arrays:
-        return None
-    values = np.concatenate(arrays)[: shape[0]].astype(np.float64, copy=False)
     if values.ndim != 1 or values.size < 2:
         return None
     deltas = np.diff(values)
     valid = deltas[np.isfinite(deltas) & (deltas > 0.0)]
-    if valid.size < 1:
-        return None
-    return float(np.median(valid))
-
-
-def read_zarr_array_metadata(*, zarr_path: Path, array_path: str) -> dict[str, Any]:
-    metadata_path = f"{array_path}/.zarray"
-    if zarr_path.is_dir():
-        path = zarr_path / metadata_path
-        if not path.is_file():
-            return {}
-        return load_json(path)
-    if not zarr_path.is_file():
-        return {}
-    try:
-        with zipfile.ZipFile(zarr_path) as archive:
-            with archive.open(metadata_path) as metadata_file:
-                value = json.loads(metadata_file.read().decode("utf-8"))
-    except (KeyError, OSError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def read_zarr_chunk(*, zarr_path: Path, array_path: str, chunk_name: str) -> bytes | None:
-    chunk_path = f"{array_path}/{chunk_name}"
-    if zarr_path.is_dir():
-        path = zarr_path / chunk_path
-        if not path.is_file():
-            return None
-        return path.read_bytes()
-    if not zarr_path.is_file():
-        return None
-    try:
-        with zipfile.ZipFile(zarr_path) as archive:
-            with archive.open(chunk_path) as chunk_file:
-                return chunk_file.read()
-    except (KeyError, OSError, zipfile.BadZipFile):
-        return None
+    return float(np.median(valid)) if valid.size else None
 
 
 def read_zarr_attrs(path: Path) -> dict[str, Any]:
-    if path.is_dir():
-        attrs_path = path / ".zattrs"
-        if attrs_path.is_file():
-            return load_json(attrs_path)
-        return {}
-    if not path.is_file():
-        return {}
     try:
-        with zipfile.ZipFile(path) as archive:
-            with archive.open(".zattrs") as attrs_file:
-                value = json.loads(attrs_file.read().decode("utf-8"))
-    except (KeyError, OSError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError):
+        with open_group(path) as group:
+            return dict(group.attrs)
+    except Exception:
         return {}
-    return value if isinstance(value, dict) else {}
-
-
-def path_size_bytes(path: Path) -> int | None:
-    if path.is_file():
-        return path.stat().st_size
-    if not path.is_dir():
-        return None
-    total = 0
-    for child in path.rglob("*"):
-        if child.is_file():
-            total += child.stat().st_size
-    return total
 
 
 def modality_array_size_bytes(
@@ -908,22 +1051,14 @@ def modality_array_size_bytes(
 
 
 def zarr_array_size_bytes(*, zarr_path: Path, array_path: str) -> int | None:
-    if zarr_path.is_dir():
-        return path_size_bytes(zarr_path / array_path)
-    if not zarr_path.is_file():
-        return None
-    prefix = f"{array_path.rstrip('/')}/"
-    total = 0
-    matched = False
+    size = ARRAY_BYTES.get((zarr_path, array_path))
+    if size is not None:
+        return size
     try:
-        with zipfile.ZipFile(zarr_path) as archive:
-            for info in archive.infolist():
-                if info.filename == array_path or info.filename.startswith(prefix):
-                    total += int(info.file_size)
-                    matched = True
-    except (OSError, zipfile.BadZipFile):
+        with open_group(zarr_path) as group:
+            return int(group[array_path].nbytes_stored())
+    except Exception:
         return None
-    return total if matched else None
 
 
 def render_latex_table(*, stats: dict[str, RowStats], caption: str, label: str, subject_label: str) -> str:
@@ -941,21 +1076,21 @@ def render_latex_table(*, stats: dict[str, RowStats], caption: str, label: str, 
         r"@{}l",
         r"r",
         r"r",
-        r"S[table-format=4.1]",
-        r"S[table-format=4.1]",
-        r"S[table-format=4.1]",
-        r"S[table-format=3.0]",
-        r"S[table-format=3.0]",
-        r"S[table-format=3.0]",
-        r"S[table-format=4.1]",
-        r"S[table-format=4.1]",
-        r"S[table-format=4.1]",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
+        r">{\raggedleft\arraybackslash}p{3.0em}",
         r"@{}",
         r"}",
         r"\toprule",
         r"{}",
-        r"& \multicolumn{1}{c}{\textbf{\#\,Items}}",
-        rf"& \multicolumn{{1}}{{c}}{{\textbf{{\#\,{escape_latex_text(subject_label)}}}}}",
+        r"& \multicolumn{1}{c}{\textbf{Items}}",
+        rf"& \multicolumn{{1}}{{c}}{{\textbf{{{escape_latex_text(subject_label)}}}}}",
         r"& \multicolumn{3}{c}{\textbf{Bytes / item (MiB)}}",
         r"& \multicolumn{3}{c}{\textbf{Sampling rate (Hz)}}",
         r"& \multicolumn{3}{c}{\textbf{Duration/item (s)}} \\",
@@ -992,7 +1127,11 @@ def render_latex_table(*, stats: dict[str, RowStats], caption: str, label: str, 
 
 
 def render_modality_row(*, modality: ModalityRow, row_stats: RowStats) -> str:
-    bytes_stats = formatted_quantiles(row_stats.bytes_mib, decimals=1)
+    # Whole MiB; sub-MiB items (the ECG) are shown as "<1" rather than a blank zero.
+    bytes_stats = [
+        "$<$1" if text == "{}" and row_stats.bytes_mib else text
+        for text in formatted_quantiles(row_stats.bytes_mib, decimals=0)
+    ]
     sampling_stats = formatted_quantiles(row_stats.sampling_hz)
     duration_stats = formatted_quantiles(row_stats.duration_s, decimals=1)
     cells = [
@@ -1012,8 +1151,11 @@ def render_section_row(label: str) -> str:
 
 def render_notes(stats: dict[str, RowStats]) -> str:
     lines = [
-        r"\textit{Abbreviations.} A2C: Apical Two-Chamber View; A4C: Apical Four-Chamber View; "
-        r"ALAX: Apical Long-Axis View.",
+        r"Values are medians and interquartile ranges; bytes are uncompressed array sizes.",
+        r"Dense annotations are defined over one heart cycle, but can be expanded to the full underlying recording "
+        r"using beat-stitching via the ECG under the (verifiable) assumption of regular heart rhythm.",
+        r"\textit{Abbreviations.} A2C: Apical Two-Chamber View; A3C: Apical Three-Chamber View; "
+        r"A4C: Apical Four-Chamber View.",
     ]
     beat_counts = stats["3d_brightness_mode"].marker_counts
     beat_parts = []
@@ -1053,24 +1195,8 @@ def render_notes(stats: dict[str, RowStats]) -> str:
 def formatted_quantiles(values: list[float], *, decimals: int = 0) -> list[str]:
     if not values:
         return ["{}", "{}", "{}"]
-    return [
-        format_number(percentile(values, 0.25), decimals=decimals),
-        format_number(percentile(values, 0.50), decimals=decimals),
-        format_number(percentile(values, 0.75), decimals=decimals),
-    ]
-
-
-def percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    index = (len(ordered) - 1) * fraction
-    lower = math.floor(index)
-    upper = math.ceil(index)
-    if lower == upper:
-        return ordered[lower]
-    weight = index - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+    quantiles = np.quantile(values, (0.25, 0.5, 0.75))
+    return [format_plain_int(value) if decimals <= 0 else f"{value:.{decimals}f}" for value in quantiles]
 
 
 def format_count(value: int) -> str:
@@ -1082,14 +1208,8 @@ def format_plain_int(value: float | int) -> str:
     return "{}" if number <= 0 else str(number)
 
 
-def format_number(value: float | int, *, decimals: int) -> str:
-    if decimals <= 0:
-        return format_plain_int(value)
-    return f"{float(value):.{decimals}f}"
-
-
-def escape_latex_text(value: str) -> str:
-    replacements = {
+_LATEX_ESCAPES = str.maketrans(
+    {
         "\\": r"\textbackslash{}",
         "&": r"\&",
         "%": r"\%",
@@ -1101,7 +1221,333 @@ def escape_latex_text(value: str) -> str:
         "~": r"\textasciitilde{}",
         "^": r"\textasciicircum{}",
     }
-    return "".join(replacements.get(char, char) for char in value)
+)
+
+
+def escape_latex_text(value: str) -> str:
+    return value.translate(_LATEX_ESCAPES)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Rows resolved from annotation documents (merged export layout)
+#
+# Dense annotations live in annotation documents, possibly nested in merged recordings: one item per annotated panel
+# (``aps_contour`` of LV/LA/RV strain and LV volume documents). Views: LV strain panels by exact match of the contour
+# timestamps with the document's AHA view timelines (``timestamps/aha_{a2c,a3c,a4c}_native``); otherwise the explicit
+# panel role (``2ch``/``3ch``/``4ch``); otherwise, within a document, the EchoPrime view classifier on the linked B-mode
+# recording (the panel most likely A4C is A4C, the other A2C). 3D LV meshes are ``aps_mesh_sequence`` documents. 3D
+# B-mode items are recordings holding ``data/3d_brightness_mode``; stitch beats are the distinct sub-volume location
+# codes in ``coordinates/3d_brightness_mode_frame_locations`` (1 when absent). Points and markers are recordings with a
+# named ``measurement`` or a ``spectral_trace`` annotation.
+
+DENSE_ROW_KEYS = {
+    ("LV", "A2C"): "lv_a2c_strain",
+    ("LV", "A3C"): "lv_alax_strain",
+    ("LV", "A4C"): "lv_a4c_strain",
+    ("LA", "A2C"): "la_a2c_strain",
+    ("LA", "A4C"): "la_a4c_strain",
+    ("RV", "A4C"): "rv_strain",
+}
+DOCUMENT_STRUCTURES = {
+    "left_ventricular_strain": "LV",
+    "left_ventricular_volume": "LV",
+    "left_atrial_strain": "LA",
+    "right_ventricular_strain": "RV",
+}
+ROLE_VIEWS = {"2ch": "A2C", "3ch": "A3C", "4ch": "A4C"}
+THREE_D_LOCATIONS = "coordinates/3d_brightness_mode_frame_locations"
+
+
+def annotation_entries(node: Any, document: dict[str, Any], out: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
+    """Collect ``(annotation, enclosing document)`` pairs from a recording manifest, nested documents included."""
+    if isinstance(node, dict):
+        if "annotation_type" in node or "annotation_document_id" in node:
+            document = node
+        if "kind" in node and ("value" in node or "target" in node):
+            out.append((node, document))
+        for value in node.values():
+            annotation_entries(value, document, out)
+    elif isinstance(node, list):
+        for value in node:
+            annotation_entries(value, document, out)
+
+
+def array_values(zarr_path: Path, array_path: str) -> np.ndarray | None:
+    try:
+        with open_group(zarr_path) as group:
+            return np.asarray(group[array_path][...], dtype=np.float64)
+    except Exception:
+        return None
+
+
+def rate_and_duration(values: np.ndarray | None) -> tuple[float, float] | None:
+    if values is None or values.ndim != 1 or values.size < 2:
+        return None
+    deltas = np.diff(values)
+    deltas = deltas[np.isfinite(deltas) & (deltas > 0.0)]
+    if not deltas.size:
+        return None
+    delta = float(np.median(deltas))
+    return 1.0 / delta, float(values.size - 1) * delta
+
+
+def echoprime_apical_probabilities(view_csv: Path | None) -> dict[str, dict[str, float]]:
+    if view_csv is None or not view_csv.is_file():
+        return {}
+    probabilities: dict[str, dict[str, float]] = {}
+    with view_csv.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            try:
+                probabilities[row["recording_id"]] = {v: float(row[f"echoprime_prob_{v}"]) for v in ("A2C", "A4C")}
+            except (KeyError, ValueError):
+                continue
+    return probabilities
+
+
+def resolve_document_rows(
+    *,
+    stats: dict[str, RowStats],
+    recordings: list[dict[str, Any]],
+    arrays: list[dict[str, Any]],
+    root: Path,
+    view_csv: Path | None,
+) -> dict[str, Any]:
+    """Replace the 3D B-mode, dense annotation and points/markers rows; return a summary of the resolution."""
+    # 3D B-mode and stitch beats.
+    with_locations = {a["recording_id"] for a in arrays if a.get("array_path") == THREE_D_LOCATIONS}
+    volumes = [r for r in recordings if "data/3d_brightness_mode" in string_list(r.get("array_paths"))]
+
+    def beats(record: dict[str, Any]) -> int:
+        if record["recording_id"] not in with_locations:
+            return 1
+        codes = array_values(root / record["zarr_path"], THREE_D_LOCATIONS)
+        return 1 if codes is None else max(1, len(np.unique(codes)))
+
+    with ThreadPoolExecutor(16) as pool:
+        beat_counts = list(pool.map(beats, volumes))
+    three_d = RowStats()
+    stitched: Counter[int] = Counter()
+    for record, count in zip(volumes, beat_counts, strict=True):
+        zarr_path = root / record["zarr_path"]
+        three_d.item_ids.add(record["recording_id"])
+        three_d.file_count += 1
+        three_d.subject_ids.add(record["exam_id"])
+        size = ARRAY_BYTES.get((zarr_path, "data/3d_brightness_mode"))
+        if size is not None:
+            three_d.bytes_mib.append(size / (1024.0 * 1024.0))
+        delta = STREAM_DELTA.get((zarr_path, "timestamps/3d_brightness_mode"))
+        frames = positive_int(dict_value(record.get("frame_counts_by_content_type")).get("3d_brightness_mode")) or 0
+        if delta and frames >= 2:
+            three_d.sampling_hz.append(1.0 / delta)
+            three_d.duration_s.append((frames - 1) * delta)
+        stitched[count] += 1
+    three_d.marker_counts = {str(beats_): n for beats_, n in sorted(stitched.items())}
+    stats["3d_brightness_mode"] = three_d
+
+    # Annotation documents.
+    annotated = [
+        r
+        for r in recordings
+        if any(
+            p.startswith(("annotations/", "derived/")) and not p.endswith("bmode_ecg_qrs")
+            for p in string_list(r.get("array_paths"))
+        )
+    ]
+
+    def load(record: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]]]:
+        attrs = json.loads((root / record["zarr_path"] / ".zattrs").read_text(encoding="utf-8"))
+        entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        annotation_entries(attrs.get("recording_manifest", {}), {}, entries)
+        return record, entries
+
+    with ThreadPoolExecutor(32) as pool:
+        loaded = list(pool.map(load, annotated))
+
+    panels: list[dict[str, Any]] = []
+    meshes, markers = RowStats(), RowStats()
+    marker_labels: Counter[str] = Counter()
+    la_traces: set[tuple[str, Any]] = set()
+    la_trace_exams: set[str] = set()
+    for record, entries in loaded:
+        zarr_path = root / record["zarr_path"]
+        aha: dict[str, str] = {}
+        for entry, _document in entries:
+            if entry.get("kind") == "aha_segmental_strain":
+                view = str(entry.get("links", {}).get("source_view", "")).upper()
+                aha.setdefault(view, entry["time"]["zarr_path"])
+        has_marker = False
+        for entry, document in entries:
+            kind = entry.get("kind")
+            document_key = (record["recording_id"], document.get("annotation_document_id"))
+            if kind == "aps_contour" and document.get("annotation_type") in DOCUMENT_STRUCTURES:
+                panels.append(
+                    {
+                        "structure": DOCUMENT_STRUCTURES[document["annotation_type"]],
+                        "lv_strain": document["annotation_type"] == "left_ventricular_strain",
+                        "role": str(entry["target"].get("semantic_id")),
+                        "zarr_path": zarr_path,
+                        "time": entry.get("time", {}).get("zarr_path"),
+                        "aha": aha,
+                        "exam": record["exam_id"],
+                        "document": document_key,
+                        "linked": entry.get("target_data", {}).get("recording_id"),
+                    }
+                )
+            elif kind == "recovered_la_trace":
+                la_traces.add(document_key)
+                la_trace_exams.add(record["exam_id"])
+            elif kind == "aps_mesh_sequence" and "left_ventricle" in str(entry["target"].get("semantic_id")):
+                meshes.item_ids.add(f"{record['recording_id']}:{entry['value']['zarr_path']}")
+                meshes.file_count += 1
+                meshes.subject_ids.add(record["exam_id"])
+                values = rate_and_duration(array_values(zarr_path, entry["time"]["zarr_path"]))
+                if values is not None:
+                    meshes.sampling_hz.append(values[0])
+                    meshes.duration_s.append(values[1])
+            elif kind in {"measurement", "spectral_trace"}:
+                measure_id = entry.get("links", {}).get("measure_id")
+                if kind == "measurement" and not measure_id:
+                    continue
+                has_marker = True
+                label = normalize_annotation_label(measure_id) if measure_id else ""
+                if label:
+                    marker_labels[label] += 1
+        if has_marker:
+            markers.item_ids.add(record["recording_id"])
+            markers.file_count += 1
+            markers.subject_ids.add(record["exam_id"])
+    markers.marker_counts = dict(marker_labels)
+    stats["3d_left_ventricle_mesh"] = meshes
+    stats["sparse_points_and_events"] = markers
+
+    def resolve_panel(panel: dict[str, Any]) -> None:
+        values = array_values(panel["zarr_path"], panel["time"]) if panel["time"] else None
+        panel["timing"] = rate_and_duration(values)
+        panel["view"] = ROLE_VIEWS.get(panel["role"])
+        panel["view_source"] = "role" if panel["view"] else None
+        if panel["lv_strain"] and values is not None:
+            for view, path in panel["aha"].items():
+                reference = array_values(panel["zarr_path"], path)
+                if reference is not None and reference.shape == values.shape and np.allclose(reference, values):
+                    panel["view"], panel["view_source"] = view, "aha_timeline"
+                    break
+
+    with ThreadPoolExecutor(32) as pool:
+        list(pool.map(resolve_panel, panels))
+    probabilities = echoprime_apical_probabilities(view_csv)
+    by_document: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    for panel in panels:
+        by_document[(panel["structure"], panel["document"])].append(panel)
+    for (structure, _), group in by_document.items():
+        pending = [p for p in group if p["view"] is None]
+        if not pending:
+            continue
+        if structure == "RV":
+            for panel in pending:
+                panel["view"], panel["view_source"] = "A4C", "structure"
+            continue
+        if group[0]["lv_strain"]:
+            continue  # LV strain panels without an AHA timeline match stay unassigned
+        taken = {p["view"] for p in group if p["view"] is not None}
+        options = [view for view in ("A4C", "A2C") if view not in taken]
+
+        def a4c_margin(panel: dict[str, Any]) -> float:
+            p = probabilities.get(panel["linked"], {})
+            return p.get("A4C", 0.0) - p.get("A2C", 0.0)
+
+        for panel, view in zip(sorted(pending, key=a4c_margin, reverse=True), options, strict=False):
+            panel["view"], panel["view_source"] = view, "view_classifier"
+    dense = {key: RowStats() for key in DENSE_ROW_KEYS.values()}
+    unassigned: Counter[str] = Counter()
+    for panel in panels:
+        key = DENSE_ROW_KEYS.get((panel["structure"], panel["view"]))
+        if key is None:
+            unassigned[f"{panel['structure']}|{panel['role']}"] += 1
+            continue
+        row = dense[key]
+        row.item_ids.add(f"{panel['document']}:{panel['role']}")
+        row.file_count += 1
+        row.subject_ids.add(panel["exam"])
+        if panel["timing"] is not None:
+            row.sampling_hz.append(panel["timing"][0])
+            row.duration_s.append(panel["timing"][1])
+    stats.update(dense)
+    return {
+        "stitch_beats": {str(k): v for k, v in sorted(stitched.items())},
+        "panel_view_sources": dict(Counter(str(p["view_source"]) for p in panels if p["view"])),
+        "unassigned_panels": dict(unassigned),
+        "la_volume_trace_documents_not_tabulated": {"documents": len(la_traces), "exams": len(la_trace_exams)},
+        "top_marker_labels": marker_labels.most_common(10),
+    }
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Paper layout (tab:modality-stats as published: spacer columns; equal-width right-aligned statistic columns)
+
+PAPER_HEADER = r"""\begin{table}[ht]
+\centering
+\caption{CAPTION}
+\footnotesize
+\sisetup{
+  group-separator={\,},
+  group-minimum-digits=4
+}
+\setlength{\tabcolsep}{1.3pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{
+l
+r
+r
+p{10pt}@{}
+>{\raggedleft\arraybackslash}p{3.0em}
+>{\raggedleft\arraybackslash}p{3.0em}
+%@{\hspace{2pt}}
+>{\raggedleft\arraybackslash}p{3.0em}
+@{}p{10pt}@{}
+>{\raggedleft\arraybackslash}p{3.0em}
+>{\raggedleft\arraybackslash}p{3.0em}
+%@{\hspace{2pt}}
+>{\raggedleft\arraybackslash}p{3.0em}
+@{}p{0pt}@{}
+>{\raggedleft\arraybackslash}p{3.0em}
+>{\raggedleft\arraybackslash}p{3.0em}
+%@{\hspace{2pt}}
+>{\raggedleft\arraybackslash}p{3.0em}
+}
+\toprule
+{}
+& \multicolumn{1}{c}{\textbf{Items}}
+& \multicolumn{1}{c}{\textbf{SUBJECT}}
+& {}
+& \multicolumn{3}{c}{\textbf{Bytes / item (MiB)}}
+& {}
+& \multicolumn{3}{c}{\textbf{Sampling rate (Hz)}}
+& {}
+& \multicolumn{3}{c}{\textbf{Duration/item (s)}} \\
+\cmidrule(lr){5-7} \cmidrule(lr){9-11} \cmidrule(lr){13-15}
+& & {} & {}
+& \multicolumn{1}{r}{\textbf{P25}} & \multicolumn{1}{r}{\textbf{P50}} & \multicolumn{1}{r}{\textbf{P75}}
+& {}
+& \multicolumn{1}{r}{\textbf{P25}} & \multicolumn{1}{r}{\textbf{P50}} & \multicolumn{1}{r}{\textbf{P75}}
+& {}
+& \multicolumn{1}{r}{\textbf{P25}} & \multicolumn{1}{r}{\textbf{P50}} & \multicolumn{1}{r}{\textbf{P75}} \\
+\midrule"""
+
+
+def paper_layout(table: str, *, caption: str, subject_label: str) -> str:
+    """Re-render ``render_latex_table`` output with the published header and its 15-column row layout."""
+    lines = table.split("\n")
+    first, last = lines.index(r"\midrule"), lines.index(r"\bottomrule")
+    rows = []
+    for line in lines[first + 1 : last]:
+        if not line.strip():
+            continue
+        cells = [cell.strip() for cell in line.rstrip().removesuffix("\\\\").split("&")]
+        cells = [cell or "{}" for cell in cells + [""] * (12 - len(cells))]
+        rows.append(" & ".join(cells[:3] + ["{}"] + cells[3:6] + ["{}"] + cells[6:9] + ["{}"] + cells[9:12]) + r" \\")
+    header = PAPER_HEADER.replace("CAPTION", caption).replace("SUBJECT", subject_label)
+    footer = "\n".join(lines[last:]).replace("\\end{tabular}", "\\end{tabular}}", 1)
+    return header + "\n\n" + "\n".join(rows) + "\n\n" + footer
 
 
 if __name__ == "__main__":

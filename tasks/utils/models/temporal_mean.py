@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from tasks.utils.training.device import move_to_device
-from tasks.utils.training.module import LossFn, ValMetricsFn
+from tasks.utils.training.module import LossFn, ValMetricsFn, call_per_sample_loss_fn
 
 TargetExtractor = Callable[[object], Tensor]
 
@@ -61,6 +61,9 @@ class TemporalMeanModule(nn.Module):
 
     def compute_loss_terms(self, sample: object) -> dict[str, Tensor]:
         return self._loss_fn(self.model, sample, self.config)
+
+    def per_sample_loss_terms(self, sample: object) -> dict[str, Tensor]:
+        return call_per_sample_loss_fn(self._loss_fn, self.model, sample, self.config)
 
     def validation_metric_terms(self, sample: object) -> dict[str, Tensor]:
         if self._val_metrics_fn is None:

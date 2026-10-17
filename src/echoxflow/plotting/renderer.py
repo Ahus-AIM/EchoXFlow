@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, cast
@@ -15,16 +18,25 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
+from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
+from matplotlib.text import Text
 
+from echoxflow.colors import data_modality_colormap_name
 from echoxflow.croissant import RecordingRecord
 from echoxflow.loading import LoadedArray, PackedMeshAnnotation, RecordingStore, open_recording
-from echoxflow.objects import AnnotationRef, RecordingObject, StrainPanel
-from echoxflow.plotting.annotations import attach_annotation_overlays, mesh_mosaic_annotation_lines
+from echoxflow.mesh import mesh_volume_curve_ml
+from echoxflow.objects import AnnotationRef, RecordingObject, RecordingRef, StrainPanel
+from echoxflow.plotting.annotations import (
+    attach_annotation_overlays,
+    load_mesh_annotation,
+    mesh_mosaic_annotation_lines,
+)
 from echoxflow.plotting.cartesian import cartesian_loaded_arrays
+from echoxflow.plotting.gating import BloodGateConfig, TissueGateConfig
 from echoxflow.plotting.layout import spatial_layout, uses_ecg_timescale
-from echoxflow.plotting.panels import render_ecg, renderer_for
+from echoxflow.plotting.panels import PanelArtists, draw_panel_label, render_ecg, renderer_for
 from echoxflow.plotting.specs import (
     FrameRequest,
     PanelKind,
@@ -34,16 +46,66 @@ from echoxflow.plotting.specs import (
     RenderedFrame,
     TraceSpec,
 )
+from echoxflow.plotting.strain import AHA_MODALITIES, anatomical_panel_views, anatomical_specs, has_anatomical_strain
+
+logger = logging.getLogger(__name__)
 from echoxflow.plotting.style import PlotStyle
-from echoxflow.plotting.timeline import nearest_index, resolve_frame_time, select_timeline, temporal_length
+from echoxflow.plotting.timeline import (
+    is_timeline_driver,
+    nearest_index,
+    resolve_frame_time,
+    select_timeline,
+    strip_drives_timeline,
+    temporal_length,
+)
 from echoxflow.plotting.writers import figure_to_rgb, save_figure, write_video
 from echoxflow.scan import (
     beamspace_spherical_mosaic,
     cartesian_spherical_mosaic,
+    mesh_frame_indices_for_volume_timestamps,
     prepare_3d_brightness_for_display,
     spherical_geometry_from_metadata,
 )
+from echoxflow.scan.contours import contour_group_layout_for_metadata
 from echoxflow.scan.geometry import SectorGeometry
+from echoxflow.schema import (
+    color_flow_velocity_codes,
+    display_array_path,
+    flow_color_first_axis_is_brightness,
+    flow_color_velocity_ramp,
+    is_lookup_table_path,
+    render_flow_color_table,
+)
+
+
+@dataclass
+class _FrameState:
+    """A built figure plus what is needed to move it to another frame in place.
+
+    ``panel_artists`` is ``None`` when some panel renderer cannot update its artists safely;
+    the caller then rebuilds the whole figure for every frame (decided per figure).
+    """
+
+    figure: Figure
+    panel_artists: tuple[PanelArtists, ...] | None
+    ecg_update: Callable[[float, np.ndarray | None], None] | None
+    title: Text | None
+    panels: tuple[PanelSpec, ...]
+    title_text: Callable[[float, int], str] | None
+
+    @property
+    def updatable(self) -> bool:
+        return self.panel_artists is not None
+
+    def update(self, *, time_s: float, frame_index: int) -> None:
+        if self.panel_artists is None:
+            raise RuntimeError("This figure cannot be updated in place")
+        for artists in self.panel_artists:
+            artists.update(time_s, frame_index)
+        if self.ecg_update is not None:
+            self.ecg_update(time_s, _ecg_marker_times(self.panels, time_s, frame_index))
+        if self.title is not None and self.title_text is not None:
+            self.title.set_text(self.title_text(time_s, frame_index))
 
 
 @dataclass(frozen=True)
@@ -70,6 +132,7 @@ class RecordingPlotRenderer:
         frame_index: int | None = None,
         view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
+        dpi: int | None = None,
     ) -> Figure:
         panels, ecg = self._load_specs(
             record, root=root, modalities=modalities, view_mode=view_mode, show_annotations=show_annotations
@@ -81,7 +144,8 @@ class RecordingPlotRenderer:
             ecg=ecg,
             time_s=current_time,
             frame_index=0 if frame_index is None else int(frame_index),
-            dpi=self.style.dpi,
+            dpi=self.style.dpi if dpi is None else int(dpi),
+            title=_recording_title(record),
         )
 
     def render_frame(
@@ -130,8 +194,12 @@ class RecordingPlotRenderer:
         frame_index: int | None = None,
         view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
-        dpi: int = 200,
+        dpi: int | None = None,
     ) -> Path:
+        """Save one frame as an image of exactly ``style.width_px`` x ``style.height_px`` pixels.
+
+        ``dpi`` only scales fonts and line widths relative to the pixel size; ``None`` uses ``style.dpi``.
+        """
         figure = self.plot_recording(
             record,
             root=root,
@@ -140,9 +208,10 @@ class RecordingPlotRenderer:
             frame_index=frame_index,
             view_mode=view_mode,
             show_annotations=show_annotations,
+            dpi=dpi,
         )
         try:
-            return save_figure(figure, output, dpi=dpi)
+            return save_figure(figure, output, dpi=self.style.dpi if dpi is None else int(dpi))
         finally:
             plt.close(figure)
 
@@ -156,27 +225,62 @@ class RecordingPlotRenderer:
         view_mode: PlotViewMode | str = "beamspace",
         show_annotations: bool = True,
         max_fps: float | None = None,
-        dpi: int = 150,
+        dpi: int | None = None,
+        time_range: tuple[float, float] | None = None,
     ) -> Path:
+        """Render a video of exactly ``style.width_px`` x ``style.height_px`` pixels per frame.
+
+        ``dpi`` only scales fonts and line widths relative to the pixel size; ``None`` uses ``style.dpi``.
+        ``time_range`` keeps only the frames with ``start <= time < end`` seconds.
+        """
         panels, ecg = self._load_specs(
             record, root=root, modalities=modalities, view_mode=view_mode, show_annotations=show_annotations
         )
         timeline = select_timeline(panels, max_fps=self.style.max_fps if max_fps is None else float(max_fps))
-        frames: list[np.ndarray] = []
-        for frame_index, current_time in enumerate(np.asarray(timeline.timestamps, dtype=np.float64).reshape(-1)):
-            figure = self.render_figure_from_specs(
-                panels=panels,
-                ecg=ecg,
-                time_s=float(current_time),
-                frame_index=frame_index,
-                dpi=dpi,
-            )
-            try:
-                frames.append(figure_to_rgb(figure))
-            finally:
-                plt.close(figure)
         source = record.path(root) if isinstance(record, RecordingRecord) else Path(record).expanduser()
-        return write_video(output, np.stack(frames, axis=0), fps=timeline.fps, source=source)
+        times = np.asarray(timeline.timestamps, dtype=np.float64).reshape(-1)
+        if time_range is not None:
+            start, end = float(time_range[0]), float(time_range[1])
+            times = times[(times >= start) & (times < end)]
+            if times.size == 0:
+                raise ValueError(f"No frames between {start} s and {end} s in {source}")
+        frames = self.iter_frames(panels, ecg, times, dpi=dpi, title=_recording_title(record))
+        return write_video(output, frames, fps=timeline.fps, source=source)
+
+    def iter_frames(
+        self,
+        panels: tuple[PanelSpec, ...],
+        ecg: TraceSpec,
+        times: np.ndarray,
+        *,
+        dpi: int | None = None,
+        title: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Render one RGB frame per timestamp.
+
+        The figure, axes, ticks, labels, colour bars and layout are built once for the first frame;
+        later frames only update the per-frame artists. Figures whose panels cannot be updated in
+        place are rebuilt for every frame.
+        """
+        state: _FrameState | None = None
+        try:
+            for frame_index, current_time in enumerate(times):
+                time_s = float(current_time)
+                if state is None:
+                    state = self._build_figure(
+                        panels=panels, ecg=ecg, time_s=time_s, frame_index=frame_index, dpi=dpi, title=title
+                    )
+                elif state.updatable:
+                    state.update(time_s=time_s, frame_index=frame_index)
+                else:
+                    plt.close(state.figure)
+                    state = self._build_figure(
+                        panels=panels, ecg=ecg, time_s=time_s, frame_index=frame_index, dpi=dpi, title=title
+                    )
+                yield figure_to_rgb(state.figure)
+        finally:
+            if state is not None:
+                plt.close(state.figure)
 
     def render_figure_from_specs(
         self,
@@ -185,10 +289,26 @@ class RecordingPlotRenderer:
         ecg: TraceSpec,
         time_s: float,
         frame_index: int,
-        dpi: int,
+        dpi: int | None = None,
+        title: str | None = None,
     ) -> Figure:
+        return self._build_figure(
+            panels=panels, ecg=ecg, time_s=time_s, frame_index=frame_index, dpi=dpi, title=title
+        ).figure
+
+    def _build_figure(
+        self,
+        *,
+        panels: tuple[PanelSpec, ...],
+        ecg: TraceSpec,
+        time_s: float,
+        frame_index: int,
+        dpi: int | None = None,
+        title: str | None = None,
+    ) -> _FrameState:
         if not panels:
             raise ValueError("At least one non-ECG modality panel is required")
+        dpi = self.style.dpi if dpi is None else int(dpi)
         spatial_panels = tuple(panel for panel in panels if not uses_ecg_timescale(panel))
         temporal_panels = tuple(panel for panel in panels if uses_ecg_timescale(panel))
         preserve_single_beamspace_image_aspect = _preserve_single_beamspace_image_aspect(panels)
@@ -196,23 +316,44 @@ class RecordingPlotRenderer:
         cols = layout.cols
         spatial_rows = layout.rows
         temporal_rows = len(temporal_panels)
-        show_ecg = bool(self.style.show_ecg)
+        show_ecg = bool(self.style.show_ecg) and not all(
+            panel.kind in {"strain_curves", "bullseye"} for panel in panels
+        )
         total_rows = spatial_rows + temporal_rows + (1 if show_ecg else 0)
-        figure = plt.figure(figsize=self.style.figsize, dpi=int(dpi), facecolor=self.style.figure_facecolor)
+        figure = plt.figure(
+            figsize=(self.style.width_px / int(dpi), self.style.height_px / int(dpi)),
+            dpi=int(dpi),
+            facecolor=self.style.figure_facecolor,
+        )
+        strip_ratio = (
+            self.style.strip_height_ratio_static
+            if spatial_panels and all(_is_single_frame(panel) for panel in spatial_panels)
+            else self.style.strip_height_ratio
+        )
         grid = GridSpec(
             total_rows,
             cols,
             figure=figure,
-            height_ratios=([1.0] * spatial_rows) + ([0.34] * temporal_rows) + ([0.28] if show_ecg else []),
+            height_ratios=([1.0] * spatial_rows)
+            + [
+                self.style.volume_curve_height_ratio if panel.loaded.name == "lv_volume_curve" else strip_ratio
+                for panel in temporal_panels
+            ]
+            + ([0.28] if show_ecg else []),
             width_ratios=layout.width_ratios,
         )
         occupied: set[tuple[int, int]] = set()
+        labelled: list[tuple[Axes, PanelSpec]] = []
+        artists: list[PanelArtists | None] = []
         for placement in layout.placements:
             row_end = placement.row + placement.row_span
             col_end = placement.col + placement.col_span
             ax = figure.add_subplot(grid[placement.row : row_end, placement.col : col_end])
             panel = placement.panel
-            renderer_for(panel.kind).render(ax, panel, time_s=time_s, frame_index=frame_index, style=self.style)
+            artists.append(
+                renderer_for(panel.kind).render(ax, panel, time_s=time_s, frame_index=frame_index, style=self.style)
+            )
+            labelled.append((ax, panel))
             if preserve_single_beamspace_image_aspect and panel is panels[0]:
                 ax.set_aspect("equal", adjustable="box")
             for row in range(placement.row, row_end):
@@ -224,11 +365,15 @@ class RecordingPlotRenderer:
                     figure.add_subplot(grid[row, col]).set_axis_off()
         for offset, panel in enumerate(temporal_panels):
             ax = figure.add_subplot(grid[spatial_rows + offset, :])
-            renderer_for(panel.kind).render(ax, panel, time_s=time_s, frame_index=frame_index, style=self.style)
+            artists.append(
+                renderer_for(panel.kind).render(ax, panel, time_s=time_s, frame_index=frame_index, style=self.style)
+            )
+            labelled.append((ax, panel))
             _set_ecg_xlim(ax, ecg)
+        ecg_update = None
         if show_ecg:
             ecg_ax = figure.add_subplot(grid[total_rows - 1, :])
-            render_ecg(
+            ecg_update = render_ecg(
                 ecg_ax,
                 ecg,
                 time_s=time_s,
@@ -236,14 +381,38 @@ class RecordingPlotRenderer:
                 marker_times=_ecg_marker_times(panels, time_s, frame_index),
             )
             _set_ecg_xlim(ecg_ax, ecg)
-        figure.tight_layout(pad=0.8)
-        return figure
+        top = 1.0
+        title_artist: Text | None = None
+        if self.style.show_figure_title:
+            title_artist, top = _draw_figure_title(
+                figure, panels, title=title, time_s=time_s, frame_index=frame_index, style=self.style
+            )
+        right = 1.0 - (0.04 if temporal_panels else 0.0)  # leave room for the strip's unit tag
+        figure.tight_layout(pad=0.8, rect=(0.0, 0.0, right, top))
+        for ax, panel in labelled:
+            draw_panel_label(ax, panel, self.style)
+        return _FrameState(
+            figure=figure,
+            panel_artists=None if any(item is None for item in artists) else tuple(cast(list[PanelArtists], artists)),
+            ecg_update=ecg_update,
+            title=title_artist,
+            panels=panels,
+            title_text=lambda t, i: _figure_title_text(panels, title=title, time_s=t, frame_index=i),
+        )
 
     def build_panel_specs(
         self, loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewMode | str = "beamspace"
     ) -> tuple[PanelSpec, ...]:
         """Build display panel specs from loaded modality arrays."""
-        return _panel_specs(loaded_arrays, view_mode=_normalize_view_mode(view_mode))
+        return _panel_specs(
+            loaded_arrays,
+            view_mode=_normalize_view_mode(view_mode),
+            mosaic_cell_height=_mosaic_cell_height(self.style),
+            blood_gate=self.style.blood_gate,
+            max_depth_m=self.style.cartesian_max_depth_m,
+            tissue_brightness_lift=self.style.tissue_doppler_brightness_lift,
+            tissue_gate=self.style.tissue_gate,
+        )
 
     def _load_specs(
         self,
@@ -254,23 +423,193 @@ class RecordingPlotRenderer:
         view_mode: PlotViewMode | str,
         show_annotations: bool,
     ) -> tuple[tuple[PanelSpec, ...], TraceSpec]:
-        store = open_recording(record, root=root)
-        obj = store.load_object()
-        if _should_plot_strain_object(obj, store, modalities):
-            return _strain_specs(
-                store, obj, modalities=modalities, view_mode=view_mode, show_annotations=show_annotations
+        with ExitStack() as stack:
+            store = stack.enter_context(open_recording(record, root=root))
+            mesh_store: RecordingStore | None = None
+            if _is_mesh_only(store):
+                mesh_store, store = store, stack.enter_context(_open_linked_volume(store))
+            if modalities and all(token in AHA_MODALITIES for token in modalities):
+                panels = anatomical_specs(
+                    store,
+                    curves=any(token != "bullseye" for token in modalities),
+                    bullseye=any(token != "aha_curves" for token in modalities),
+                )
+                return panels, TraceSpec(signal=np.empty(0), timestamps=np.empty(0))
+            obj = store.load_object()
+            if _should_plot_strain_object(obj, store, modalities):
+                return _strain_specs(
+                    store,
+                    obj,
+                    modalities=modalities,
+                    view_mode=view_mode,
+                    show_annotations=show_annotations,
+                    max_depth_m=self.style.cartesian_max_depth_m,
+                )
+            paths = _resolve_modality_paths(store, modalities)
+            loaded_arrays = tuple(
+                _with_recording_colormap(store, _with_display_path(store.load_modality(path), path)) for path in paths
             )
-        paths = _resolve_modality_paths(store, modalities)
-        loaded_arrays = tuple(store.load_modality(path) for path in paths)
-        if show_annotations:
-            loaded_arrays = attach_annotation_overlays(store, loaded_arrays)
-        panels = self.build_panel_specs(loaded_arrays, view_mode=view_mode)
-        ecg = _ecg_trace(store)
-        return panels, ecg
+            if show_annotations:
+                loaded_arrays = attach_annotation_overlays(store, loaded_arrays)
+                if mesh_store is not None:
+                    loaded_arrays = _with_linked_mesh(loaded_arrays, mesh_store)
+            panels = self.build_panel_specs(loaded_arrays, view_mode=view_mode)
+            ecg = _ecg_trace(store)
+            return panels, ecg
+
+
+def _recording_title(record: RecordingRecord | str | Path) -> str:
+    return record.recording_id if isinstance(record, RecordingRecord) else Path(record).stem
+
+
+def _figure_title_text(panels: tuple[PanelSpec, ...], *, title: str | None, time_s: float, frame_index: int) -> str:
+    parts = [] if not title else [title]
+    if panels and all(panel.kind in {"strain_curves", "bullseye"} for panel in panels):
+        return title or "Anatomical strain"
+    parts.append(f"t = {float(time_s):.3f} s")
+    driver = next((panel for panel in panels if is_timeline_driver(panel)), None)
+    if driver is not None:
+        count = temporal_length(driver.loaded.data)
+        index = nearest_index(driver.loaded.timestamps, time_s, count=count, fallback_index=frame_index)
+        parts[-1] += f"  frame {index}/{count}"
+    return "    ".join(parts)
+
+
+def _draw_figure_title(
+    figure: Figure,
+    panels: tuple[PanelSpec, ...],
+    *,
+    title: str | None,
+    time_s: float,
+    frame_index: int,
+    style: PlotStyle,
+) -> tuple[Text, float]:
+    """Write the recording id, frame time and frame index on top of the figure; return it and the free top edge."""
+    height_pt = figure.get_figheight() * 72.0
+    text = figure.text(
+        0.008,
+        0.998,
+        _figure_title_text(panels, title=title, time_s=time_s, frame_index=frame_index),
+        ha="left",
+        va="top",
+        fontsize=style.panel_label_fontsize,
+        color=style.text_dim_color,
+    )
+    return text, 1.0 - 2.0 * style.panel_label_fontsize / height_pt
+
+
+def _with_recording_colormap(store: RecordingStore, loaded: LoadedArray) -> LoadedArray:
+    """Attach the recording's RGB table to spectral, colour and tissue Doppler arrays.
+
+    A colour Doppler array whose table is variance-style also gets the table's two-dimensional colouring, see
+    `_flow_color_attrs`, so turbulence tints the picture the way the scanner shows it.
+    """
+    name = data_modality_colormap_name(loaded.data_path)
+    path = None if loaded.stream is None else loaded.stream.metadata.colormap_path
+    if name not in {"color_doppler_velocity", "tissue_doppler", "spectral_doppler"} or path is None:
+        return loaded
+    try:
+        table = store.load_array(path)
+        if name == "spectral_doppler":
+            ramp = np.asarray(table)
+            if ramp.shape != (256, 3) or ramp.dtype != np.uint8:
+                return loaded
+        else:
+            ramp = flow_color_velocity_ramp(table, phase_ordered=True)
+    except (KeyError, ValueError):
+        return loaded
+    cmap = ListedColormap(ramp.astype(np.float32) / 255.0, name=f"{name}_recording")
+    attrs = {**loaded.attrs, "colormap": cmap}
+    if name == "color_doppler_velocity":
+        attrs.update(_flow_color_attrs(store, loaded, np.asarray(table)))
+    elif name == "tissue_doppler" and flow_color_first_axis_is_brightness(table):
+        attrs["tissue_color_table"] = np.asarray(table, dtype=np.uint8)
+    return replace(loaded, attrs=attrs)
+
+
+_LAG_ONE_PATH = "derived/2d_color_doppler_lag_one_magnitude"
+_LAG_ONE_FULL_SCALE = 127.0 * float(np.sqrt(2.0))
+
+
+def _flow_color_attrs(store: RecordingStore, loaded: LoadedArray, table: np.ndarray) -> dict[str, object]:
+    """Colour a variance-style colour Doppler stack through the whole FlowColorTable.
+
+    The table is indexed `[secondary, velocity]`. The velocity index is the phase code of the wrapped velocity. The
+    exporter stores no turbulence byte (the raw auxiliary channel is always zero), so the secondary index is the
+    lag-one magnitude turned around, `255 * (1 - |R1| / full scale)`: coherent flow stays on the zero-variance row and
+    incoherent flow blends toward green. Returns nothing when the table is power-style (its first axis only dims) or
+    the recording has no lag-one magnitude, and callers then keep the one-dimensional velocity ramp.
+
+    `flow_color_rgb` is the `uint8` `(T, H, W, 3)` stack. `flow_color_codes` holds the `uint16` codes
+    `secondary * 256 + velocity`; Cartesian conversion looks up these exact native codes before interpolating RGB.
+    """
+    try:
+        if flow_color_first_axis_is_brightness(table) or _LAG_ONE_PATH not in store.array_paths:
+            return {}
+        velocity = np.asarray(loaded.data, dtype=np.float32)
+        lag_one = np.asarray(store.load_array(_LAG_ONE_PATH), dtype=np.float32)
+        value_range = None if loaded.stream is None else loaded.stream.metadata.value_range
+        if velocity.ndim != 3 or lag_one.shape != velocity.shape or value_range is None:
+            return {}
+        velocity_codes = color_flow_velocity_codes(velocity, velocity_limit_mps=float(value_range[1]))
+        turbulence = 1.0 - np.clip(lag_one / _LAG_ONE_FULL_SCALE, 0.0, 1.0)
+        secondary = np.where(np.isfinite(velocity), np.rint(255.0 * turbulence), 0.0).astype(np.uint8)
+        rgb = render_flow_color_table(velocity_codes=velocity_codes, secondary_codes=secondary, flow_color_table=table)
+    except (KeyError, ValueError):
+        return {}
+    codes = secondary.astype(np.uint16) * np.uint16(256) + velocity_codes.astype(np.uint16)
+    return {"flow_color_rgb": rgb, "flow_color_codes": codes, "flow_color_table": table.astype(np.uint8)}
+
+
+def _is_mesh_only(store: RecordingStore) -> bool:
+    paths = store.array_paths
+    return not any(path.startswith("data/") for path in paths) and any(
+        path.startswith("annotations/3d_") and "_mesh" in path for path in paths
+    )
+
+
+def _open_linked_volume(mesh_store: RecordingStore) -> RecordingStore:
+    """Open the volume recording a mesh-only recording was derived from."""
+    attrs = getattr(mesh_store.group, "attrs", {})
+    manifest = attrs.get("recording_manifest") if hasattr(attrs, "get") else None
+    linked_volume = manifest.get("linked_volume") if isinstance(manifest, Mapping) else None
+    linked = linked_volume.get("linked_recording") if isinstance(linked_volume, Mapping) else None
+    recording_id = mesh_store.record.recording_id if mesh_store.record is not None else mesh_store.path.stem
+    if not isinstance(linked, Mapping) or not (linked.get("recording_zarr_path") or linked.get("relative_zarr_path")):
+        raise ValueError(f"Recording `{recording_id}` holds only a mesh with no linked volume to render")
+    ref = RecordingRef(
+        recording_id=_text_or_none(linked.get("recording_id")),
+        zarr_path=_text_or_none(linked.get("recording_zarr_path")),
+        relative_zarr_path=_text_or_none(linked.get("relative_zarr_path")),
+        is_self=False,
+    )
+    try:
+        return mesh_store.open_reference(ref)
+    except Exception as exc:
+        raise ValueError(f"Could not open the volume linked to mesh-only recording `{recording_id}`") from exc
+
+
+def _text_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _with_linked_mesh(loaded_arrays: tuple[LoadedArray, ...], mesh_store: RecordingStore) -> tuple[LoadedArray, ...]:
+    if not any(path.startswith("annotations/3d_left_ventricle_mesh/") for path in mesh_store.array_paths):
+        logger.warning("LA/RV mesh overlay is unavailable; rendering the linked volume without the mesh")
+        return loaded_arrays
+    mesh = load_mesh_annotation(mesh_store)
+    if mesh is None:
+        return loaded_arrays
+    return tuple(
+        replace(loaded, attrs={**loaded.attrs, "mesh_annotation": mesh})
+        if loaded.data_path == "data/3d_brightness_mode"
+        else loaded
+        for loaded in loaded_arrays
+    )
 
 
 def _resolve_modality_paths(store: RecordingStore, modalities: tuple[str, ...] | None) -> tuple[str, ...]:
-    available = tuple(path for path in store.array_paths if path.startswith("data/"))
+    available = _display_data_paths(store)
     if modalities is None:
         return tuple(path for path in available if _is_auto_modality(path))
     resolved: list[str] = []
@@ -280,6 +619,12 @@ def _resolve_modality_paths(store: RecordingStore, modalities: tuple[str, ...] |
             raise KeyError(f"Requested modality `{modality}` is not available in {store.path}")
         resolved.extend(expanded)
     return tuple(dict.fromkeys(resolved))
+
+
+def _is_single_frame(panel: PanelSpec) -> bool:
+    """True for a static reference image: a stream holding one frame."""
+    shape = np.shape(panel.loaded.data)
+    return len(shape) < 3 or int(shape[0]) <= 1
 
 
 def _preserve_single_beamspace_image_aspect(panels: tuple[PanelSpec, ...]) -> bool:
@@ -315,19 +660,50 @@ def _strain_specs(
     modalities: tuple[str, ...] | None,
     view_mode: PlotViewMode | str,
     show_annotations: bool,
+    max_depth_m: float | None = None,
 ) -> tuple[tuple[PanelSpec, ...], TraceSpec]:
     selected_roles = _selected_strain_roles(obj, modalities)
     selected_panels = tuple(panel for panel in obj.panels if selected_roles is None or panel.role_id in selected_roles)
     if not selected_panels:
         raise KeyError(f"Requested strain modalities are not available in {store.path}")
     normalized_view = _normalize_view_mode(view_mode)
-    image_view: PanelView = "cartesian" if normalized_view == "cartesian" else "beamspace"
+    image_views: tuple[PanelView, ...] = (
+        ("beamspace", "cartesian")
+        if normalized_view == "both"
+        else ("cartesian",)
+        if normalized_view == "cartesian"
+        else ("beamspace",)
+    )
     image_inputs = _align_strain_image_inputs(tuple(_strain_image_input(store, panel) for panel in selected_panels))
     image_specs = [
-        _strain_image_spec(image_input, view=image_view, show_annotations=show_annotations)
+        spec
+        for view in image_views
         for image_input in image_inputs
+        for spec in (
+            _strain_image_spec(image_input, view=view, show_annotations=show_annotations, max_depth_m=max_depth_m),
+        )
+        if not (normalized_view == "both" and view == "cartesian" and spec.view != "cartesian")
     ]
-    curve_specs = list(_strain_curve_specs(store, obj, selected_panels, modalities))
+    curve_specs = (
+        anatomical_specs(store)
+        if _has_generic_strain_modality(modalities) and has_anatomical_strain(store)
+        else _strain_curve_specs(store, obj, selected_panels, modalities)
+    )
+    if curve_specs and curve_specs[0].kind == "strain_curves":
+        views = anatomical_panel_views(store)
+        image_specs = [
+            replace(
+                spec,
+                loaded=replace(
+                    spec.loaded,
+                    attrs={
+                        **spec.loaded.attrs,
+                        "strain_source_view": views.get(str(spec.loaded.attrs["strain_role_id"])),
+                    },
+                ),
+            )
+            for spec in image_specs
+        ]
     return (*image_specs, *curve_specs), _strain_ecg_trace(store, selected_panels)
 
 
@@ -350,23 +726,28 @@ def _selected_strain_roles(obj: RecordingObject, modalities: tuple[str, ...] | N
 
 
 def _strain_image_input(store: RecordingStore, panel: StrainPanel) -> _StrainImageInput:
+    source_store = None
     try:
-        source_store = store.open_reference(panel.bmode.recording)
-        loaded = source_store.load_modality(panel.bmode.data_path)
-    except Exception as exc:
-        recording_id = panel.bmode.recording.recording_id or panel.bmode.recording.zarr_path or "<unknown>"
-        raise ValueError(
-            f"Could not load linked B-mode for strain panel `{panel.role_id}` from recording `{recording_id}`"
-        ) from exc
-    loaded = _with_explicit_timestamps(source_store, loaded, panel.bmode.timestamps_path)
-    contour_overlays = _strain_contour_overlays(store, panel)
-    qrs_trigger_times = _strain_qrs_trigger_times(store, source_store, panel)
-    return _StrainImageInput(
-        panel=panel,
-        loaded=loaded,
-        contour_overlays=contour_overlays,
-        qrs_trigger_times=qrs_trigger_times,
-    )
+        try:
+            source_store = store.open_reference(panel.bmode.recording)
+            loaded = source_store.load_modality(panel.bmode.data_path)
+        except Exception as exc:
+            recording_id = panel.bmode.recording.recording_id or panel.bmode.recording.zarr_path or "<unknown>"
+            raise ValueError(
+                f"Could not load linked B-mode for strain panel `{panel.role_id}` from recording `{recording_id}`"
+            ) from exc
+        loaded = _with_explicit_timestamps(source_store, loaded, panel.bmode.timestamps_path)
+        contour_overlays = _strain_contour_overlays(store, panel)
+        qrs_trigger_times = _strain_qrs_trigger_times(store, source_store, panel)
+        return _StrainImageInput(
+            panel=panel,
+            loaded=loaded,
+            contour_overlays=contour_overlays,
+            qrs_trigger_times=qrs_trigger_times,
+        )
+    finally:
+        if source_store is not None and source_store is not store:
+            source_store.close()
 
 
 def _strain_image_spec(
@@ -374,6 +755,7 @@ def _strain_image_spec(
     *,
     view: PanelView,
     show_annotations: bool,
+    max_depth_m: float | None = None,
 ) -> PanelSpec:
     panel = image_input.panel
     loaded = image_input.loaded
@@ -391,7 +773,7 @@ def _strain_image_spec(
     loaded = replace(loaded, attrs=attrs)
     if view == "cartesian":
         if _loaded_has_sector_geometry(loaded):
-            loaded = cartesian_loaded_arrays((loaded,))[0]
+            loaded = cartesian_loaded_arrays((loaded,), max_depth_m=max_depth_m)[0]
         else:
             view = "beamspace"
     return PanelSpec(
@@ -414,7 +796,7 @@ def _strain_curve_specs(
     specs: list[PanelSpec] = []
     seen: set[str] = set()
     for annotation in obj.annotations:
-        if not _is_curve_annotation(annotation):
+        if annotation.value is None or not _is_curve_annotation(annotation):
             continue
         data_path = _normalize_data_path(annotation.value.path)
         if data_path in seen or not _should_include_strain_curve(
@@ -518,7 +900,7 @@ def _strain_curve_spec(
 def _strain_contour_overlays(store: RecordingStore, panel: StrainPanel) -> tuple[dict[str, object], ...]:
     overlays: list[dict[str, object]] = []
     for annotation in panel.annotations:
-        if not _is_contour_annotation(annotation):
+        if annotation.value is None or not _is_contour_annotation(annotation):
             continue
         if annotation.value.path not in store.group:
             continue
@@ -531,6 +913,10 @@ def _strain_contour_overlays(store: RecordingStore, panel: StrainPanel) -> tuple
                 "kind": "physical_points",
                 "points": points,
                 "timestamps": timestamps,
+                "group_layout": contour_group_layout_for_metadata(
+                    content_type=_strain_content_type(store),
+                    point_count=int(points.shape[1]) if points.ndim == 3 else None,
+                ),
                 **_annotation_label_metadata(annotation.raw),
                 "field": annotation.field,
                 "target": {
@@ -541,6 +927,15 @@ def _strain_contour_overlays(store: RecordingStore, panel: StrainPanel) -> tuple
             }
         )
     return tuple(overlays)
+
+
+def _strain_content_type(store: RecordingStore) -> str:
+    attrs = getattr(store.group, "attrs", {})
+    declared = attrs.get("content_types") if hasattr(attrs, "get") else None
+    types = [str(value) for value in declared or ()]
+    if not types and store.record is not None:
+        types = [str(value) for value in store.record.content_types]
+    return next((value for value in types if "strain" in value), "")
 
 
 def _annotation_label_metadata(raw: Mapping[str, Any] | None) -> dict[str, object]:
@@ -883,7 +1278,7 @@ def _strain_qrs_trigger_times(store: RecordingStore, source_store: RecordingStor
             continue
         if annotation.time is not None and annotation.time.path in store.group:
             values.append(np.asarray(store.group[annotation.time.path][:], dtype=np.float64))
-        elif annotation.value.path in store.group:
+        elif annotation.value is not None and annotation.value.path in store.group:
             values.append(np.asarray(store.group[annotation.value.path][:], dtype=np.float64))
     values.extend(_strain_qrs_arrays_from_mapping(panel.raw))
     values.extend(_strain_qrs_arrays_from_paths(store, panel.role_id))
@@ -916,17 +1311,8 @@ def _strain_qrs_arrays_from_mapping(raw: Mapping[str, Any] | None) -> list[np.nd
 
 
 def _strain_qrs_arrays_from_paths(store: RecordingStore, role_id: str) -> list[np.ndarray]:
-    candidate_pairs = (
-        (f"timestamps/{role_id}_ecg_qrs", f"data/{role_id}_ecg_qrs"),
-        (f"timestamps/{role_id}_qrs", f"data/{role_id}_qrs"),
-        ("timestamps/ecg_qrs", "data/ecg_qrs"),
-    )
-    values: list[np.ndarray] = []
-    for timestamp_path, data_path in candidate_pairs:
-        path = timestamp_path if timestamp_path in store.group else data_path
-        if path in store.group:
-            values.append(np.asarray(store.group[path][:], dtype=np.float64))
-    return values
+    candidate_paths = (f"timestamps/{role_id}_ecg_qrs", f"timestamps/{role_id}_qrs", "timestamps/ecg_qrs")
+    return [np.asarray(store.group[path][:], dtype=np.float64) for path in candidate_paths if path in store.group]
 
 
 def _optional_float_array(value: Any) -> np.ndarray | None:
@@ -937,11 +1323,15 @@ def _optional_float_array(value: Any) -> np.ndarray | None:
 
 
 def _is_contour_annotation(annotation: AnnotationRef) -> bool:
+    if annotation.value is None:
+        return False
     field = annotation.field.lower()
     return "contour" in field or annotation.value.path.endswith("_contour")
 
 
 def _is_qrs_annotation(annotation: AnnotationRef) -> bool:
+    if annotation.value is None:
+        return False
     field = annotation.field.lower()
     path = annotation.value.path.lower()
     time_path = "" if annotation.time is None else annotation.time.path.lower()
@@ -949,6 +1339,8 @@ def _is_qrs_annotation(annotation: AnnotationRef) -> bool:
 
 
 def _is_curve_annotation(annotation: AnnotationRef) -> bool:
+    if annotation.value is None:
+        return False
     field = annotation.field.lower()
     path = annotation.value.path.lower()
     return "curve" in field or path.endswith("_curve")
@@ -1000,13 +1392,34 @@ def _strain_ecg_trace(store: RecordingStore, panels: tuple[StrainPanel, ...]) ->
             source_store = store.open_reference(panel.bmode.recording)
         except (FileNotFoundError, KeyError, ValueError):
             continue
-        if _has_ecg(source_store):
-            return _ecg_trace(source_store)
+        try:
+            if _has_ecg(source_store):
+                return _ecg_trace(source_store)
+        finally:
+            if source_store is not store:
+                source_store.close()
     return TraceSpec(
         signal=np.zeros(1, dtype=np.float32),
         timestamps=np.zeros(1, dtype=np.float64),
         label="ECG",
     )
+
+
+def _display_data_paths(store: RecordingStore) -> tuple[str, ...]:
+    """Return plottable arrays under the short names the panel code dispatches on."""
+    paths = (
+        display_array_path(path)
+        for path in store.array_paths
+        if path.startswith(("data/", "derived/")) and not is_lookup_table_path(path)
+    )
+    return tuple(dict.fromkeys(path for path in paths if path.startswith("data/")))
+
+
+def _with_display_path(loaded: LoadedArray, display_path: str) -> LoadedArray:
+    if loaded.data_path == display_path:
+        return loaded
+    stream = None if loaded.stream is None else replace(loaded.stream, data_path=display_path)
+    return replace(loaded, data_path=display_path, stream=stream)
 
 
 def _has_ecg(store: RecordingStore) -> bool:
@@ -1031,16 +1444,32 @@ def _expand_modality(modality: str, available: tuple[str, ...]) -> tuple[str, ..
 
 def _is_auto_modality(path: str) -> bool:
     name = path.removeprefix("data/")
-    if "/" in name or name == "ecg" or name.startswith("line_"):
+    if "/" in name or name == "ecg" or name.startswith("line_") or name.endswith("_raw"):
         return False
-    if any(token in name for token in ("annotation", "overlay_physical_points", "colormap")):
+    if any(token in name for token in ("annotation", "overlay_physical_points")):
         return False
     return name == "tissue_doppler" or name.startswith(("1d_", "2d_", "3d_"))
 
 
-def _panel_specs(loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewMode) -> tuple[PanelSpec, ...]:
+def _mosaic_cell_height(style: PlotStyle) -> int:
+    """Pixel height of one 3D mosaic cell: the spatial panel is three cells tall, about 0.84 of the figure height."""
+    return max(2, int(round(0.28 * style.height_px)))
+
+
+def _panel_specs(
+    loaded_arrays: tuple[LoadedArray, ...],
+    *,
+    view_mode: PlotViewMode,
+    mosaic_cell_height: int | None = None,
+    blood_gate: BloodGateConfig | None = None,
+    max_depth_m: float | None = None,
+    tissue_brightness_lift: float = 0.0,
+    tissue_gate: TissueGateConfig | None = None,
+) -> tuple[PanelSpec, ...]:
     if _has_3d_brightness(loaded_arrays):
-        return (_three_dimensional_panel(loaded_arrays, view_mode=view_mode),)
+        mosaic_panel = _three_dimensional_panel(loaded_arrays, view_mode=view_mode, cell_height=mosaic_cell_height)
+        volume_panel = _lv_volume_panel(mosaic_panel)
+        return (mosaic_panel,) if volume_panel is None else (mosaic_panel, volume_panel)
     panels: list[PanelSpec] = []
     if view_mode == "beamspace":
         panels.extend(_panel_spec(loaded, view="beamspace") for loaded in _beamspace_arrays(loaded_arrays))
@@ -1052,7 +1481,16 @@ def _panel_specs(loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewM
         )
     if view_mode in {"cartesian", "both"}:
         _validate_cartesian_color_doppler_pair(loaded_arrays)
-        panels.extend(_panel_spec(loaded, view="cartesian") for loaded in _cartesian_arrays(loaded_arrays))
+        panels.extend(
+            _panel_spec(loaded, view="cartesian")
+            for loaded in _cartesian_arrays(
+                loaded_arrays,
+                blood_gate=blood_gate,
+                max_depth_m=max_depth_m,
+                tissue_brightness_lift=tissue_brightness_lift,
+                tissue_gate=tissue_gate,
+            )
+        )
     return tuple(panels)
 
 
@@ -1069,7 +1507,9 @@ def _has_3d_brightness(loaded_arrays: tuple[LoadedArray, ...]) -> bool:
     return any(loaded.data_path == "data/3d_brightness_mode" for loaded in loaded_arrays)
 
 
-def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewMode) -> PanelSpec:
+def _three_dimensional_panel(
+    loaded_arrays: tuple[LoadedArray, ...], *, view_mode: PlotViewMode, cell_height: int | None = None
+) -> PanelSpec:
     loaded = next(loaded for loaded in loaded_arrays if loaded.data_path == "data/3d_brightness_mode")
     raw = None if loaded.stream is None else loaded.stream.metadata.raw
     prepared = prepare_3d_brightness_for_display(np.asarray(loaded.data), loaded.timestamps, raw)
@@ -1077,11 +1517,14 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
         None if loaded.stream is None else loaded.stream.metadata.stitch_beat_count
     ) or prepared.stitch_beat_count
     if view_mode == "beamspace":
-        mosaic = beamspace_spherical_mosaic(prepared.volumes).frames
+        mosaic = beamspace_spherical_mosaic(prepared.volumes, cell_height=cell_height).frames
+        mosaic_layout = None
         view: PanelView = "beamspace"
     else:
         geometry = spherical_geometry_from_metadata(raw)
-        mosaic = cartesian_spherical_mosaic(prepared.volumes, geometry).frames
+        mosaic_result = cartesian_spherical_mosaic(prepared.volumes, geometry, cell_height=cell_height)
+        mosaic = mosaic_result.frames
+        mosaic_layout = mosaic_result.layout
         view = "cartesian"
     attrs = {
         **dict(loaded.attrs),
@@ -1092,15 +1535,17 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
     }
     if prepared.source_timestamps is not None:
         attrs["ecg_marker_timestamps"] = prepared.source_timestamps
+    if view == "cartesian" and mosaic_layout is not None:
+        attrs["mosaic_layout"] = mosaic_layout
+        attrs["mosaic_geometry"] = geometry
     mesh_annotation = attrs.get("mesh_annotation")
-    if view == "cartesian" and isinstance(mesh_annotation, PackedMeshAnnotation):
+    if view == "cartesian" and mosaic_layout is not None and isinstance(mesh_annotation, PackedMeshAnnotation):
         try:
             geometry = spherical_geometry_from_metadata(raw)
             lines = mesh_mosaic_annotation_lines(
                 mesh_annotation,
-                geometry,
                 frame_count=int(mosaic.shape[0]),
-                mosaic_shape=(int(mosaic.shape[1]), int(mosaic.shape[2])),
+                layout=mosaic_layout,
                 view=view,
                 volume_timestamps=prepared.timestamps,
                 metadata=raw,
@@ -1122,12 +1567,82 @@ def _three_dimensional_panel(loaded_arrays: tuple[LoadedArray, ...], *, view_mod
     )
 
 
-def _cartesian_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
+def _lv_volume_panel(mosaic_panel: PanelSpec) -> PanelSpec | None:
+    """Line panel of the LV cavity volume per displayed frame, following the same mesh frames as the overlay."""
+    loaded = mosaic_panel.loaded
+    mesh = loaded.attrs.get("mesh_annotation")
+    if not isinstance(mesh, PackedMeshAnnotation) or loaded.timestamps is None:
+        return None
+    curve = mesh_volume_curve_ml(mesh)
+    if curve is None:
+        return None
+    raw = None if loaded.stream is None else loaded.stream.metadata.raw
+    frame_count = int(np.asarray(loaded.data).shape[0])
+    mesh_indices = np.asarray(
+        mesh_frame_indices_for_volume_timestamps(
+            mesh.timestamps, loaded.timestamps, raw, mesh_frame_count=mesh.frame_count, target_count=frame_count
+        ),
+        dtype=np.int64,
+    )
+    timestamps = np.asarray(loaded.timestamps, dtype=np.float64).reshape(-1)
+    if mesh_indices.size != timestamps.size or timestamps.size == 0:
+        return None
+    local = np.clip(mesh_indices - curve.frame_start, 0, curve.volumes_ml.size - 1)
+    series = curve.volumes_ml[local].astype(np.float32)
+    if not np.any(np.isfinite(series)):
+        return None
+    markers: list[tuple[float, float, str]] = []
+    # the displayed frames can span several beats, each replaying the mesh cycle: mark the extremes of every pass
+    breaks = np.flatnonzero(np.diff(local) < 0) + 1
+    for segment in np.split(np.arange(local.size), breaks):
+        values = series[segment]
+        if segment.size < 2 or not np.any(np.isfinite(values)):
+            continue
+        ed = int(segment[int(np.nanargmax(values))])
+        es = int(segment[int(np.nanargmin(values))])
+        markers.append((float(timestamps[ed]), float(series[ed]), f"ED {series[ed]:.0f} ml"))
+        markers.append((float(timestamps[es]), float(series[es]), f"ES {series[es]:.0f} ml"))
+    logger.info("%s", curve.description)
+    return PanelSpec(
+        loaded=LoadedArray(
+            name="lv_volume_curve",
+            data_path="data/3d_lv_volume_curve",
+            data=series,
+            timestamps_path=None,
+            timestamps=timestamps,
+            sample_rate_hz=None,
+            attrs={
+                "line_label": "LV volume (ml)",
+                "line_markers": tuple(markers),
+                "volume_description": curve.description,
+            },
+            stream=None,
+        ),
+        kind="line",
+        label="LV volume (ml)",
+        view="beamspace",
+    )
+
+
+def _cartesian_arrays(
+    loaded_arrays: tuple[LoadedArray, ...],
+    *,
+    blood_gate: BloodGateConfig | None = None,
+    max_depth_m: float | None = None,
+    tissue_brightness_lift: float = 0.0,
+    tissue_gate: TissueGateConfig | None = None,
+) -> tuple[LoadedArray, ...]:
     visual = tuple(loaded for loaded in loaded_arrays if _panel_kind(loaded) == "image")
     temporal = tuple(loaded for loaded in loaded_arrays if _panel_kind(loaded) != "image")
     if not visual:
         return loaded_arrays
-    cartesian = cartesian_loaded_arrays(visual)
+    cartesian = cartesian_loaded_arrays(
+        visual,
+        blood_gate=blood_gate,
+        max_depth_m=max_depth_m,
+        tissue_brightness_lift=tissue_brightness_lift,
+        tissue_gate=tissue_gate,
+    )
     return (*(cartesian or visual), *temporal)
 
 
@@ -1202,6 +1717,9 @@ def _set_ecg_xlim(ax: Axes, ecg: TraceSpec) -> None:
 
 
 def _ecg_marker_times(panels: tuple[PanelSpec, ...], time_s: float, frame_index: int) -> np.ndarray | None:
+    if strip_drives_timeline(panels):
+        # A single 2D frame has one fixed set of markers; the moving cursor is the timeline.
+        return None
     for panel in panels:
         marker_times = panel.loaded.attrs.get("ecg_marker_timestamps")
         if marker_times is None:
@@ -1218,6 +1736,8 @@ def _ecg_marker_times(panels: tuple[PanelSpec, ...], time_s: float, frame_index:
 
 
 def _ecg_trace(store: RecordingStore) -> TraceSpec:
+    if not _has_ecg(store):
+        return TraceSpec(signal=np.zeros(0, dtype=np.float32), timestamps=np.zeros(0, dtype=np.float64), label="ECG")
     loaded = store.load_modality(_ecg_data_path(store))
     signal = np.asarray(loaded.data, dtype=np.float32).reshape(-1)
     if loaded.timestamps is None:

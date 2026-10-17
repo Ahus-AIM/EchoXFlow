@@ -1,0 +1,75 @@
+---
+# ECG-conditioned frame-to-video diffusion (Task 4). Defaults reproduce the paper runs; the coordinate space and
+# spatial size (128, 256 or 320) are usually set on the command line.
+model:
+  kind: video_diffusion
+  pixel_pack_factor: 2          # lossless 2x2 space-to-depth: 1x128x128 frames -> 4x64x64 diffusion tensors
+  model_channels: 128
+  channel_multipliers: [1, 2, 4]  # widths 128 / 256 / 512
+  embedding_channels: 512
+  spatial_kernel_size: 3
+  temporal_kernel_size: 3
+  ecg_encoder_channels: [16, 32, 64]
+  ecg_encoder_kernel_size: 15
+  ecg_encoder_pooled_samples: 8
+  activation_checkpointing: false  # recompute blocks in backward to save memory (peak 15 GB at 256 px without)
+diffusion:
+  steps: 1000
+  schedule: cosine
+  prediction: v
+  sampling_steps: 32
+ecg:
+  sample_rate_hz: 600.0
+  history_seconds: 1.2          # 1.2 s before + 0.2 s after each frame = 1.4 s windows (841 samples)
+  future_seconds: 0.2
+  maximum_gap_samples: 4
+  amplitude_clip: 5.0           # robust z-score clip, then scaled to [-1, 1]
+  sign_flip_probability: 0.5    # ECG polarity augmentation (training only)
+optimizer:
+  name: adammuon
+  learning_rate: 0.0037
+  muon_momentum: 0.95
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  ema_decay: 0.995
+trainer:
+  epochs: 10
+  max_steps: null
+  seed: 0
+  device: cuda
+  precision: bf16-mixed
+  validation_batches: 32       # held-out clips, each scored at a fixed grid of noise levels with fixed noise
+  validation_levels: 8
+  log_every_steps: 50
+data:
+  root_dir: null                # or ECHOXFLOW_DATA_ROOT / --data-root
+  split_csv: null               # default: <root>/splits.csv (exam_id,five_fold_split)
+  evaluation_fold: 4            # held out; all other folds are used for training
+  coordinate_space: beamspace   # beamspace | cartesian
+  spatial_size: 128             # 128 | 256 | 320
+  clip_frames: 32
+  views: [A2C, A3C, A4C]
+  view_source: csv  # csv | scanner_view_detector
+  view_labels_csv: view_classifier_probabilities.csv  # relative paths resolve against the data root
+  minimum_view_confidence: 0.85
+  minimum_frame_rate_hz: 25.0
+  high_frame_rate_threshold_hz: 50.0
+  high_frame_rate_stride: 2
+  maximum_depth_start_m: 1.0e-5
+  batch_size: 1
+  num_workers: 8
+  index_cache_dir: outputs/cache/video_diffusion
+  index_workers: 16
+  max_recordings: null
+evaluation:
+  clips_per_view: 68            # one clip per recording, 31 generated frames each -> 2108 frames per view
+  seed: 0                       # clip selection and per-clip initial noise
+  extractors: [echoprime_view, echofine, echoclip, inception, panecho, echojepa, echoprime_mvit]
+  feature_batch_size: 32
+  kid_subsets: 100
+  kid_subset_size: 32
+  kid_seed: 17
+  bootstrap_replicates: 2000
+  bootstrap_seed: 17
+artifacts:
+  root_dir: outputs/runs/video_diffusion

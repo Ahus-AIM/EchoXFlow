@@ -5,23 +5,20 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import croissant_row, write_croissant
 
 from echoxflow import (
-    PredictionArray,
     RecordingArray,
     RecordingRecord,
-    build_prediction_manifest,
     find_derived_recordings,
     find_recordings,
     find_source_recordings,
     load_croissant,
     open_recording,
-    prediction_array_entry,
     rasterize_beamspace_mask,
     rasterize_beamspace_volume_mask,
     rasterize_packed_mesh_volume_masks,
     resample_sector,
-    write_prediction_recording,
     write_recording,
 )
 from echoxflow.croissant import RecordingRelationship, linked_frame_timestamp_paths
@@ -163,15 +160,15 @@ def test_open_recording_supports_zip_zarr_store(tmp_path: Path) -> None:
 
 
 def test_croissant_relationship_helpers_find_source_and_derived_records(tmp_path: Path) -> None:
-    _write_croissant(
+    write_croissant(
         tmp_path,
         [
-            _row(
+            croissant_row(
                 "bmode",
                 content_types=["2d_brightness_mode"],
                 array_paths=["data/2d_brightness_mode", "timestamps/2d_brightness_mode"],
             ),
-            _row(
+            croissant_row(
                 "mesh",
                 content_types=["3d_left_ventricle_mesh"],
                 array_paths=["data/3d_left_ventricle_mesh_points"],
@@ -190,11 +187,13 @@ def test_croissant_relationship_helpers_find_source_and_derived_records(tmp_path
 
 
 def test_croissant_relationship_helpers_parse_public_recording_links(tmp_path: Path) -> None:
-    _write_croissant(
+    write_croissant(
         tmp_path,
         [
-            _row("derived", content_types=["3d_left_ventricle_mesh"], array_paths=["data/3d_left_ventricle_mesh"]),
-            _row("source", content_types=["2d_brightness_mode"], array_paths=["data/2d_brightness_mode"]),
+            croissant_row(
+                "derived", content_types=["3d_left_ventricle_mesh"], array_paths=["data/3d_left_ventricle_mesh"]
+            ),
+            croissant_row("source", content_types=["2d_brightness_mode"], array_paths=["data/2d_brightness_mode"]),
         ],
         recording_links=[
             {
@@ -218,10 +217,10 @@ def test_croissant_relationship_helpers_parse_public_recording_links(tmp_path: P
 
 
 def test_find_recordings_filters_by_croissant_frame_counts(tmp_path: Path) -> None:
-    _write_croissant(
+    write_croissant(
         tmp_path,
         [
-            _row(
+            croissant_row(
                 "single_frame",
                 content_types=["2d_brightness_mode", "2d_color_doppler_velocity", "2d_color_doppler_power"],
                 array_paths=[
@@ -235,7 +234,7 @@ def test_find_recordings_filters_by_croissant_frame_counts(tmp_path: Path) -> No
                     "2d_color_doppler_power": 4,
                 },
             ),
-            _row(
+            croissant_row(
                 "multi_frame",
                 content_types=["2d_brightness_mode", "2d_color_doppler_velocity", "2d_color_doppler_power"],
                 array_paths=[
@@ -265,17 +264,17 @@ def test_find_recordings_filters_by_croissant_frame_counts(tmp_path: Path) -> No
 
 
 def test_find_recordings_exposes_and_filters_3d_stitch_beat_count(tmp_path: Path) -> None:
-    _write_croissant(
+    write_croissant(
         tmp_path,
         [
-            _row(
+            croissant_row(
                 "single_beat_3d",
                 content_types=["3d_brightness_mode"],
                 array_paths=["data/3d_brightness_mode"],
                 frame_counts={"3d_brightness_mode": 2},
                 stitch_beat_count=1,
             ),
-            _row(
+            croissant_row(
                 "stitched_3d",
                 content_types=["3d_brightness_mode"],
                 array_paths=["data/3d_brightness_mode"],
@@ -286,7 +285,7 @@ def test_find_recordings_exposes_and_filters_3d_stitch_beat_count(tmp_path: Path
     )
 
     catalog = load_croissant(root=tmp_path)
-    stitched = find_recordings(croissant=catalog, content_type="3d_brightness_mode", min_stitch_beat_count=2)
+    stitched = find_recordings(croissant=catalog, content_types=["3d_brightness_mode"], min_stitch_beat_count=2)
 
     assert [record.recording_id for record in stitched] == ["stitched_3d"]
     assert stitched[0].stitch_beat_count == 4
@@ -365,9 +364,10 @@ def test_typed_annotation_and_mesh_streams_validate_shapes() -> None:
 
 def test_packed_mesh_annotation_loader_validates_conventional_paths(tmp_path: Path) -> None:
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
-    group.create_array("data/3d_left_ventricle_mesh_points", data=np.zeros((4, 3), dtype=np.float32))
-    group.create_array("data/3d_left_ventricle_mesh_faces", data=np.asarray([[0, 1, 2]], dtype=np.int32))
-    group.create_array("data/3d_left_ventricle_mesh_frame_offsets", data=np.asarray([0, 2, 4], dtype=np.int64))
+    mesh_group = group.create_group("annotations/3d_left_ventricle_mesh")
+    mesh_group.create_array("point_values", data=np.zeros((4, 3), dtype=np.float32))
+    mesh_group.create_array("face_values", data=np.asarray([[0, 1, 2]], dtype=np.int32))
+    mesh_group.create_array("point_frame_offsets", data=np.asarray([0, 4], dtype=np.int64))
 
     mesh = open_recording(tmp_path / "case.zarr").load_packed_mesh_annotation()
 
@@ -377,7 +377,7 @@ def test_packed_mesh_annotation_loader_validates_conventional_paths(tmp_path: Pa
 
 def test_packed_mesh_annotation_loader_exposes_grouped_frame_views(tmp_path: Path) -> None:
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
-    mesh_group = group.create_group("data/3d_left_ventricle_mesh")
+    mesh_group = group.create_group("annotations/3d_left_ventricle_mesh")
     mesh_group.create_array(
         "point_values",
         data=np.asarray(
@@ -402,6 +402,8 @@ def test_packed_mesh_annotation_loader_exposes_grouped_frame_views(tmp_path: Pat
 
     mesh = open_recording(tmp_path / "case.zarr").load_packed_mesh_annotation()
 
+    assert mesh.points_path == "annotations/3d_left_ventricle_mesh/point_values"
+    assert mesh.faces_path == "annotations/3d_left_ventricle_mesh/face_values"
     assert mesh.frame_count == 2
     assert mesh.component_names == ("lv",)
     assert mesh.frame(1).points.shape == (3, 3)
@@ -469,7 +471,7 @@ def test_sector_resampling_and_beamspace_rasterization() -> None:
 
 def test_mesh_volume_rasterization_returns_frame_volume_masks(tmp_path: Path) -> None:
     group = zarr.open_group(tmp_path / "case.zarr", mode="w")
-    mesh_group = group.create_group("data/3d_left_ventricle_mesh")
+    mesh_group = group.create_group("annotations/3d_left_ventricle_mesh")
     mesh_group.create_array(
         "point_values",
         data=np.asarray(
@@ -497,28 +499,15 @@ def test_mesh_volume_rasterization_returns_frame_volume_masks(tmp_path: Path) ->
     assert masks.any()
 
 
-def test_prediction_manifest_helpers_are_typed() -> None:
-    entry = prediction_array_entry("3d_left_ventricle_mask", np.zeros((2, 3, 4), dtype=np.float32))
-    manifest = build_prediction_manifest(
-        exam_id="exam",
-        recording_id="prediction",
-        source_recording_id="source",
-        arrays=[entry],
-    )
-
-    assert manifest.to_dict()["arrays"][0]["data_path"] == "data/3d_left_ventricle_mask"
-    assert manifest.to_dict()["source_recording_id"] == "source"
-
-
-def test_prediction_recording_writer_round_trips_through_open_recording(tmp_path: Path) -> None:
+def test_recording_writer_round_trips_through_open_recording(tmp_path: Path) -> None:
     output_path = tmp_path / "prediction.zarr"
-    manifest = write_prediction_recording(
+    record = write_recording(
         output_path,
         exam_id="exam",
         recording_id="prediction",
         source_recording_id="source",
         arrays=[
-            PredictionArray(
+            RecordingArray(
                 "3d_left_ventricle_mask",
                 np.ones((2, 3, 4), dtype=np.float32),
                 timestamps=np.asarray([0.0, 1.0], dtype=np.float32),
@@ -530,7 +519,7 @@ def test_prediction_recording_writer_round_trips_through_open_recording(tmp_path
 
     store = open_recording(output_path)
 
-    assert manifest.to_dict()["arrays"][0]["timestamps_path"] == "timestamps/3d_left_ventricle_mask"
+    assert record.has_array_path("timestamps/3d_left_ventricle_mask")
     assert store.load_stream("3d_left_ventricle_mask").data.shape == (2, 3, 4)
     assert store.load_timestamps("3d_left_ventricle_mask") is not None
     catalog = load_croissant(root=tmp_path)
@@ -641,16 +630,16 @@ def test_recording_writer_publishes_split_3d_volume_annotation_links(tmp_path: P
     assert linked_frame_timestamp_paths(volume, "3d_brightness_mode")[0] == "timestamps/3d_brightness_mode"
 
 
-def test_prediction_recording_writer_publishes_recording_manifest_without_internal_annotation_plumbing(
+def test_recording_writer_publishes_recording_manifest_without_internal_annotation_plumbing(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "prediction.zarr"
-    write_prediction_recording(
+    write_recording(
         output_path,
         exam_id="exam",
         recording_id="prediction",
         arrays=[
-            PredictionArray(
+            RecordingArray(
                 "3d_left_ventricle_mask",
                 np.ones((2, 3, 4), dtype=np.float32),
             )
@@ -775,44 +764,3 @@ def test_spherical_geometry_accepts_internal_restored_render_metadata() -> None:
     assert geometry.depth_end_m == 1.5
     assert geometry.azimuth_width_rad == 0.4
     assert geometry.elevation_width_rad == 0.3
-
-
-def _row(
-    recording_id: str,
-    *,
-    content_types: list[str],
-    array_paths: list[str],
-    frame_counts: dict[str, int] | None = None,
-    source_recording_id: str | None = None,
-    stitch_beat_count: int | None = None,
-) -> dict[str, object]:
-    row: dict[str, object] = {
-        "recordings/exam_id": "exam",
-        "recordings/recording_id": recording_id,
-        "recordings/zarr_path": f"{recording_id}.zarr",
-        "recordings/modes": content_types,
-        "recordings/content_types": content_types,
-        "recordings/frame_counts_by_content_type": frame_counts or {},
-        "recordings/median_delta_time_by_content_type": {},
-        "recordings/array_paths": array_paths,
-    }
-    if source_recording_id is not None:
-        row["recordings/source_recording_id"] = source_recording_id
-    if stitch_beat_count is not None:
-        row["recordings/stitch_beat_count"] = stitch_beat_count
-    return row
-
-
-def _write_croissant(
-    root: Path,
-    rows: list[dict[str, object]],
-    *,
-    recording_links: list[dict[str, object]] | None = None,
-) -> None:
-    record_sets: list[dict[str, object]] = [{"@id": "recordings", "name": "recordings", "data": rows}]
-    if recording_links is not None:
-        record_sets.append({"@id": "recording_links", "name": "recording_links", "data": recording_links})
-    (root / "croissant.json").write_text(
-        json.dumps({"recordSet": record_sets}),
-        encoding="utf-8",
-    )

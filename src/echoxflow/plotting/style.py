@@ -5,10 +5,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from echoxflow.colors import get_colors, rgb_to_hex
+from echoxflow.plotting.gating import BloodGateConfig, TissueGateConfig
 
 
 @dataclass(frozen=True)
 class PlotStyle:
+    """Size, colours and fonts of a rendered figure.
+
+    `width_px` and `height_px` are the output pixel size of every still and video frame, whatever `dpi` is; `dpi`
+    only scales fonts and line widths. The colour fields set the figure, panel, text, ECG and cursor colours. The
+    font-size fields set tick, colour bar, panel label and annotation text. The `show_*` fields switch the ECG
+    strip, panel labels, figure title, Doppler extent box and depth ruler on or off. The `annotation_*`,
+    `sampling_gate_*` and `cartesian_depth_ruler_*` fields style overlays and the depth ruler. `max_fps` caps the
+    frame rate of videos. `strip_height_ratio` is the height of a spectral or M-mode strip relative to an image row;
+    `strip_height_ratio_static` replaces it when every image has a single frame, so the strip dominates.
+    `volume_curve_height_ratio` sets the LV volume curve height relative to an image row.
+    """
+
     width_px: int = 1440
     height_px: int = 1080
     dpi: int = 100
@@ -22,12 +35,26 @@ class PlotStyle:
     cursor_color: str = "#FF6060"
     line_color: str = "#3CFF3C"
     max_fps: float = 60.0
+    strip_height_ratio: float = 0.55
+    strip_height_ratio_static: float = 1.6
+    volume_curve_height_ratio: float = 0.3
     show_ecg: bool = True
     axis_tick_label_fontsize: float = 14.0
     colorbar_fontsize: float = 16.0
+    panel_label_fontsize: float = 11.0
+    show_panel_labels: bool = True
+    show_figure_title: bool = True
     color_doppler_extent_color: str = "#FFFFFF"
     color_doppler_extent_linewidth: float = 1.2
     show_color_doppler_extent: bool = True
+    blood_gate: BloodGateConfig | None = None  # colour Doppler gate; None uses the BloodGateConfig defaults
+    tissue_gate: TissueGateConfig | None = None  # tissue Doppler gate; None uses the TissueGateConfig defaults
+    show_colorbars: bool = True
+    show_colorbar_labels: bool = True
+    cartesian_max_depth_m: float | None = None  # crop scan-converted sectors below this depth
+    tissue_doppler_brightness_lift: float = (
+        0.0  # 0-1: moves the B-mode brightness picking the tissue colour row towards 1
+    )
     annotation_color: str = "#00D5FF"
     annotation_secondary_color: str = "#FF9F0A"
     annotation_edge_color: str = "#000000"
@@ -48,6 +75,8 @@ class PlotStyle:
     cartesian_depth_ruler_border_linewidth: float = 0.65
     cartesian_depth_ruler_label_fontsize: float = 14.0
     cartesian_depth_ruler_show_border: bool = False
+    show_mosaic_levels: bool = True
+    mosaic_level_colors: tuple[str, str, str] = ("#FFD23F", "#FF6F91", "#8AFF80")
 
     @property
     def figsize(self) -> tuple[float, float]:
