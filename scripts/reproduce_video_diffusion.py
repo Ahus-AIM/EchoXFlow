@@ -185,8 +185,6 @@ class Reproduction:
                     "--extractors",
                     *self.args.extractors,
                     *(["--camus-root", str(self.camus_root)] if self.camus_root is not None else []),
-                    # An interrupted run keeps its finished EchoXFlow evaluation and only resumes the CAMUS part.
-                    *(["--skip-echoxflow"] if (evaluation_dir / "metrics.json").is_file() else []),
                     *(["--keep-samples"] if self.args.keep_samples else []),
                     *shlex.split(self.args.evaluate_args),
                 ]

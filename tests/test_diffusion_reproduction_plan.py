@@ -36,6 +36,11 @@ def test_single_space_plan_revalidates_without_comparison_tables(tmp_path: Path,
     reproduction = Reproduction(args)
     assert len(reproduction.launcher.jobs) == 2
     assert all(job.state == "pending" for job in reproduction.launcher.jobs)
+    evaluate = reproduction.launcher.jobs[1]
+    completed_command = evaluate.commands(evaluate, "local")
+    (run_dir / "evaluation" / "metrics.json").unlink()
+    assert evaluate.commands(evaluate, "local") == completed_command
+    assert "--skip-echoxflow" not in completed_command[0]
 
 
 def test_two_space_plan_keeps_comparison_tables(tmp_path: Path) -> None:
