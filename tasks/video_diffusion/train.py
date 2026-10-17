@@ -402,8 +402,6 @@ def train(config: dict[str, Any], *, resume: str | Path | None = None, keep_late
         with history_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row) + "\n")
         print(json.dumps(row), flush=True)
-        save_latest(completed_epochs=epoch + 1, step_in_epoch=0)
-        last_checkpoint = time.monotonic()
         atomic_torch_save(
             {
                 "format": "echoxflow_video_diffusion_ema",
@@ -416,6 +414,8 @@ def train(config: dict[str, Any], *, resume: str | Path | None = None, keep_late
         )
         if epoch + 1 in {int(kept) for kept in trainer.get("keep_ema_epochs") or ()}:
             shutil.copyfile(run_dir / "ema.pt", run_dir / f"ema_epoch{epoch + 1:03d}.pt")
+        save_latest(completed_epochs=epoch + 1, step_in_epoch=0)
+        last_checkpoint = time.monotonic()
         if max_steps and step >= max_steps:
             break
     completed = {

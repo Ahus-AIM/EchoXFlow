@@ -237,3 +237,53 @@ def test_evaluation_requires_a_dataset_before_loading_checkpoint(monkeypatch):
     with pytest.raises(SystemExit) as error:
         evaluate.main(["--checkpoint", "unused.pt", "--skip-echoxflow"])
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("interrupted_file", ["ema.pt", "latest.pt"])
+def test_final_epoch_interruption_resumes_with_current_ema(tmp_path, monkeypatch, interrupted_file):
+    class ToyDataset(torch.utils.data.Dataset):
+        recordings = ["recording"]
+        grouped = {"A2C": recordings}
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            return torch.ones(1)
+
+    config = train.load_config(None)
+    config["data"].update(_dataset(tmp_path / "data")["data"], num_workers=0, batch_size=1)
+    run = tmp_path / "run"
+    config["artifacts"]["run_dir"] = str(run)
+    config["trainer"].update(
+        device="cpu", epochs=2, checkpoint_every_steps=0, checkpoint_every_minutes=0, keep_ema_epochs=[2]
+    )
+    monkeypatch.setattr(train, "build_datasets", lambda config: (ToyDataset(), ToyDataset()))
+    monkeypatch.setattr(train, "build_model", lambda config: torch.nn.Linear(1, 1))
+    monkeypatch.setattr(
+        train, "diffusion_loss_terms", lambda model, batch, config: {"loss": model(batch).square().mean()}
+    )
+    monkeypatch.setattr(train, "validate", lambda *args, **kwargs: {})
+    save = train.atomic_torch_save
+
+    def interrupted_save(payload, path):
+        if path.name == interrupted_file and payload["step"] == 2:
+            raise RuntimeError("interrupted final epoch write")
+        save(payload, path)
+
+    monkeypatch.setattr(train, "atomic_torch_save", interrupted_save)
+    with pytest.raises(RuntimeError, match="interrupted final epoch write"):
+        train.train(config, keep_latest=True)
+    latest = run / "latest.pt"
+    assert torch.load(latest, weights_only=False)["epoch"] == 1
+    assert not (run / "training_complete.json").exists()
+
+    monkeypatch.setattr(train, "atomic_torch_save", save)
+    train.train(config, resume=latest, keep_latest=True)
+    state = torch.load(latest, weights_only=False)
+    ema = torch.load(run / "ema.pt", weights_only=False)
+    assert state["epoch"] == 2 and state["step"] == ema["step"] == 2
+    for name, tensor in state["ema_model"].items():
+        torch.testing.assert_close(ema["ema_model"][name], tensor)
+    complete = json.loads((run / "training_complete.json").read_text())
+    assert complete["ema_sha256"] == file_digest(run / "ema.pt") == file_digest(run / "ema_epoch002.pt")
