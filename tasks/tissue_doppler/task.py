@@ -9,7 +9,8 @@ from tasks.utils.training.runners import doppler_result
 TASK_SPEC = TaskSpec(
     name="tissue_doppler",
     loss_fn=tissue_doppler_loss_terms,
-    metric_keys={"cartesian_velocity": "velocity_l1"},
+    # velocity_l1 is the wrapped absolute error in m/s; velocity_nyquist_l1 divides it by the velocity limit.
+    metric_keys={"cartesian_velocity": "velocity_l1", "cartesian_velocity_nyquist": "velocity_nyquist_l1"},
     val_metrics_fn=tissue_doppler_cartesian_val_metrics,
     result_factory=doppler_result,
     preview=PreviewSpec(

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import cast
 
 import numpy as np
+from matplotlib.colors import Colormap
 
 from echoxflow.loading import LoadedArray
 from echoxflow.plotting.gating import (
@@ -13,17 +15,41 @@ from echoxflow.plotting.gating import (
     TissueGateConfig,
     blood_gate,
     normalize_bmode_intensity,
-    normalize_doppler_power,
     tissue_gate,
 )
-from echoxflow.scan import CartesianGrid, ImageLayer, compose_layers, layer_to_rgba, sector_to_cartesian
+from echoxflow.scan import (
+    CartesianGrid,
+    CartesianImage,
+    ImageLayer,
+    Interpolation,
+    SectorGeometry,
+    compose_layers,
+    layer_to_rgba,
+    sector_stack_to_cartesian_array,
+)
+from echoxflow.schema import color_flow_velocity_codes
 from echoxflow.streams import default_value_range_for_path
 
 _COLOR_DOPPLER_HIDDEN_CENTER_FRACTION = 0.20
+_COLOR_DOPPLER_VELOCITY_ALPHA = 0.9
+# The scanner indexes the tissue table's brightness axis with k = 255 * (slope * B-mode + offset), B-mode in [0, 1].
+_TISSUE_TABLE_SLOPE = 0.85
+_TISSUE_TABLE_OFFSET = 0.02
 
 
-def cartesian_loaded_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[LoadedArray, ...]:
-    """Build Cartesian cartesian-view arrays from loaded 2D streams."""
+def cartesian_loaded_arrays(
+    loaded_arrays: tuple[LoadedArray, ...],
+    *,
+    blood_gate: BloodGateConfig | None = None,
+    max_depth_m: float | None = None,
+    tissue_brightness_lift: float = 0.0,
+    tissue_gate: TissueGateConfig | None = None,
+) -> tuple[LoadedArray, ...]:
+    """Build Cartesian cartesian-view arrays from loaded 2D streams.
+
+    ``blood_gate`` and ``tissue_gate`` override the default Doppler gates; ``max_depth_m`` crops the sectors below
+    that depth; ``tissue_brightness_lift`` brightens the tissue Doppler colours (see :class:`PlotStyle`).
+    """
     by_path = {loaded.data_path: loaded for loaded in loaded_arrays}
     bmode = _first_available(
         by_path,
@@ -35,87 +61,116 @@ def cartesian_loaded_arrays(loaded_arrays: tuple[LoadedArray, ...]) -> tuple[Loa
         ),
     )
     if bmode is None or not _has_geometry(bmode):
-        converted = tuple(_cartesian_single(loaded) for loaded in loaded_arrays if _has_geometry(loaded))
+        converted = tuple(
+            _cartesian_single(loaded, max_depth_m=max_depth_m) for loaded in loaded_arrays if _has_geometry(loaded)
+        )
         return converted or loaded_arrays
 
-    overlays = _cartesian_overlays(bmode, by_path)
+    overlays = _cartesian_overlays(
+        bmode,
+        by_path,
+        blood_gate=blood_gate,
+        max_depth_m=max_depth_m,
+        tissue_brightness_lift=tissue_brightness_lift,
+        tissue_gate=tissue_gate,
+    )
     if overlays:
         return overlays
 
     return (
-        _cartesian_single(bmode),
-        *tuple(_cartesian_single(loaded) for loaded in loaded_arrays if loaded is not bmode and _has_geometry(loaded)),
+        _cartesian_single(bmode, max_depth_m=max_depth_m),
+        *tuple(
+            _cartesian_single(loaded, max_depth_m=max_depth_m)
+            for loaded in loaded_arrays
+            if loaded is not bmode and _has_geometry(loaded)
+        ),
     )
 
 
-def _cartesian_overlays(bmode: LoadedArray, by_path: dict[str, LoadedArray]) -> tuple[LoadedArray, ...]:
+def _cartesian_overlays(
+    bmode: LoadedArray,
+    by_path: dict[str, LoadedArray],
+    *,
+    blood_gate: BloodGateConfig | None = None,
+    max_depth_m: float | None = None,
+    tissue_brightness_lift: float = 0.0,
+    tissue_gate: TissueGateConfig | None = None,
+) -> tuple[LoadedArray, ...]:
     overlays: list[LoadedArray] = []
     velocity = by_path.get("data/2d_color_doppler_velocity")
     power = by_path.get("data/2d_color_doppler_power")
     if velocity is not None and power is not None and _has_geometry(velocity) and _has_geometry(power):
-        overlays.append(_cartesian_color_doppler(bmode, velocity, power))
+        overlays.append(
+            _cartesian_color_doppler(bmode, velocity, power, gate_config=blood_gate, max_depth_m=max_depth_m)
+        )
     tissue = by_path.get("data/tissue_doppler")
     if tissue is not None and _has_geometry(tissue):
-        overlays.append(_cartesian_tissue_doppler(bmode, tissue))
+        overlays.append(
+            _cartesian_tissue_doppler(
+                bmode,
+                tissue,
+                max_depth_m=max_depth_m,
+                brightness_lift=tissue_brightness_lift,
+                gate_config=tissue_gate,
+            )
+        )
     return tuple(overlays)
 
 
-def _cartesian_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: LoadedArray) -> LoadedArray:
+def _display_grid(geometry: SectorGeometry, height: int, max_depth_m: float | None) -> CartesianGrid:
+    """The Cartesian grid of a sector, cropped to ``max_depth_m`` when that is shallower than the sector."""
+    if max_depth_m is not None and float(max_depth_m) < float(geometry.depth_end_m):
+        geometry = replace(geometry, depth_end_m=max(float(max_depth_m), float(geometry.depth_start_m) + 1e-3))
+    return CartesianGrid.from_sector_height(geometry, height)
+
+
+def _within_depth(image: CartesianImage, max_depth_m: float | None) -> np.ndarray:
+    """The image mask without the pixels deeper than ``max_depth_m`` from the apex at the grid origin."""
+    if max_depth_m is None:
+        return np.asarray(image.mask, dtype=bool)
+    height, width = image.grid.shape
+    xs = np.linspace(image.grid.x_range_m[0], image.grid.x_range_m[1], width, dtype=np.float64)
+    ys = np.linspace(image.grid.y_range_m[0], image.grid.y_range_m[1], height, dtype=np.float64)
+    radii = np.hypot(xs[np.newaxis, :], ys[:, np.newaxis])
+    return np.asarray(image.mask, dtype=bool) & (radii <= float(max_depth_m))
+
+
+def _cartesian_color_doppler(
+    bmode: LoadedArray,
+    velocity: LoadedArray,
+    power: LoadedArray,
+    *,
+    gate_config: BloodGateConfig | None = None,
+    max_depth_m: float | None = None,
+) -> LoadedArray:
     bmode_geometry = _geometry(bmode)
     velocity_geometry = _geometry(velocity)
     power_geometry = _geometry(power)
     bmode_data = np.asarray(bmode.data)
     _, timeline_timestamps = _cartesian_timeline_source(bmode, velocity, power)
-    grid = CartesianGrid.from_sector_height(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]))
-    frames = []
-    for index, time_s in enumerate(timeline_timestamps):
-        bmode_frame = _frame_at_time(bmode, float(time_s), fallback_index=index)
-        velocity_frame = _frame_at_time(velocity, time_s, fallback_index=index)
-        power_frame = _frame_at_time(power, time_s, fallback_index=index)
-        bmode_cart = sector_to_cartesian(bmode_frame, bmode_geometry, grid=grid, interpolation="linear")
-        velocity_cart = sector_to_cartesian(velocity_frame, velocity_geometry, grid=grid, interpolation="linear")
-        power_cart = sector_to_cartesian(power_frame, power_geometry, grid=grid, interpolation="linear")
-        region = bmode_cart.mask & velocity_cart.mask & power_cart.mask
-        velocity_range = _value_range(velocity, velocity_cart.data)
-        gate = blood_gate(
-            bmode_cart.data,
-            power_cart.data,
-            config=BloodGateConfig(),
-            region_mask=region,
+    grid = _display_grid(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]), max_depth_m)
+    # Velocity and power are sampled with nearest-neighbour so wrapped velocities across the Nyquist boundary are
+    # never blended into false mid-range values; the colormap is applied only after sampling.
+    bmode_stack = _cartesian_stack(bmode, bmode_geometry, grid, timeline_timestamps, interpolation="linear")
+    velocity_stack = _cartesian_stack(velocity, velocity_geometry, grid, timeline_timestamps, interpolation="nearest")
+    power_stack = _cartesian_stack(power, power_geometry, grid, timeline_timestamps, interpolation="nearest")
+    bmode_mask = _within_depth(bmode_stack, max_depth_m)
+    region = bmode_mask & velocity_stack.mask & power_stack.mask
+    flow_colors = _cartesian_flow_color_stack(velocity, velocity_geometry, grid, timeline_timestamps)
+    frames = [
+        _color_doppler_frame(
+            bmode=bmode,
+            velocity=velocity,
+            bmode_data=bmode_stack.data[index],
+            bmode_mask=bmode_mask,
+            velocity_data=velocity_stack.data[index],
+            power_data=power_stack.data[index],
+            region=region,
+            flow_rgb=None if flow_colors is None else flow_colors[index],
+            gate_config=gate_config,
         )
-        velocity_gate = gate & _outside_middle_colormap_band(
-            velocity_cart.data,
-            value_range=velocity_range,
-            hidden_fraction=_COLOR_DOPPLER_HIDDEN_CENTER_FRACTION,
-        )
-        power_alpha = normalize_doppler_power(power_cart.data) * velocity_gate.astype(np.float32)
-        frames.append(
-            compose_layers(
-                [
-                    ImageLayer(
-                        data=bmode_cart.data,
-                        cmap="grayscale",
-                        value_range=_value_range(bmode, bmode_cart.data),
-                        mask=bmode_cart.mask,
-                    ),
-                    ImageLayer(
-                        data=velocity_cart.data,
-                        cmap="color_doppler_velocity",
-                        alpha=0.9,
-                        mask=velocity_gate,
-                        value_range=velocity_range,
-                    ),
-                    ImageLayer(
-                        data=power_cart.data,
-                        cmap="color_doppler_power",
-                        alpha=0.25,
-                        mask=power_alpha,
-                        value_range=_value_range(power, power_cart.data),
-                    ),
-                ],
-                background=None,
-            )
-        )
+        for index in range(len(timeline_timestamps))
+    ]
     return _cartesian_loaded(
         source=bmode,
         name="cartesian_color_doppler",
@@ -125,7 +180,9 @@ def _cartesian_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: L
         timestamps=timeline_timestamps,
         attrs={
             "annotation_overlays": _combined_annotation_overlays(bmode, velocity, power),
+            "colormap": velocity.attrs.get("colormap"),
             "cartesian_colorbar_data_path": velocity.data_path,
+            "cartesian_colorbar_table": velocity.attrs.get("flow_color_table"),
             "cartesian_colorbar_value_range": _value_range(velocity, np.asarray(velocity.data)),
             "cartesian_color_doppler_geometry": velocity_geometry,
             "cartesian_color_doppler_sector": None if velocity.stream is None else velocity.stream.metadata.raw,
@@ -133,34 +190,86 @@ def _cartesian_color_doppler(bmode: LoadedArray, velocity: LoadedArray, power: L
     )
 
 
-def _cartesian_tissue_doppler(bmode: LoadedArray, tissue: LoadedArray) -> LoadedArray:
+def _color_doppler_frame(
+    *,
+    bmode: LoadedArray,
+    velocity: LoadedArray,
+    bmode_data: np.ndarray,
+    bmode_mask: np.ndarray,
+    velocity_data: np.ndarray,
+    power_data: np.ndarray,
+    region: np.ndarray,
+    flow_rgb: np.ndarray | None,
+    gate_config: BloodGateConfig | None = None,
+) -> np.ndarray:
+    """Composite one scan-converted colour Doppler frame: B-mode with the gated velocity colours on top.
+
+    All arrays are on the same Cartesian grid. `flow_rgb` is the `[0, 1]` RGB the recording's two-dimensional
+    FlowColorTable gives each pixel, or None to colour `velocity_data` through the velocity colormap. The scanner
+    draws velocity colour opaque over B-mode and adds no power tint, so there is no further layer.
+    """
+    velocity_range = _value_range(velocity, velocity_data)
+    gate = blood_gate(bmode_data, power_data, config=gate_config or BloodGateConfig(), region_mask=region)
+    velocity_gate = gate & _outside_middle_colormap_band(
+        velocity_data, value_range=velocity_range, hidden_fraction=_COLOR_DOPPLER_HIDDEN_CENTER_FRACTION
+    )
+    return cast(
+        np.ndarray,
+        compose_layers(
+            [
+                ImageLayer(
+                    data=bmode_data,
+                    cmap="grayscale",
+                    value_range=_value_range(bmode, bmode_data),
+                    mask=bmode_mask,
+                ),
+                ImageLayer(
+                    data=velocity_data if flow_rgb is None else flow_rgb,
+                    cmap=_own_colormap(velocity, "color_doppler_velocity"),
+                    alpha=_COLOR_DOPPLER_VELOCITY_ALPHA,
+                    mask=velocity_gate,
+                    value_range=velocity_range,
+                ),
+            ],
+            background=None,
+        ),
+    )
+
+
+def _cartesian_tissue_doppler(
+    bmode: LoadedArray,
+    tissue: LoadedArray,
+    *,
+    max_depth_m: float | None = None,
+    brightness_lift: float = 0.0,
+    gate_config: TissueGateConfig | None = None,
+) -> LoadedArray:
     bmode_geometry = _geometry(bmode)
     tissue_geometry = _geometry(tissue)
     bmode_data = np.asarray(bmode.data)
     timeline_source, timeline_timestamps = _cartesian_timeline_source(bmode, tissue)
-    grid = CartesianGrid.from_sector_height(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]))
-    frames = []
-    for index, time_s in enumerate(timeline_timestamps):
-        bmode_frame = _frame_at_time(bmode, float(time_s), fallback_index=index)
-        tissue_frame = _frame_at_time(tissue, time_s, fallback_index=index)
-        bmode_cart = sector_to_cartesian(bmode_frame, bmode_geometry, grid=grid, interpolation="linear")
-        tissue_rgba = _tissue_rgba_frame(tissue, tissue_frame)
-        tissue_cart = sector_to_cartesian(tissue_rgba, tissue_geometry, grid=grid, interpolation="linear")
-        region = bmode_cart.mask & tissue_cart.mask
-        gate = tissue_gate(
-            bmode_cart.data,
-            config=TissueGateConfig(),
-            region_mask=region,
+    grid = _display_grid(bmode_geometry, int(_frame_at(bmode_data, 0).shape[0]), max_depth_m)
+    # The velocity is interpolated as a phase on the aliasing circle, so neighbours across the Nyquist boundary blend
+    # into a velocity near the limit instead of a false value near zero; colouring happens afterwards.
+    bmode_stack = _cartesian_stack(bmode, bmode_geometry, grid, timeline_timestamps, interpolation="linear")
+    tissue_stack = _cartesian_wrapped_stack(
+        tissue, tissue_geometry, grid, timeline_timestamps, limit=abs(_value_range(tissue, np.asarray(tissue.data))[1])
+    )
+    bmode_mask = _within_depth(bmode_stack, max_depth_m)
+    region = bmode_mask & tissue_stack.mask
+    frames = [
+        _tissue_doppler_frame(
+            bmode=bmode,
+            tissue=tissue,
+            bmode_data=bmode_stack.data[index],
+            bmode_mask=bmode_mask,
+            tissue_data=tissue_stack.data[index],
+            region=region,
+            brightness_lift=brightness_lift,
+            gate_config=gate_config,
         )
-        frames.append(
-            _compose_tissue_overlay(
-                bmode=bmode,
-                bmode_data=bmode_cart.data,
-                bmode_mask=bmode_cart.mask,
-                tissue_rgba=tissue_cart.data,
-                tissue_mask=gate,
-            )
-        )
+        for index in range(len(timeline_timestamps))
+    ]
     return _cartesian_loaded(
         source=timeline_source,
         name="cartesian_tissue_doppler",
@@ -170,21 +279,74 @@ def _cartesian_tissue_doppler(bmode: LoadedArray, tissue: LoadedArray) -> Loaded
         timestamps=timeline_timestamps,
         attrs={
             "annotation_overlays": _combined_annotation_overlays(bmode, tissue),
+            "colormap": tissue.attrs.get("colormap"),
             "cartesian_colorbar_data_path": tissue.data_path,
+            "cartesian_colorbar_table": tissue.attrs.get("tissue_color_table"),
             "cartesian_colorbar_value_range": _value_range(tissue, np.asarray(tissue.data)),
         },
     )
 
 
-def _cartesian_single(loaded: LoadedArray) -> LoadedArray:
+def _tissue_doppler_frame(
+    *,
+    bmode: LoadedArray,
+    tissue: LoadedArray,
+    bmode_data: np.ndarray,
+    bmode_mask: np.ndarray,
+    tissue_data: np.ndarray,
+    region: np.ndarray,
+    brightness_lift: float = 0.0,
+    gate_config: TissueGateConfig | None = None,
+) -> np.ndarray:
+    """Composite one scan-converted tissue Doppler frame.
+
+    With the recording's brightness-style FlowColorTable the scanner indexes the table by the B-mode brightness of
+    each pixel (first axis) and the velocity phase code (second axis); without one the velocity ramp is scaled by
+    the B-mode brightness instead. Only pixels the tissue gate passes are coloured. ``brightness_lift`` moves the
+    normalised brightness that fraction of the way towards 1 before the table lookup, so dark tissue takes brighter
+    colours while bright tissue barely changes and near-black pixels stay dark.
+    """
+    gate = tissue_gate(bmode_data, config=gate_config or TissueGateConfig(), region_mask=region)
+    table = tissue.attrs.get("tissue_color_table")
+    if not isinstance(table, np.ndarray):
+        return _compose_tissue_overlay(
+            bmode=bmode,
+            bmode_data=bmode_data,
+            bmode_mask=bmode_mask,
+            tissue_rgba=_tissue_rgba_frame(tissue, tissue_data),
+            tissue_mask=gate,
+        )
+    base = np.asarray(
+        layer_to_rgba(
+            ImageLayer(
+                data=bmode_data,
+                cmap="grayscale",
+                value_range=_value_range(bmode, bmode_data),
+                mask=bmode_mask,
+            )
+        ),
+        dtype=np.float32,
+    )
+    low, high = _value_range(bmode, bmode_data)
+    brightness = np.clip((np.nan_to_num(bmode_data) - low) / (high - low), 0.0, 1.0)
+    # Lift dark tissue towards brighter table rows, bright tissue hardly, and the darkest pixels not at all.
+    brightness = brightness + float(brightness_lift) * (1.0 - brightness) * np.minimum(1.0, brightness / 0.15)
+    rows = np.clip(np.rint(255.0 * (_TISSUE_TABLE_SLOPE * brightness + _TISSUE_TABLE_OFFSET)), 0, 255).astype(np.intp)
+    limit = abs(_value_range(tissue, tissue_data)[1])
+    columns = color_flow_velocity_codes(np.nan_to_num(tissue_data), velocity_limit_mps=limit).astype(np.intp)
+    base[gate, :3] = table[rows[gate], columns[gate]].astype(np.float32) / 255.0
+    return base
+
+
+def _cartesian_single(loaded: LoadedArray, *, max_depth_m: float | None = None) -> LoadedArray:
     geometry = _geometry(loaded)
     data = np.asarray(loaded.data)
-    frame_count = _frame_count(data)
-    grid = CartesianGrid.from_sector_height(geometry, int(_frame_at(data, 0).shape[0]))
-    converted = []
-    for index in range(frame_count):
-        cart = sector_to_cartesian(_frame_at(data, index), geometry, grid=grid, interpolation="linear")
-        converted.append(_masked_rgba(loaded, cart.data, cart.mask))
+    grid = _display_grid(geometry, int(_frame_at(data, 0).shape[0]), max_depth_m)
+    stack = sector_stack_to_cartesian_array(
+        data if data.ndim >= 3 else data[np.newaxis], geometry, grid=grid, interpolation=_interpolation_for(loaded)
+    )
+    mask = _within_depth(stack, max_depth_m)
+    converted = [_masked_rgba(loaded, frame, mask) for frame in stack.data]
     return _cartesian_loaded(
         source=loaded,
         name=f"cartesian_{loaded.name}",
@@ -194,13 +356,85 @@ def _cartesian_single(loaded: LoadedArray) -> LoadedArray:
     )
 
 
+def _interpolation_for(loaded: LoadedArray) -> Interpolation:
+    """Nearest sampling for Doppler scalars, linear for everything else."""
+    return "nearest" if "doppler" in loaded.data_path and "brightness" not in loaded.data_path else "linear"
+
+
+def _cartesian_stack(
+    loaded: LoadedArray,
+    geometry: SectorGeometry,
+    grid: CartesianGrid,
+    timestamps: np.ndarray,
+    *,
+    interpolation: Interpolation,
+) -> CartesianImage:
+    """Scan-convert the frames nearest to each timeline time in one call, sharing a single lookup."""
+    data = np.asarray(loaded.data)
+    stack = data if data.ndim >= 3 else data[np.newaxis]
+    indices = [_frame_index_at_time(loaded, float(t), fallback_index=i) for i, t in enumerate(timestamps)]
+    return sector_stack_to_cartesian_array(stack[indices], geometry, grid=grid, interpolation=interpolation)
+
+
+def _cartesian_wrapped_stack(
+    loaded: LoadedArray, geometry: SectorGeometry, grid: CartesianGrid, timestamps: np.ndarray, *, limit: float
+) -> CartesianImage:
+    """Scan-convert a velocity that wraps at ``±limit`` with linear interpolation on the aliasing circle."""
+    data = np.asarray(loaded.data, dtype=np.float32)
+    stack = data if data.ndim >= 3 else data[np.newaxis]
+    indices = [_frame_index_at_time(loaded, float(t), fallback_index=i) for i, t in enumerate(timestamps)]
+    sampled = sector_stack_to_cartesian_array(
+        wrapped_velocity_to_phasor(stack[indices], limit=limit), geometry, grid=grid, interpolation="linear"
+    )
+    return CartesianImage(data=phasor_to_wrapped_velocity(sampled.data, limit=limit), mask=sampled.mask, grid=grid)
+
+
+def wrapped_velocity_to_phasor(velocity: np.ndarray, *, limit: float) -> np.ndarray:
+    """``[..., 2]`` cosine and sine of the velocity's phase ``pi * v / limit``; NaN velocities map to zero."""
+    phase = np.pi * np.nan_to_num(np.asarray(velocity, dtype=np.float32)) / np.float32(max(float(limit), 1e-12))
+    return np.stack((np.cos(phase), np.sin(phase)), axis=-1).astype(np.float32)
+
+
+def phasor_to_wrapped_velocity(phasor: np.ndarray, *, limit: float) -> np.ndarray:
+    """Inverse of :func:`wrapped_velocity_to_phasor`; interpolated phasors give the velocity of their mean phase."""
+    phasor = np.asarray(phasor, dtype=np.float32)
+    velocity: np.ndarray = np.arctan2(phasor[..., 1], phasor[..., 0]) / np.pi * np.float32(limit)
+    return velocity.astype(np.float32)
+
+
+def _cartesian_flow_color_stack(
+    velocity: LoadedArray, geometry: SectorGeometry, grid: CartesianGrid, timestamps: np.ndarray
+) -> np.ndarray | None:
+    """Colour native codes through the table, then interpolate displayed RGB onto the Cartesian grid.
+
+    The table is looked up on exact native codes. Interpolating displayed colours preserves mixed green/cyan
+    boundaries; packed indices and wrapped scalar velocities must never be interpolated as ordinary numbers.
+    Returns `float32` `(T, H, W, 3)` in `[0, 1]`, or None when the velocity array carries no codes or table.
+    """
+    codes = velocity.attrs.get("flow_color_codes")
+    table = velocity.attrs.get("flow_color_table")
+    if not isinstance(codes, np.ndarray) or not isinstance(table, np.ndarray):
+        return None
+    rgb = velocity.attrs.get("flow_color_rgb")
+    if not isinstance(rgb, np.ndarray) or rgb.shape != (*codes.shape, 3):
+        rgb = table[(codes >> 8).astype(np.intp), (codes & 255).astype(np.intp)]
+    sampled = _cartesian_stack(replace(velocity, data=rgb), geometry, grid, timestamps, interpolation="linear")
+    return np.asarray(sampled.data, dtype=np.float32) / np.float32(255.0)
+
+
+def _own_colormap(loaded: LoadedArray, fallback: str) -> Colormap | str:
+    """Return the colormap loaded with the array, else the configured name."""
+    own = loaded.attrs.get("colormap")
+    return own if isinstance(own, Colormap) else fallback
+
+
 def _masked_rgba(loaded: LoadedArray, data: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cast(
         np.ndarray,
         layer_to_rgba(
             ImageLayer(
                 data=data,
-                cmap=loaded.data_path,
+                cmap=_own_colormap(loaded, loaded.data_path),
                 value_range=_value_range(loaded, data),
                 mask=mask,
             )
@@ -293,7 +527,7 @@ def _tissue_rgba_frame(tissue: LoadedArray, tissue_frame: np.ndarray) -> np.ndar
         layer_to_rgba(
             ImageLayer(
                 data=tissue_frame,
-                cmap="tissue_doppler",
+                cmap=_own_colormap(tissue, "tissue_doppler"),
                 value_range=_value_range(tissue, tissue_frame),
             )
         ),
@@ -392,12 +626,10 @@ def _frame_at(data: np.ndarray, index: int) -> np.ndarray:
     return arr
 
 
-def _frame_at_time(loaded: LoadedArray, time_s: float, *, fallback_index: int) -> np.ndarray:
-    data = np.asarray(loaded.data)
+def _frame_index_at_time(loaded: LoadedArray, time_s: float, *, fallback_index: int) -> int:
     if loaded.timestamps is None:
-        return _frame_at(data, fallback_index)
+        return fallback_index
     timestamps = np.asarray(loaded.timestamps, dtype=np.float64).reshape(-1)
     if timestamps.size == 0:
-        return _frame_at(data, fallback_index)
-    index = int(np.argmin(np.abs(timestamps - float(time_s))))
-    return _frame_at(data, index)
+        return fallback_index
+    return int(np.argmin(np.abs(timestamps - float(time_s))))

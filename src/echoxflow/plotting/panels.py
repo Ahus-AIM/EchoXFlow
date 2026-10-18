@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
 import numpy as np
 from matplotlib import colormaps, patheffects
+from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.colors import Colormap, Normalize
 from matplotlib.patches import Polygon, Rectangle
@@ -17,50 +21,110 @@ from echoxflow.plotting.colorbar import colorbar_spec_for_modality, draw_top_rig
 from echoxflow.plotting.specs import PanelKind, PanelSpec, TraceSpec
 from echoxflow.plotting.style import PlotStyle
 from echoxflow.plotting.timeline import nearest_index, temporal_length
+from echoxflow.scan.contours import ContourGroupLayout
 from echoxflow.scan.geometry import CartesianGrid, SectorGeometry, sector_geometry_from_mapping
-from echoxflow.scan.matplotlib import SectorDepthRuler, draw_sector_depth_ruler
+from echoxflow.scan.matplotlib import SectorDepthRuler, draw_sector_depth_ruler, sector_depth_ticks
 from echoxflow.scan.rasterization import points_to_sector_indices
+from echoxflow.scan.spherical import MosaicCell, MosaicSlicePlane, SphericalGeometry, SphericalMosaicLayout
+from echoxflow.schema import semantic_name
 from echoxflow.spectral import SpectralMetadata
 from echoxflow.streams import default_value_range_for_path
 
 
+@dataclass(frozen=True)
+class PanelArtists:
+    """Handle returned by a panel renderer to move an already drawn panel to another frame.
+
+    ``update(time_s, frame_index)`` touches only per-frame artists; the axes, ticks, labels,
+    colour bars and layout stay as drawn by the first frame.
+    """
+
+    update: Callable[[float, int], None]
+
+
 class PanelRenderer(Protocol):
-    def render(self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle) -> None:
+    def render(
+        self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle
+    ) -> PanelArtists | None:
         pass
 
 
+@contextmanager
+def _collect_new_artists(ax: Axes, sink: list[Artist]) -> Iterator[None]:
+    """Record every artist added to ``ax`` inside the block into ``sink``."""
+    before = set(ax.get_children())
+    try:
+        yield
+    finally:
+        sink.extend(child for child in ax.get_children() if child not in before)
+
+
+def _remove_artists(artists: list[Artist]) -> None:
+    for artist in artists:
+        artist.remove()
+    artists.clear()
+
+
 class ImagePanelRenderer:
-    def render(self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle) -> None:
+    def render(
+        self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle
+    ) -> PanelArtists | None:
         count = temporal_length(panel.loaded.data)
-        index = nearest_index(panel.loaded.timestamps, time_s, count=count, fallback_index=frame_index)
-        data = np.asarray(panel.loaded.data)
-        frame = _display_frame(data[index] if _has_temporal_axis(panel, count) else data)
-        cmap = None if frame.ndim == 3 else _transparent_bad_colormap(named_listed_colormap(panel.loaded.data_path))
+        flow_rgb = panel.loaded.attrs.get("flow_color_rgb") if panel.view != "cartesian" else None
+        data = np.asarray(flow_rgb if isinstance(flow_rgb, np.ndarray) else panel.loaded.data)
+
+        def frame_at(time: float, frame: int) -> tuple[int, np.ndarray]:
+            index = nearest_index(panel.loaded.timestamps, time, count=count, fallback_index=frame)
+            return index, _display_frame(data[index] if _has_temporal_axis(panel, count) else data)
+
+        index, frame = frame_at(time_s, frame_index)
+        cmap = None if frame.ndim == 3 else _transparent_bad_colormap(panel_colormap(panel.loaded))
         norm = None if frame.ndim == 3 else fixed_normalize(panel.loaded, frame)
         grid = _cartesian_grid(panel)
-        ax.imshow(
+        image = ax.imshow(
             frame,
             cmap=cmap or _transparent_bad_colormap("gray"),
             norm=norm,
             interpolation="nearest",
-            aspect="equal" if grid is not None else "auto",
+            aspect="equal" if _is_physical_image(panel, grid) else "auto",
             extent=_cartesian_extent(grid),
         )
-        _draw_image_annotations(ax, panel, time_s=time_s, frame_index=index, frame_shape=frame.shape[:2], style=style)
+        ax.set_anchor("C")
+        overlay_artists: list[Artist] = []
+
+        def draw_overlays(time: float, frame_idx: int, shown: np.ndarray) -> None:
+            with _collect_new_artists(ax, overlay_artists):
+                _draw_image_annotations(
+                    ax, panel, time_s=time, frame_index=frame_idx, frame_shape=shown.shape[:2], style=style
+                )
+
+        draw_overlays(time_s, index, frame)
         _draw_color_doppler_extent(ax, panel, frame_shape=frame.shape[:2], style=style)
         colorbar_cmap = _colorbar_colormap(panel, cmap)
         if colorbar_cmap is not None and (colorbar_spec := _colorbar_spec(panel)) is not None:
             draw_top_right_colorbar(ax, colorbar_cmap, colorbar_spec, style=style)
         _draw_cartesian_depth_ruler(ax, panel, style=style)
+        _draw_mosaic_depth_guides(ax, panel, style=style)
         _finish_panel(ax, panel.label, style)
+
+        def update(time: float, frame_idx: int) -> None:
+            # The normalisation is fixed per stream, so only the pixels and the overlays change.
+            new_index, new_frame = frame_at(time, frame_idx)
+            image.set_data(new_frame)
+            _remove_artists(overlay_artists)
+            draw_overlays(time, new_index, new_frame)
+
+        return PanelArtists(update)
 
 
 class MatrixPanelRenderer:
-    def render(self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle) -> None:
+    def render(
+        self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle
+    ) -> PanelArtists | None:
         del frame_index
         matrix = _display_matrix(np.asarray(panel.loaded.data))
         timestamps = panel.loaded.timestamps
-        cmap = named_listed_colormap(panel.loaded.data_path) or "magma"
+        cmap = panel_colormap(panel.loaded) or "magma"
         norm = fixed_normalize(panel.loaded, matrix)
         if timestamps is not None:
             ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
@@ -75,13 +139,13 @@ class MatrixPanelRenderer:
                     origin=_matrix_origin(panel),
                     extent=extent,
                 )
-                ax.axvline(float(time_s), color=style.cursor_color, linewidth=1.4)
+                cursor = ax.axvline(float(time_s), color=style.cursor_color, linewidth=1.4)
                 _draw_matrix_annotations(ax, panel, time_s=time_s, y_size=y_size, style=style)
                 if not isinstance(cmap, str) and (colorbar_spec := _colorbar_spec(panel)) is not None:
                     draw_top_right_colorbar(ax, cmap, colorbar_spec, style=style)
                 _finish_panel(ax, panel.label, style)
                 _configure_matrix_y_axis(ax, panel, y_size=y_size, style=style)
-                return
+                return PanelArtists(lambda time, _frame: cursor.set_xdata([float(time), float(time)]))
         y_size = matrix.shape[1]
         ax.imshow(
             matrix.T,
@@ -96,10 +160,13 @@ class MatrixPanelRenderer:
             draw_top_right_colorbar(ax, cmap, colorbar_spec, style=style)
         _finish_panel(ax, panel.label, style)
         _configure_matrix_y_axis(ax, panel, y_size=y_size, style=style)
+        return PanelArtists(lambda _time, _frame: None)  # no cursor: the panel is identical on every frame
 
 
 class LinePanelRenderer:
-    def render(self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle) -> None:
+    def render(
+        self, ax: Axes, panel: PanelSpec, *, time_s: float, frame_index: int, style: PlotStyle
+    ) -> PanelArtists | None:
         del frame_index
         values = np.asarray(panel.loaded.data, dtype=np.float32)
         timestamps = panel.loaded.timestamps
@@ -112,12 +179,84 @@ class LinePanelRenderer:
                 color=_line_trace_color(index, len(traces), colors, style=style),
                 linewidth=1.0,
             )
-        if x.size:
-            ax.axvline(float(time_s), color=style.cursor_color, linewidth=1.4)
+        cursor = ax.axvline(float(time_s), color=style.cursor_color, linewidth=1.4) if x.size else None
         _finish_panel(ax, panel.label, style)
+        _draw_line_markers(ax, panel, style)
+        if cursor is None:
+            return PanelArtists(lambda _time, _frame: None)
+        return PanelArtists(lambda time, _frame: cursor.set_xdata([float(time), float(time)]))
+
+
+def _draw_line_markers(ax: Axes, panel: PanelSpec, style: PlotStyle) -> None:
+    """Mark labelled points on a line panel (such as end-diastole and end-systole) with small captions."""
+    markers = panel.loaded.attrs.get("line_markers")
+    if not isinstance(markers, tuple) or not markers:
+        return
+    ax.margins(y=0.35)
+    for x, y, text in markers:
+        ax.plot([x], [y], marker="o", markersize=3.0, color=style.line_color, linestyle="None")
+        ax.annotate(
+            text,
+            (x, y),
+            xytext=(4, -3),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            fontsize=0.75 * style.axis_tick_label_fontsize,
+            color=style.text_color,
+            clip_on=True,
+        )
+
+
+def panel_label_lines(panel: PanelSpec) -> tuple[str, ...]:
+    """Return the stream name and, for image and matrix panels, the array dtype and shape or `cartesian`."""
+    name = semantic_name(panel.loaded.data_path)
+    if panel.kind == "image" and (view := panel.loaded.attrs.get("strain_source_view")):
+        return (f"{view} B-mode", panel.view)
+    if panel.kind == "line":
+        return (str(panel.loaded.attrs.get("line_label", name)),)
+    if panel.view == "cartesian" and panel.kind == "image":
+        return (name.removeprefix("cartesian_"), "cartesian")
+    data = np.asarray(panel.loaded.data)
+    return (name, f"{data.dtype} {'×'.join(str(size) for size in data.shape)}")
+
+
+def draw_panel_label(ax: Axes, panel: PanelSpec, style: PlotStyle) -> None:
+    """Write the panel's stream name and array description in its top-left corner.
+
+    Call after the layout is final: the font shrinks until the longest line fits the axes width.
+    """
+    if panel.kind in {"strain_curves", "bullseye"}:
+        if style.show_panel_labels:
+            ax.set_title(panel.label, color=style.text_color, fontsize=style.panel_label_fontsize, pad=16)
+        return
+    if not style.show_panel_labels:
+        return
+    text = ax.text(
+        0.012,
+        0.988,
+        "\n".join(panel_label_lines(panel)),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=style.panel_label_fontsize,
+        color=style.text_color,
+        linespacing=1.2,
+        zorder=20,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": style.panel_facecolor, "edgecolor": "none", "alpha": 0.6},
+    )
+    renderer = ax.figure.canvas.get_renderer()  # type: ignore[attr-defined]
+    available = 0.9 * ax.get_window_extent(renderer).width
+    width = text.get_window_extent(renderer).width
+    if width > available > 0.0:
+        text.set_fontsize(max(6.0, style.panel_label_fontsize * available / width))
 
 
 def renderer_for(kind: PanelKind) -> PanelRenderer:
+    if kind in {"strain_curves", "bullseye"}:
+        from echoxflow.plotting.strain import BullseyePanelRenderer, StrainCurvePanelRenderer
+
+        return BullseyePanelRenderer() if kind == "bullseye" else StrainCurvePanelRenderer()
     if kind == "image":
         return ImagePanelRenderer()
     if kind == "matrix":
@@ -191,6 +330,13 @@ def _draw_image_annotations(
         xy = _annotation_image_xy(panel, points[:, :2], frame_shape=frame_shape)
         if xy is None or xy.size == 0:
             continue
+        layout = overlay.get("group_layout")
+        if isinstance(layout, ContourGroupLayout):
+            grid = _contour_point_grid(xy, layout)
+            if grid is not None:
+                _draw_contour_boundaries(ax, grid, layout, style=style)
+                _draw_annotation_label(ax, overlay, grid[:, int(layout.endo_index), :], style=style)
+                continue
         if xy.shape[0] >= 2:
             ax.plot(
                 xy[:, 0],
@@ -229,6 +375,80 @@ def _draw_image_annotations(
             zorder=8.3,
         )
         _draw_annotation_label(ax, overlay, xy, style=style)
+
+
+def _contour_point_grid(xy: np.ndarray, layout: ContourGroupLayout) -> np.ndarray | None:
+    size = int(layout.group_size)
+    if size < 2 or xy.shape[0] < size or xy.shape[0] % size != 0:
+        return None
+    grid = xy.reshape(-1, size, 2)
+    grid = grid[np.all(np.isfinite(grid), axis=(1, 2))]
+    return grid if grid.shape[0] > 0 else None
+
+
+def _draw_contour_boundaries(ax: Axes, grid: np.ndarray, layout: ContourGroupLayout, *, style: PlotStyle) -> None:
+    """Draw a strain tracking grid with the mid-wall row emphasised.
+
+    The mid row is a bright polyline with round markers; rows toward the
+    borders fade to small dim dots, and the outermost rows keep a faint thin
+    outline so the ROI stays legible.
+    """
+    del layout
+    size = grid.shape[1]
+    mid = size // 2
+    marker_size = style.annotation_markersize
+    for column in range(size):
+        pts = grid[:, column, :]
+        distance = abs(column - mid)
+        if distance == 0:
+            if pts.shape[0] >= 2:
+                ax.plot(
+                    pts[:, 0],
+                    pts[:, 1],
+                    color=style.annotation_edge_color,
+                    linewidth=style.annotation_linewidth * 1.4 + 1.0,
+                    alpha=0.8,
+                    zorder=8.0,
+                )
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                color=style.annotation_color,
+                linewidth=style.annotation_linewidth * 1.4,
+                alpha=0.95,
+                marker="o",
+                markersize=marker_size * 1.3,
+                markerfacecolor=style.annotation_color,
+                markeredgecolor=style.annotation_edge_color,
+                markeredgewidth=0.8,
+                zorder=8.3,
+            )
+            continue
+        if distance == 1:
+            scale, alpha = 0.8, 0.7
+        else:
+            scale, alpha = 0.55, 0.45
+            if pts.shape[0] >= 2:
+                ax.plot(
+                    pts[:, 0],
+                    pts[:, 1],
+                    color=style.annotation_color,
+                    linewidth=style.annotation_linewidth * 0.6,
+                    alpha=0.35,
+                    zorder=8.1,
+                )
+        ax.plot(
+            pts[:, 0],
+            pts[:, 1],
+            linestyle="None",
+            marker="o",
+            markersize=marker_size * scale,
+            markerfacecolor=style.annotation_color,
+            markeredgecolor=style.annotation_edge_color,
+            markeredgewidth=0.4,
+            alpha=alpha,
+            zorder=8.2,
+        )
 
 
 def _draw_sampling_gate_annotation(
@@ -530,9 +750,12 @@ def _draw_matrix_annotations(
     style: PlotStyle,
 ) -> None:
     del time_s
-    for overlay in _annotation_overlays(panel, kind="spectral_points"):
+    for overlay in _annotation_overlays(panel, kind=("spectral_points", "spectral_trace")):
+        is_trace = overlay.get("kind") == "spectral_trace"
         points = np.asarray(overlay.get("points"), dtype=np.float32)
-        if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] < 2:
+        if points.ndim != 2 or points.shape[1] < 2:
+            raise ValueError(f"Spectral annotation {overlay.get('path')!r} needs time/value pairs, got {points.shape}")
+        if points.shape[0] == 0:
             continue
         x = points[:, 0]
         if _is_mmode_panel(panel):
@@ -540,7 +763,21 @@ def _draw_matrix_annotations(
             if y is None:
                 continue
         else:
-            y = _spectral_annotation_y_to_display_y(panel, overlay, points[:, 1], y_size=y_size)
+            y = _spectral_annotation_y_to_display_y(panel, overlay, points[:, 1], y_size=y_size, times=x)
+        geometry = overlay.get("geometry_kind")
+        if geometry in {"segment", "segments"}:
+            for begin in range(0, len(x) - 1, 2):
+                trace_x, trace_y = _spectral_trace_with_breaks(
+                    panel, x[begin : begin + 2], y[begin : begin + 2], overlay
+                )
+                _draw_spectral_trace(ax, trace_x, trace_y, style=style)
+            _draw_annotation_label(ax, overlay, np.column_stack([x, y]), style=style)
+            continue
+        if geometry == "polyline" or (geometry is None and is_trace):
+            trace_x, trace_y = _spectral_trace_with_breaks(panel, x, y, overlay)
+            _draw_spectral_trace(ax, trace_x, trace_y, style=style)
+            _draw_annotation_label(ax, overlay, np.column_stack([x, y]), style=style)
+            continue
         ax.plot(
             x,
             y,
@@ -564,11 +801,52 @@ def _draw_matrix_annotations(
         _draw_annotation_label(ax, overlay, np.column_stack([x, y]), style=style)
 
 
-def _annotation_overlays(panel: PanelSpec, *, kind: str) -> tuple[Mapping[object, object], ...]:
+def _spectral_trace_with_breaks(
+    panel: PanelSpec, x: np.ndarray, y: np.ndarray, overlay: Mapping[object, object] | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Do not join physical curves across native gaps, segment boundaries or calibration changes."""
+    clock = panel.loaded.timestamps
+    if clock is None or len(x) < 2:
+        return x, y
+    columns, runs = _spectral_annotation_columns(panel, x, overlay)
+    metadata = panel.loaded.attrs.get("spectral_metadata")
+    calibration = metadata.calibration if isinstance(metadata, SpectralMetadata) else None
+    output_x, output_y = [float(x[0])], [float(y[0])]
+    for index in range(1, len(x)):
+        low, high = sorted((columns[index - 1], columns[index]))
+        broken = low < 0 or runs[index - 1] != runs[index]
+        if not broken and calibration is not None:
+            broken = any(
+                values is not None and not np.all(values[low : high + 1] == values[low])
+                for values in (calibration.baseline_fraction, calibration.nyquist_mps)
+            )
+        if broken:
+            output_x.append(np.nan)
+            output_y.append(np.nan)
+        output_x.append(float(x[index]))
+        output_y.append(float(y[index]))
+    return np.asarray(output_x), np.asarray(output_y)
+
+
+def _draw_spectral_trace(ax: Axes, x: np.ndarray, y: np.ndarray, *, style: PlotStyle) -> None:
+    ax.plot(x, y, color=style.annotation_edge_color, linewidth=3.2, zorder=8.0, solid_capstyle="round")
+    ax.plot(
+        x,
+        y,
+        color=style.annotation_color,
+        linewidth=1.6,
+        zorder=8.1,
+        solid_capstyle="round",
+        marker="+" if len(x) == 1 or np.isnan(x).any() else None,
+    )
+
+
+def _annotation_overlays(panel: PanelSpec, *, kind: str | tuple[str, ...]) -> tuple[Mapping[object, object], ...]:
     raw = panel.loaded.attrs.get("annotation_overlays")
     if not isinstance(raw, tuple):
         return ()
-    return tuple(overlay for overlay in raw if isinstance(overlay, Mapping) and overlay.get("kind") == kind)
+    kinds = (kind,) if isinstance(kind, str) else kind
+    return tuple(overlay for overlay in raw if isinstance(overlay, Mapping) and overlay.get("kind") in kinds)
 
 
 def _draw_annotation_label(
@@ -718,14 +996,15 @@ def _spectral_annotation_y_to_display_y(
     values: np.ndarray,
     *,
     y_size: int,
+    times: np.ndarray | None = None,
 ) -> np.ndarray:
     y = np.asarray(values, dtype=np.float32)
     unit_hint = _spectral_annotation_y_unit(overlay)
     coordinate_hint = _spectral_annotation_y_coordinate_system(overlay)
     if _is_spectral_centimeters_per_second_hint(unit_hint):
-        return _spectral_velocity_to_display_y(panel, y / 100.0, y_size=y_size)
+        return _spectral_velocity_to_display_y(panel, y / 100.0, y_size=y_size, times=times, overlay=overlay)
     if _is_spectral_meters_per_second_hint(unit_hint):
-        return _spectral_velocity_to_display_y(panel, y, y_size=y_size)
+        return _spectral_velocity_to_display_y(panel, y, y_size=y_size, times=times, overlay=overlay)
     if _is_spectral_row_coordinate_hint(coordinate_hint):
         return _spectral_row_to_display_y(
             panel,
@@ -733,28 +1012,93 @@ def _spectral_annotation_y_to_display_y(
             y_size=y_size,
             use_cursor_box=_is_spectral_image_coordinate_hint(coordinate_hint),
         )
+    if unit_hint is not None:
+        return np.full(y.shape, np.nan, dtype=np.float32)
 
     axis = _spectral_velocity_axis(panel)
-    if axis is not None:
-        if _values_fit_range(y, axis):
-            return _spectral_velocity_to_display_y(panel, y, y_size=y_size)
-        if _values_look_like_panel_rows(y, y_size=y_size):
-            return _spectral_row_to_display_y(panel, y, y_size=y_size, use_cursor_box=False)
-        if _values_look_like_cursor_box_rows(panel, y):
-            return _spectral_row_to_display_y(panel, y, y_size=y_size, use_cursor_box=True)
-        y_mps = y / 100.0
-        if _values_fit_range(y_mps, axis) and _values_look_like_centimeters_per_second(y, axis):
-            return _spectral_velocity_to_display_y(panel, y_mps, y_size=y_size)
-    return _spectral_velocity_to_display_y(panel, y, y_size=y_size)
+    # Unlabelled legacy overlays without calibration may already contain panel rows.
+    if coordinate_hint is None and panel.loaded.attrs.get("spectral_metadata") is None:
+        finite = y[np.isfinite(y)]
+        upper = float(max(0, y_size - 1))
+        if finite.size and np.all((finite >= -0.5) & (finite <= upper + 0.5)):
+            if np.ptp(finite) >= max(2.0, 0.25 * upper):
+                return _spectral_row_to_display_y(panel, y, y_size=y_size, use_cursor_box=False)
+    # Compatibility for unlabelled legacy velocity traces with a known physical axis.
+    if axis is not None and coordinate_hint is None and _values_look_like_centimeters_per_second(y, axis):
+        if _values_fit_range(y / 100.0, axis):
+            y = y / 100.0
+    return _spectral_velocity_to_display_y(panel, y, y_size=y_size, times=times, overlay=overlay)
 
 
-def _spectral_velocity_to_display_y(panel: PanelSpec, velocity_mps: np.ndarray, *, y_size: int) -> np.ndarray:
+def _spectral_annotation_columns(
+    panel: PanelSpec, times: np.ndarray, overlay: Mapping[object, object] | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve points to native columns and clock runs; ambiguous ownership stays -1."""
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    columns = np.full(times.size, -1, dtype=int)
+    runs = np.full(times.size, -1, dtype=int)
+    matches = np.zeros(times.size, dtype=int)
+    clock = panel.loaded.timestamps
+    offsets = panel.loaded.attrs.get("spectral_segment_offsets")
+    links = {} if overlay is None else overlay.get("links", {})
+    segment_index = links.get("segment_index") if isinstance(links, Mapping) else None
+    if clock is None or (segment_index is not None and offsets is None):
+        return columns, runs
+    clock = np.asarray(clock, dtype=np.float64).reshape(-1)
+    delta = np.diff(clock)
+    positive = delta[np.isfinite(delta) & (delta > 0)]
+    gap = 3 * np.median(positive) if positive.size else np.inf
+    boundaries = {0, len(clock), *(np.flatnonzero(~np.isfinite(delta) | (delta <= 0) | (delta > gap)) + 1)}
+    if offsets is not None:
+        boundaries.update(int(i) for i in np.asarray(offsets).reshape(-1) if 0 < i < len(clock))
+    ordered = sorted(boundaries)
+    for run, (begin, end) in enumerate(zip(ordered[:-1], ordered[1:], strict=True)):
+        if segment_index is not None and np.searchsorted(np.asarray(offsets), begin, side="right") - 1 != segment_index:
+            continue
+        selected = np.flatnonzero(np.isfinite(times) & (clock[begin] <= times) & (times <= clock[end - 1]))
+        right = np.clip(np.searchsorted(clock[begin:end], times[selected]) + begin, begin, end - 1)
+        left = np.maximum(begin, right - 1)
+        columns[selected] = np.where(
+            abs(times[selected] - clock[left]) <= abs(clock[right] - times[selected]), left, right
+        )
+        runs[selected] = run
+        matches[selected] += 1
+    columns[matches != 1] = runs[matches != 1] = -1
+    return columns, runs
+
+
+def _spectral_velocity_to_display_y(
+    panel: PanelSpec,
+    velocity_mps: np.ndarray,
+    *,
+    y_size: int,
+    times: np.ndarray | None = None,
+    overlay: Mapping[object, object] | None = None,
+) -> np.ndarray:
+    metadata = panel.loaded.attrs.get("spectral_metadata")
+    velocity = np.asarray(velocity_mps, dtype=np.float32)
+    result = np.full(velocity.shape, np.nan, dtype=np.float32)
+    if isinstance(metadata, SpectralMetadata) and metadata.calibration is not None:
+        calibration = metadata.calibration
+        valid = calibration.calibrated_columns()
+        if valid is None or times is None:
+            return result
+        if panel.loaded.timestamps is None or len(panel.loaded.timestamps) != len(valid):
+            return result
+        columns, _ = _spectral_annotation_columns(panel, times, overlay)
+        points = np.flatnonzero(columns >= 0)
+        points = points[valid[columns[points]]]
+        baseline = np.asarray(calibration.baseline_fraction)[columns[points]]
+        nyquist = np.asarray(calibration.nyquist_mps)[columns[points]]
+        native_rows = y_size * (1 - baseline + velocity.flat[points] / (2 * nyquist))
+        result.flat[points] = np.where((0 <= native_rows) & (native_rows <= y_size), native_rows, np.nan)
+        return result
     axis = _spectral_velocity_axis(panel)
     if axis is not None:
         rows = np.linspace(float(y_size) - 0.5, 0.5, axis.size, dtype=np.float32)
         order = np.argsort(axis)
-        return np.interp(np.asarray(velocity_mps, dtype=np.float32), axis[order], rows[order]).astype(np.float32)
-    return np.clip(np.asarray(velocity_mps, dtype=np.float32), 0.0, float(max(0, int(y_size) - 1)))
+        return np.interp(velocity, axis[order], rows[order], left=np.nan, right=np.nan).astype(np.float32)
+    return result
 
 
 def _spectral_velocity_axis(panel: PanelSpec) -> np.ndarray | None:
@@ -822,6 +1166,7 @@ def _is_spectral_centimeters_per_second_hint(value: str | None) -> bool:
         "cm_s",
         "cms",
         "cm_per_s",
+        "s_cmps",
         "cm_per_second",
         "centimeter_per_second",
         "centimeters_per_second",
@@ -829,7 +1174,7 @@ def _is_spectral_centimeters_per_second_hint(value: str | None) -> bool:
 
 
 def _is_spectral_meters_per_second_hint(value: str | None) -> bool:
-    return value in {"m/s", "m_s", "mps", "m_per_s", "m_per_second", "meter_per_second", "meters_per_second"}
+    return value in {"m/s", "m_s", "mps", "s_mps", "m_per_s", "m_per_second", "meter_per_second", "meters_per_second"}
 
 
 def _is_spectral_row_coordinate_hint(value: str | None) -> bool:
@@ -849,41 +1194,10 @@ def _values_fit_range(values: np.ndarray, reference: np.ndarray) -> bool:
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
         return False
-    ref = np.asarray(reference, dtype=np.float32)
-    ref = ref[np.isfinite(ref)]
-    if ref.size == 0:
-        return False
-    ref_min = float(np.min(ref))
-    ref_max = float(np.max(ref))
+    ref_min = float(np.min(reference))
+    ref_max = float(np.max(reference))
     tolerance = max(1e-3, 0.05 * max(abs(ref_max - ref_min), 1e-3))
     return float(np.min(finite)) >= ref_min - tolerance and float(np.max(finite)) <= ref_max + tolerance
-
-
-def _values_look_like_panel_rows(values: np.ndarray, *, y_size: int) -> bool:
-    finite = np.asarray(values, dtype=np.float32)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return False
-    upper = float(max(0, int(y_size) - 1))
-    if float(np.min(finite)) < -0.5 or float(np.max(finite)) > upper + 0.5:
-        return False
-    return float(np.max(finite) - np.min(finite)) >= max(2.0, 0.25 * upper)
-
-
-def _values_look_like_cursor_box_rows(panel: PanelSpec, values: np.ndarray) -> bool:
-    metadata = panel.loaded.attrs.get("spectral_metadata")
-    if not isinstance(metadata, SpectralMetadata) or metadata.cursor_box is None:
-        return False
-    finite = np.asarray(values, dtype=np.float32)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return False
-    box = metadata.cursor_box
-    lower = float(box.y)
-    upper = float(box.y + max(0.0, box.height - 1.0))
-    if float(np.min(finite)) < lower - 0.5 or float(np.max(finite)) > upper + 0.5:
-        return False
-    return float(np.max(finite) - np.min(finite)) >= max(2.0, 0.25 * max(1.0, float(box.height) - 1.0))
 
 
 def _values_look_like_centimeters_per_second(values: np.ndarray, velocity_axis_mps: np.ndarray) -> bool:
@@ -891,11 +1205,7 @@ def _values_look_like_centimeters_per_second(values: np.ndarray, velocity_axis_m
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
         return False
-    axis = np.asarray(velocity_axis_mps, dtype=np.float32)
-    axis = axis[np.isfinite(axis)]
-    if axis.size == 0:
-        return False
-    return float(np.max(np.abs(finite))) >= max(10.0, 4.0 * float(np.max(np.abs(axis))))
+    return float(np.max(np.abs(finite))) >= max(10.0, 4.0 * float(np.max(np.abs(velocity_axis_mps))))
 
 
 def _is_mmode_panel(panel: PanelSpec) -> bool:
@@ -993,15 +1303,26 @@ def _mmode_annotation_depth_cm(
 def _configure_matrix_y_axis(ax: Axes, panel: PanelSpec, *, y_size: int, style: PlotStyle) -> None:
     if not _is_1d_matrix_panel(panel):
         return
-    ticks, tick_labels, label = _matrix_y_ticks(panel, y_size=y_size)
+    ticks, tick_labels, unit, baseline = _matrix_y_ticks(panel, y_size=y_size)
     if not ticks:
         return
     original_ylim = ax.get_ylim()
     ax.set_yticks(ticks)
     ax.set_yticklabels(tick_labels)
-    ax.set_ylabel(label, color=style.text_dim_color, fontsize=style.axis_tick_label_fontsize)
+    ax.set_ylabel("")
     ax.yaxis.set_ticks_position("left")
-    ax.yaxis.set_label_position("left")
+    tag = ax.text(
+        1.008,
+        baseline,
+        unit,
+        transform=ax.get_yaxis_transform(),
+        color=style.text_dim_color,
+        fontsize=0.8 * style.axis_tick_label_fontsize,
+        ha="left",
+        va="center",
+        clip_on=False,
+    )
+    tag.set_in_layout(False)  # sits in the margin without shrinking the strip against the ECG
     ax.tick_params(
         axis="y",
         left=True,
@@ -1020,14 +1341,15 @@ def _configure_matrix_y_axis(ax: Axes, panel: PanelSpec, *, y_size: int, style: 
         ax.set_ylim(original_ylim)
 
 
-def _matrix_y_ticks(panel: PanelSpec, *, y_size: int) -> tuple[tuple[float, ...], tuple[str, ...], str]:
+def _matrix_y_ticks(panel: PanelSpec, *, y_size: int) -> tuple[tuple[float, ...], tuple[str, ...], str, float]:
+    """Return tick positions, tick labels, the unit tag and the display y of the baseline the tag sits at."""
     if _is_mmode_panel(panel):
         depth_range = _mmode_depth_range_cm(panel)
         if depth_range is not None:
             span_cm = max(0.0, depth_range[1] - depth_range[0])
             ticks = _axis_limit_ticks(0.0, span_cm)
-            return ticks, tuple(_format_cm_label(tick) for tick in ticks), "Distance (cm)"
-        return (), (), ""
+            return ticks, tuple(_format_axis_tick(tick) for tick in ticks), "[cm]", ticks[0]
+        return (), (), "", 0.0
     metadata = panel.loaded.attrs.get("spectral_metadata")
     if isinstance(metadata, SpectralMetadata) and metadata.row_velocity_mps is not None:
         axis = np.asarray(metadata.row_velocity_mps, dtype=np.float32).reshape(-1)
@@ -1040,8 +1362,13 @@ def _matrix_y_ticks(panel: PanelSpec, *, y_size: int) -> tuple[tuple[float, ...]
                     panel, np.asarray(velocity_ticks, dtype=np.float32), y_size=y_size
                 )
             )
-            return display_ticks, tuple(_format_axis_tick(tick) for tick in velocity_ticks), "Velocity (m/s)"
-    return (), (), ""
+            baseline = float(
+                _spectral_velocity_to_display_y(panel, np.asarray([0.0], dtype=np.float32), y_size=y_size)[0]
+            )
+            lo, hi = sorted(display_ticks[:1] + display_ticks[-1:])
+            baseline = min(max(baseline, lo), hi)
+            return display_ticks, tuple(_format_axis_tick(tick) for tick in velocity_ticks), "[m/s]", baseline
+    return (), (), "", 0.0
 
 
 def _nice_axis_ticks(lo: float, hi: float, *, count: int) -> tuple[float, ...]:
@@ -1068,10 +1395,6 @@ def _format_axis_tick(value: float) -> str:
     return f"{value:.1f}"
 
 
-def _format_cm_label(value: float) -> str:
-    return f"{_format_axis_tick(value)} cm"
-
-
 def _has_temporal_axis(panel: PanelSpec, count: int) -> bool:
     timestamps = panel.loaded.timestamps
     return (
@@ -1088,18 +1411,34 @@ def render_ecg(
     time_s: float,
     style: PlotStyle,
     marker_times: np.ndarray | None = None,
-) -> None:
+) -> Callable[[float, np.ndarray | None], None]:
+    """Draw the ECG trace and return ``update(time_s, marker_times)`` that redraws only the markers."""
     signal = np.asarray(ecg.signal, dtype=np.float32).reshape(-1)
     timestamps = np.asarray(ecg.timestamps, dtype=np.float64).reshape(-1)
     count = min(signal.size, timestamps.size)
     if count:
         ax.plot(timestamps[:count], signal[:count], color=style.ecg_trace_color, linewidth=0.9)
-        markers = _ecg_marker_times(marker_times, fallback_time=float(time_s))
+
+    marker_artists: list[Artist] = []
+
+    def draw_markers(time: float, times: np.ndarray | None) -> None:
+        if not count:
+            return
+        markers = _ecg_marker_times(times, fallback_time=float(time))
         linewidth = 1.4 if markers.size == 1 else 1.1
         alpha = 1.0 if markers.size == 1 else 0.75
-        for marker_time in markers:
-            ax.axvline(float(marker_time), color=style.ecg_marker_color, linewidth=linewidth, alpha=alpha)
+        with _collect_new_artists(ax, marker_artists):
+            for marker_time in markers:
+                ax.axvline(float(marker_time), color=style.ecg_marker_color, linewidth=linewidth, alpha=alpha)
+
+    draw_markers(time_s, marker_times)
     _finish_panel(ax, "", style)
+
+    def update(time: float, new_marker_times: np.ndarray | None) -> None:
+        _remove_artists(marker_artists)
+        draw_markers(time, new_marker_times)
+
+    return update
 
 
 def _ecg_marker_times(marker_times: np.ndarray | None, *, fallback_time: float) -> np.ndarray:
@@ -1159,16 +1498,29 @@ def _colorbar_value_range(panel: PanelSpec) -> tuple[float, float] | None:
     return _stream_value_range(panel.loaded)
 
 
+def panel_colormap(loaded: LoadedArray, data_path: str | None = None) -> Colormap | None:
+    """Return the recording's own colormap when loaded with the array, else the configured one for its path."""
+    own = loaded.attrs.get("colormap")
+    if isinstance(own, Colormap):
+        return own
+    return named_listed_colormap(loaded.data_path if data_path is None else data_path)
+
+
 def _colorbar_colormap(panel: PanelSpec, image_cmap: Colormap | None) -> Colormap | None:
     if panel.view != "cartesian":
         return None
-    return image_cmap or named_listed_colormap(_colorbar_data_path(panel))
+    return image_cmap or panel_colormap(panel.loaded, _colorbar_data_path(panel))
 
 
 def _colorbar_spec(panel: PanelSpec):
     if panel.view != "cartesian":
         return None
-    return colorbar_spec_for_modality(_colorbar_data_path(panel), value_range=_colorbar_value_range(panel))
+    table = panel.loaded.attrs.get("cartesian_colorbar_table")
+    return colorbar_spec_for_modality(
+        _colorbar_data_path(panel),
+        value_range=_colorbar_value_range(panel),
+        table=table if isinstance(table, np.ndarray) else None,
+    )
 
 
 def _cartesian_grid(panel: PanelSpec) -> CartesianGrid | None:
@@ -1176,6 +1528,11 @@ def _cartesian_grid(panel: PanelSpec) -> CartesianGrid | None:
         return None
     grid = panel.loaded.attrs.get("cartesian_grid")
     return grid if isinstance(grid, CartesianGrid) else None
+
+
+def _is_physical_image(panel: PanelSpec, grid: CartesianGrid | None) -> bool:
+    """True when pixels are isotropic physical samples, so the axes box must keep the image's true aspect."""
+    return grid is not None or (panel.view == "cartesian" and panel.loaded.attrs.get("mosaic_layout") is not None)
 
 
 def _cartesian_extent(grid: CartesianGrid | None) -> tuple[float, float, float, float] | None:
@@ -1210,6 +1567,182 @@ def _draw_cartesian_depth_ruler(ax: Axes, panel: PanelSpec, *, style: PlotStyle)
         show_border=style.cartesian_depth_ruler_show_border,
     )
     draw_sector_depth_ruler(ax, geometry, ruler)
+
+
+def _slice_edge_slope(geometry: SphericalGeometry, angle_deg: float) -> float:
+    """Half-width per metre of depth z of a radial-axis slice, i.e. the slope of its left and right sector edges."""
+    angle = math.radians(float(angle_deg))
+    cos_a, sin_a = abs(math.cos(angle)), abs(math.sin(angle))
+    tan_az = math.tan(0.5 * geometry.azimuth_width_rad)
+    tan_el = math.tan(0.5 * geometry.elevation_width_rad)
+    slopes = [math.inf]
+    if sin_a > 1e-9:
+        slopes.append(tan_el / sin_a)
+    denom = cos_a * cos_a - tan_az * tan_az * sin_a * sin_a
+    if denom > 1e-12:
+        slopes.append(tan_az / math.sqrt(denom))
+    return min(slopes)
+
+
+def _mosaic_level_cells(layout: SphericalMosaicLayout) -> tuple[MosaicCell, ...]:
+    """The shallowest, middle and deepest depth cuts, marked on the long-axis slices."""
+    by_position = {(cell.row, cell.col): cell for cell in layout.cells}
+    return tuple(by_position[position] for position in ((0, 1), (1, 2), (2, 3)) if position in by_position)
+
+
+def _draw_mosaic_depth_guides(ax: Axes, panel: PanelSpec, *, style: PlotStyle) -> None:
+    layout = panel.loaded.attrs.get("mosaic_layout")
+    geometry = panel.loaded.attrs.get("mosaic_geometry")
+    if not isinstance(layout, SphericalMosaicLayout) or not isinstance(geometry, SphericalGeometry):
+        return
+    levels = _mosaic_level_cells(layout) if style.show_mosaic_levels else ()
+    if levels:
+        _draw_mosaic_level_brackets(ax, levels, style=style)
+    for cell in layout.cells:
+        plane = cell.plane
+        if cell.kind != "radial_axis" or plane is None or cell.angle_deg is None:
+            continue
+        slope = _slice_edge_slope(geometry, cell.angle_deg)
+        if not math.isfinite(slope):
+            continue
+        sx = (cell.image_width - 1) / max(plane.x_max - plane.x_min, 1e-12)
+        sy = (cell.image_height - 1) / max(plane.y_max - plane.y_min, 1e-12)
+
+        to_px = _slice_pixel_mapper(cell, plane, sx, sy)
+        if style.show_cartesian_depth_ruler:
+            _draw_slice_depth_ruler(ax, cell, geometry, slope, to_px, sx, style=style)
+        for color, level in zip(style.mosaic_level_colors, levels, strict=False):
+            if level.plane is None:
+                continue
+            _draw_slice_level(ax, cell, level, slope, to_px, color=color, style=style)
+
+
+def _slice_pixel_mapper(
+    cell: MosaicCell, plane: MosaicSlicePlane, sx: float, sy: float
+) -> Callable[[float, float], tuple[float, float]]:
+    def to_px(u: float, z: float) -> tuple[float, float]:
+        return cell.image_x0 + (u - plane.x_min) * sx, cell.image_y0 + (z - plane.y_min) * sy
+
+    return to_px
+
+
+def _draw_slice_depth_ruler(
+    ax: Axes,
+    cell: MosaicCell,
+    geometry: SphericalGeometry,
+    slope: float,
+    to_px: Callable[[float, float], tuple[float, float]],
+    sx: float,
+    *,
+    style: PlotStyle,
+) -> None:
+    plane = cast("MosaicSlicePlane", cell.plane)
+    half_angle = math.atan(slope)
+    sector = SectorGeometry(
+        depth_start_m=float(geometry.depth_start_m),
+        depth_end_m=float(geometry.depth_end_m),
+        angle_start_rad=-half_angle,
+        angle_end_rad=half_angle,
+    )
+    ruler = SectorDepthRuler(
+        side="left",
+        tick_interval_cm=style.cartesian_depth_ruler_tick_interval_cm,
+        label_interval_cm=style.cartesian_depth_ruler_label_interval_cm,
+        minor_tick_length_cm=style.cartesian_depth_ruler_minor_tick_length_cm,
+        major_tick_length_cm=style.cartesian_depth_ruler_major_tick_length_cm,
+        label_pad_cm=style.cartesian_depth_ruler_label_pad_cm,
+        color=style.ecg_trace_color,
+        linewidth=style.cartesian_depth_ruler_linewidth,
+        border_linewidth=style.cartesian_depth_ruler_border_linewidth,
+        label_fontsize=style.cartesian_depth_ruler_label_fontsize,
+        show_border=False,
+        zorder=7.5,  # below the mesh lines (8.0), so reused and freshly built frames stack identically
+    )
+    ticks = [t for t in sector_depth_ticks(sector, ruler) if t.base_xy_m[1] >= plane.y_min]
+    if not ticks:
+        return
+    # The apex sits above the slice; the edge is in the tick base frame (u = x, z = y).
+    deepest = max(ticks, key=lambda t: t.depth_cm)
+    outward_m = abs(deepest.label_xy_m[0] - deepest.base_xy_m[0])
+    label_px = 0.6 * style.cartesian_depth_ruler_label_fontsize * ax.figure.dpi / 72.0 * 1.6
+    free_px = to_px(deepest.base_xy_m[0], deepest.base_xy_m[1])[0] - cell.x0
+    inside = free_px < outward_m * sx + label_px
+    sign = -1.0 if inside else 1.0
+    for tick in ticks:
+        bx, by = to_px(*tick.base_xy_m)
+        ex, ey = to_px(*tick.end_xy_m)
+        lx, ly = to_px(*tick.label_xy_m)
+        ex, ey = bx + sign * (ex - bx), by + sign * (ey - by)
+        lx, ly = bx + sign * (lx - bx), by + sign * (ly - by)
+        ax.plot(
+            [bx, ex],
+            [by, ey],
+            color=ruler.color,
+            linewidth=ruler.linewidth,
+            antialiased=False,
+            clip_on=False,
+            zorder=ruler.zorder,
+        )
+        if tick.label:
+            ax.text(
+                lx,
+                ly,
+                tick.label,
+                color=ruler.color,
+                fontsize=ruler.label_fontsize,
+                ha="left" if inside else "right",
+                va="center",
+                clip_on=False,
+                zorder=ruler.zorder,
+            )
+
+
+def _draw_slice_level(
+    ax: Axes,
+    cell: MosaicCell,
+    level: MosaicCell,
+    slope: float,
+    to_px: Callable[[float, float], tuple[float, float]],
+    *,
+    color: str,
+    style: PlotStyle,
+) -> None:
+    plane = cast("MosaicSlicePlane", level.plane)
+    depth_m = float(plane.plane_point[2])
+    half_m = slope * depth_m
+    x0, y = to_px(-half_m, depth_m)
+    x1, _ = to_px(half_m, depth_m)
+    ax.plot([x0, x1], [y, y], color=color, linewidth=1.6, zorder=8.3, solid_capstyle="butt")
+    fontsize = max(6.0, 0.7 * style.cartesian_depth_ruler_label_fontsize)
+    label_px = 4.4 * fontsize * ax.figure.dpi / 72.0 * 0.6
+    fits = x1 + 3.0 + label_px <= cell.x0 + cell.width
+    ax.text(
+        x1 + 3.0 if fits else x1,
+        y if fits else y - 2.0,
+        f"{100.0 * depth_m:.1f} cm",
+        color=color,
+        fontsize=fontsize,
+        ha="left" if fits else "right",
+        va="center" if fits else "bottom",
+        clip_on=False,
+        zorder=8.3,
+    )
+
+
+def _draw_mosaic_level_brackets(ax: Axes, levels: tuple[MosaicCell, ...], *, style: PlotStyle) -> None:
+    for color, cell in zip(style.mosaic_level_colors, levels, strict=False):
+        size = 0.08 * min(cell.image_height, cell.image_width)
+        x0, y0 = cell.image_x0 + 1.5, cell.image_y0 + 1.5
+        ax.plot(
+            [x0, x0, x0 + size],
+            [y0 + size, y0, y0],
+            color=color,
+            linewidth=2.0,
+            solid_joinstyle="miter",
+            solid_capstyle="butt",
+            clip_on=False,
+            zorder=8.3,
+        )
 
 
 def _draw_color_doppler_extent(ax: Axes, panel: PanelSpec, *, frame_shape: tuple[int, ...], style: PlotStyle) -> None:
@@ -1360,8 +1893,6 @@ def _dtype_value_range(values: np.ndarray) -> tuple[float, float]:
     if np.issubdtype(arr.dtype, np.integer):
         info = np.iinfo(arr.dtype)
         return float(info.min), float(info.max)
-    if np.issubdtype(arr.dtype, np.bool_):
-        return 0.0, 1.0
     return 0.0, 1.0
 
 

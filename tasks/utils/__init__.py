@@ -4,6 +4,8 @@ from __future__ import annotations
 
 _MODEL_EXPORTS = {
     "ColorDopplerHead",
+    "DenseVideoBackbone",
+    "FramewiseDenseVideoBackbone",
     "SegmentationHead",
     "TaskHead",
     "TaskModel",
@@ -24,6 +26,8 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "ColorDopplerHead",
+    "DenseVideoBackbone",
+    "FramewiseDenseVideoBackbone",
     "SegmentationHead",
     "TaskHead",
     "TaskModel",

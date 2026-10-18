@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from echoxflow.scan.geometry import CartesianGrid, SectorGeometry, SlicePlane, VolumeGrid
-from echoxflow.scan.interpolation import Interpolation, sample_image, sample_volume
+from echoxflow.scan.interpolation import Interpolation, sample_image, sample_image_stack, sample_volume
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,36 @@ def sector_stack_to_cartesian(
         sector_to_cartesian(frame, geometry, grid=grid, output_height=output_height, interpolation=interpolation)
         for frame in arr
     )
+
+
+def sector_stack_to_cartesian_array(
+    frames: np.ndarray,
+    geometry: SectorGeometry,
+    *,
+    grid: CartesianGrid | None = None,
+    output_height: int | None = None,
+    interpolation: Interpolation = "linear",
+) -> CartesianImage:
+    """Convert a ``[T,R,A]`` or ``[T,R,A,C]`` sector stack to one Cartesian ``[T,H,W(,C)]`` array in a single pass.
+
+    ``data[t]`` equals ``sector_to_cartesian(frames[t], ...).data`` and ``mask`` is the (shared) sector mask.
+    """
+    arr = np.asarray(frames)
+    if arr.ndim not in {3, 4}:
+        raise ValueError(f"Expected frame stack [T,R,A] or [T,R,A,C], got {arr.shape}")
+    target_grid = grid or CartesianGrid.from_sector_height(geometry, output_height or int(arr.shape[1]))
+    rows, cols, mask = _sector_sample_coordinates(geometry, target_grid, source_shape=arr.shape[1:3])
+    sampled = sample_image_stack(arr, rows, cols, interpolation=interpolation)
+    out = np.asarray(sampled)
+    if not np.all(mask):
+        out = out.copy()
+        out[:, ~mask] = 0
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        out = np.clip(np.rint(out), info.min, info.max).astype(arr.dtype)
+    else:
+        out = out.astype(arr.dtype, copy=False)
+    return CartesianImage(data=np.ascontiguousarray(out), mask=mask, grid=target_grid)
 
 
 def slice_volume(

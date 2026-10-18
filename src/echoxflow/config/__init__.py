@@ -21,7 +21,7 @@ class DatasetConfig:
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: Path
+    root: Path | None
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def load_settings(path: str | Path | None = None) -> EchoXFlowSettings:
     output = _mapping(raw, "output")
     return EchoXFlowSettings(
         dataset=DatasetConfig(name=_string(dataset, "name")),
-        data=DataConfig(root=_path(_string(data, "root"), base_dir=base_dir)),
+        data=DataConfig(root=_path(str(data["root"]), base_dir=base_dir) if data.get("root") else None),
         output=OutputConfig(root=_path(_string(output, "root"), base_dir=base_dir)),
         raw=raw,
     )
@@ -111,7 +111,10 @@ def data_root(path: str | Path | None = None) -> Path:
     override = os.environ.get(DATA_ROOT_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return load_settings().data.root
+    root = load_settings().data.root
+    if root is None:
+        raise ValueError("No EchoXFlow data root configured: set ECHOXFLOW_DATA_ROOT or pass --data-root.")
+    return root
 
 
 def resolve_data_path(*parts: str | Path, root: str | Path | None = None) -> Path:

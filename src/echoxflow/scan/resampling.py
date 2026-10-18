@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from echoxflow.scan.geometry import SectorGeometry
-from echoxflow.scan.interpolation import Interpolation, sample_image
+from echoxflow.scan.interpolation import Interpolation, sample_image, sample_image_stack
 
 
 @dataclass(frozen=True)
@@ -73,10 +73,23 @@ def resample_sector_stack(
     output_shape: tuple[int, int] | None = None,
     interpolation: Interpolation = "linear",
 ) -> np.ndarray:
-    """Resample a temporal sector stack while preserving the frame axis."""
+    """Resample a temporal sector stack while preserving the frame axis.
+
+    All frames share one lookup and are sampled in a single vectorized pass; the result equals resampling each frame
+    with :func:`resample_sector` and stacking the frames.
+    """
     arr = np.asarray(frames)
     if arr.ndim < 3:
         raise ValueError(f"Expected frame stack [T,R,A...], got {arr.shape}")
+    if arr.ndim in {3, 4} and arr.shape[0] > 0:
+        lookup = sector_lookup(
+            source_geometry,
+            target_geometry,
+            source_shape=arr.shape[1:3],
+            output_shape=output_shape,
+        )
+        sampled = sample_image_stack(arr, lookup.rows, lookup.cols, interpolation=interpolation)
+        return np.ascontiguousarray(_zero_outside_stack(sampled, lookup.mask, dtype=arr.dtype))
     return np.asarray(
         [
             resample_sector(
@@ -95,6 +108,20 @@ def _beamspace_grid(geometry: SectorGeometry, shape: tuple[int, int]) -> tuple[n
     rows = np.linspace(geometry.depth_start_m, geometry.depth_end_m, int(shape[0]), dtype=np.float64)
     cols = np.linspace(geometry.angle_start_rad, geometry.angle_end_rad, int(shape[1]), dtype=np.float64)
     return np.meshgrid(rows, cols, indexing="ij")
+
+
+def _zero_outside_stack(values: np.ndarray, mask: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
+    """:func:`_zero_outside` of every frame of a ``[T,H,W,...]`` stack with one ``[H,W]`` mask."""
+    out = np.asarray(values)
+    if not np.all(mask):
+        out = out.copy()
+        out[:, ~mask] = 0
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        out = np.clip(np.rint(out), info.min, info.max).astype(dtype)
+    else:
+        out = out.astype(dtype, copy=False)
+    return out
 
 
 def _zero_outside(values: np.ndarray, mask: np.ndarray, *, dtype: np.dtype) -> np.ndarray:

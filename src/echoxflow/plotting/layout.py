@@ -30,17 +30,24 @@ class SpatialLayout:
 def spatial_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
     if not panels:
         return SpatialLayout(cols=1, rows=0, placements=(), width_ratios=(1.0,))
+    if any(panel.kind in {"strain_curves", "bullseye"} for panel in panels):
+        return anatomical_layout(panels)
     beamspace = tuple(panel for panel in panels if panel.view == "beamspace")
     cartesian = tuple(panel for panel in panels if panel.view == "cartesian")
     if beamspace and cartesian:
         beamspace_layout_result = beamspace_layout(beamspace)
         rows = max(beamspace_layout_result.rows, len(cartesian))
+        beamspace_rows = beamspace_layout_result.rows
+        if rows % beamspace_rows == 0:
+            row_scale = rows // beamspace_rows  # stretch the beamspace grid over the Cartesian column height
+        else:
+            row_scale = 1
         converted = tuple(
             PanelPlacement(
-                row=placement.row,
+                row=placement.row * row_scale,
                 col=placement.col,
                 panel=placement.panel,
-                row_span=placement.row_span,
+                row_span=placement.row_span * row_scale,
                 col_span=placement.col_span,
             )
             for placement in beamspace_layout_result.placements
@@ -110,3 +117,22 @@ def panel_spatial_area(panel: PanelSpec) -> int:
 
 def uses_ecg_timescale(panel: PanelSpec) -> bool:
     return panel.loaded.name.startswith("1d_") or panel.kind == "line"
+
+
+def anatomical_layout(panels: tuple[PanelSpec, ...]) -> SpatialLayout:
+    """Keep source images above view-specific curves and the derived bullseye."""
+    summary = tuple(p for p in panels if p.kind in {"strain_curves", "bullseye"})
+    images = tuple(p for p in panels if p.kind not in {"strain_curves", "bullseye"})
+    cols = 12 if images else len(summary)
+    placements: list[PanelPlacement] = []
+    row = 0
+    for view in ("beamspace", "cartesian"):
+        group = [p for p in images if p.view == view]
+        for start in range(0, len(group), 3):
+            batch = group[start : start + 3]
+            span = cols // len(batch)
+            placements.extend(PanelPlacement(row, i * span, p, col_span=span) for i, p in enumerate(batch))
+            row += 1
+    span = cols // len(summary)
+    placements.extend(PanelPlacement(row, i * span, p, col_span=span) for i, p in enumerate(summary))
+    return SpatialLayout(cols=cols, rows=row + 1, placements=tuple(placements), width_ratios=(1.0,) * cols)

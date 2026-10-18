@@ -33,7 +33,6 @@ from echoxflow.scan import ImageLayer, compose_layers
 from tasks.utils.training.device import _autocast_context, move_to_device
 from tasks.utils.training.io import (
     _color_full_region_preview_attrs,
-    _encode_tissue_doppler_for_source,
     _finite_array,
     _native_tdi_extra_arrays,
     _preview_attrs,
@@ -98,22 +97,6 @@ def _write_epoch_previews(
                 logger.warning("could not write %s preview for epoch %d: %s", split, epoch, exc)
     finally:
         module.train(was_training)
-
-
-def _random_preview_sample(dataloader: Iterable[object] | None, *, device: torch.device) -> object | None:
-    if dataloader is None:
-        return None
-    dataset = getattr(dataloader, "dataset", None)
-    if dataset is None:
-        return None
-    try:
-        sample_count = len(dataset)
-    except TypeError:
-        return None
-    if int(sample_count) <= 0:
-        return None
-    index = int(np.random.randint(0, int(sample_count)))
-    return move_to_device(dataset[index], device)
 
 
 def _stable_preview_sample(
@@ -188,25 +171,6 @@ def _task_preview_spec(task_kind: str) -> Any | None:
         return task_preview_spec(task_kind)
     except ValueError:
         return None
-
-
-def _preview_prediction(module: nn.Module, sample: object, task_kind: str) -> Tensor:
-    frames = getattr(sample, "frames", None)
-    if not isinstance(frames, Tensor):
-        raise TypeError(f"{task_kind} preview sample is missing frames")
-    if task_kind == "segmentation":
-        return cast(Tensor, cast(Any, module)(frames, None))
-    if task_kind == "tissue_doppler":
-        return cast(
-            Tensor,
-            cast(Any, module)(
-                frames,
-                velocity_scale_mps_per_px_frame=getattr(sample, "velocity_scale_mps_per_px_frame"),
-            ),
-        )
-    if task_kind == "color_doppler":
-        return cast(Tensor, cast(Any, module)(frames, conditioning=getattr(sample, "conditioning")))
-    raise ValueError(f"unsupported preview task kind {task_kind!r}")
 
 
 def segmentation_preview_prediction(module: nn.Module, sample: object) -> Tensor:
@@ -429,12 +393,7 @@ def _tissue_recording_preview_specs(
     uses_cartesian_prediction = _preview_view_mode(sample) == "beamspace"
 
     def build_modality_arrays(suffix: str) -> Sequence[RecordingArray]:
-        encoded = _encode_tissue_doppler_for_source(
-            store=store,
-            values=videos[suffix],
-            source_stream=source_stream,
-            velocity_limit_mps=limit,
-        )
+        encoded = _finite_array(videos[suffix])
         arrays = [
             RecordingArray(
                 data_path="data/tissue_doppler",
@@ -610,19 +569,6 @@ _PREVIEW_SPEC_BUILDERS: dict[str, Any] = {
     "tissue_doppler": _tissue_recording_preview_specs,
     "color_doppler": _color_recording_preview_specs,
 }
-
-
-def _prediction_recording_preview_specs(
-    *,
-    task_kind: str,
-    sample: object,
-    record: RecordingRecord,
-    prediction: Tensor,
-) -> _PreviewRecordingSpecs:
-    builder = _PREVIEW_SPEC_BUILDERS.get(task_kind)
-    if builder is None:
-        raise ValueError(f"unsupported preview task kind {task_kind!r}")
-    return cast(_PreviewRecordingSpecs, builder(sample=sample, record=record, prediction=prediction))
 
 
 def _common_preview_arrays(

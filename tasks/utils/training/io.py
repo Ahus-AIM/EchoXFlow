@@ -2,73 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from echoxflow import RecordingArray, RecordingRecord
+from echoxflow import RecordingArray
 from echoxflow.preview import (
     common_preview_arrays,
-    source_bmode_array,
-    source_ecg_arrays,
     write_preview_pair,
-    write_preview_recording_video,
-    zero_ecg_array,
 )
-from echoxflow.streams import (
-    TDI_LINEAR_UINT8_STORAGE_ENCODING,
-    TDI_NATIVE_STORAGE_ENCODING,
-    encode_tdi_linear_uint8_codes,
-    encode_tdi_native_codes,
-)
-from tasks.utils.training.runtime import _PREVIEW_FPS, _PREVIEW_MAX_FPS, _PREVIEW_STYLE, _PREVIEW_VIEW_MODE
+from tasks.utils.training.runtime import _PREVIEW_FPS
 
 _common_preview_arrays = common_preview_arrays
 _write_preview_pair = write_preview_pair
-
-
-def _write_preview_recording_video(
-    *,
-    record: RecordingRecord,
-    preview_dir: Path,
-    epoch: int,
-    split: str,
-    suffix: str,
-    arrays: Sequence[RecordingArray],
-    attrs: Mapping[str, Any],
-    modalities: tuple[str, ...],
-) -> None:
-    render_options: dict[str, Any] = {
-        "view_mode": _PREVIEW_VIEW_MODE,
-        "max_fps": _PREVIEW_MAX_FPS,
-        "style": _PREVIEW_STYLE,
-    }
-    write_preview_recording_video(
-        record=record,
-        preview_dir=preview_dir,
-        epoch=epoch,
-        split=split,
-        suffix=suffix,
-        arrays=arrays,
-        attrs=attrs,
-        modalities=modalities,
-        **render_options,
-    )
-
-
-def _source_bmode_array(store: Any, sample: object, data_path: str = "data/2d_brightness_mode") -> RecordingArray:
-    return source_bmode_array(store, sample, data_path=data_path)
-
-
-def _source_ecg_arrays(store: Any) -> tuple[RecordingArray, ...]:
-    return source_ecg_arrays(store)
-
-
-def _zero_ecg_array(timestamps: np.ndarray | None, *, frame_count: int) -> RecordingArray:
-    return zero_ecg_array(timestamps, frame_count=frame_count, fallback_fps=_PREVIEW_FPS)
 
 
 def _resolve_segmentation_panel(store: Any, role_id: str | None) -> tuple[Any, str, Any | None]:
@@ -78,11 +26,6 @@ def _resolve_segmentation_panel(store: Any, role_id: str | None) -> tuple[Any, s
         return store.open_reference(panel.bmode.recording), panel.bmode.data_path, panel
     except (StopIteration, ValueError, KeyError):
         return store, "data/2d_brightness_mode", None
-
-
-def _resolve_segmentation_bmode(store: Any, role_id: str | None) -> tuple[Any, str]:
-    source_store, bmode_path, _panel = _resolve_segmentation_panel(store, role_id)
-    return source_store, bmode_path
 
 
 def _native_tdi_extra_arrays(store: Any, source_stream: Any) -> tuple[RecordingArray, ...]:
@@ -97,29 +40,6 @@ def _native_tdi_extra_arrays(store: Any, source_stream: Any) -> tuple[RecordingA
             content_type=str(fenc_table_path).removeprefix("data/"),
         ),
     )
-
-
-def _encode_tissue_doppler_for_source(
-    *,
-    store: Any,
-    values: np.ndarray,
-    source_stream: Any,
-    velocity_limit_mps: float,
-) -> np.ndarray:
-    metadata = getattr(source_stream, "metadata", None)
-    storage_encoding = getattr(metadata, "storage_encoding", None)
-    if storage_encoding == TDI_NATIVE_STORAGE_ENCODING:
-        fenc_table_path = getattr(metadata, "fenc_table_path", None)
-        if not fenc_table_path:
-            raise ValueError("Native TDI preview source is missing fenc_table_path metadata")
-        return encode_tdi_native_codes(
-            values,
-            fenc_table=store.load_array(str(fenc_table_path)),
-            velocity_scale_mps=velocity_limit_mps,
-        )
-    if storage_encoding == TDI_LINEAR_UINT8_STORAGE_ENCODING:
-        return encode_tdi_linear_uint8_codes(values, velocity_scale_mps=velocity_limit_mps)
-    return _finite_array(values)
 
 
 def _preview_attrs(store: Any) -> Mapping[str, Any]:
@@ -186,9 +106,6 @@ def _full_region_doppler_sector(
     if "track_role_id" in sector:
         sector["track_role_id"] = semantic_id
     for key in (
-        "colormap",
-        "native_tdi_lookup_tables",
-        "tdi_tables",
         "storage_encoding",
         "velocity_limit_source",
         "velocity_scale_mps",
@@ -270,10 +187,6 @@ def _sample_timestamps(sample: object, field_name: str, *, count: int) -> np.nda
         timestamps = np.asarray(array[0] if array.ndim >= 2 else array, dtype=np.float32).reshape(-1)
         if int(timestamps.size) == int(count):
             return timestamps
-    return np.arange(int(count), dtype=np.float32) / _PREVIEW_FPS
-
-
-def _preview_output_timestamps(*, count: int) -> np.ndarray:
     return np.arange(int(count), dtype=np.float32) / _PREVIEW_FPS
 
 

@@ -25,14 +25,14 @@ from echoxflow.scan import (
     sector_geometry_from_mapping,
     sector_to_cartesian,
 )
+from echoxflow.schema import STRAIN_CONTOUR_ANNOTATIONS
 from tasks.segmentation.types import Sample
 from tasks.utils.dataset import (
     SharedTrainingTransform,
     SkippedCase,
-)
-from tasks.utils.dataset import as_spatial_shape as _as_spatial_shape
-from tasks.utils.dataset import (
+    _config_bool,
     build_task_dataloaders,
+    cartesian_sector_mask,
     discover_records_from_candidates,
     optional_int,
     progress_iter,
@@ -40,6 +40,10 @@ from tasks.utils.dataset import (
     shared_training_transform_from_config,
     training_transform_from_args,
 )
+from tasks.utils.dataset import as_spatial_shape as _as_spatial_shape
+from tasks.utils.dataset import cartesian_grid_sample_grid as _cartesian_grid_sample_grid
+from tasks.utils.dataset import cartesian_image_sample_grid as _cartesian_image_sample_grid
+from tasks.utils.ref_cache import DEFAULT_REF_CACHE_DIR, RecordingScanCache, scan_cache_dir
 
 
 @dataclass(frozen=True)
@@ -68,21 +72,28 @@ class RawDataset(Dataset[Sample]):
         target_mask_channels: int = 2,
         coordinate_space: str = "beamspace",
         cartesian_height: int | None = None,
+        cartesian_preprocessing: str = "centered_native_spacing",
         include_cartesian_metrics: bool = False,
         content_types: tuple[str, ...] | None = None,
+        allowed_roles: tuple[str, ...] | None = None,
         sampling_mode: str = "sliding",
         target_frame_policy: str = "all",
         annotation_context_frames: int = 0,
+        bmode_link_resolution: str = "timestamp_fallback",
         training_transform: SharedTrainingTransform | None = None,
         recording_cache_dir: str | Path | None = None,
         recording_cache_read_only: bool = False,
         recording_cache_include: tuple[str, ...] = (),
         recording_cache_exclude: tuple[str, ...] = (),
+        sample_ref_cache_dir: str | Path | None = DEFAULT_REF_CACHE_DIR,
+        sample_ref_cache_read_only: bool = False,
         **_: object,
     ) -> None:
         self.records = sorted(records, key=lambda record: (record.exam_id, record.recording_id))
         self.clip_length = int(clip_length)
         self.clip_stride = int(clip_stride)
+        self.sample_ref_cache_dir = None if sample_ref_cache_dir is None else Path(sample_ref_cache_dir)
+        self.sample_ref_cache_read_only = bool(sample_ref_cache_read_only)
         self.input_spatial_shape = _as_spatial_shape(input_spatial_shape)
         self.data_root = data_root
         self.target_mask_channels = int(target_mask_channels)
@@ -90,20 +101,28 @@ class RawDataset(Dataset[Sample]):
         self.cartesian_height = (
             int(cartesian_height) if cartesian_height is not None else int(self.input_spatial_shape[0])
         )
+        self.cartesian_preprocessing = str(cartesian_preprocessing).strip().lower()
         self.include_cartesian_metrics = bool(include_cartesian_metrics)
         self.content_types = _string_tuple(content_types)
+        self.allowed_roles = tuple(dict.fromkeys(value.lower() for value in _string_tuple(allowed_roles)))
         self.sampling_mode = str(sampling_mode).strip().lower()
         self.target_frame_policy = str(target_frame_policy).strip().lower()
         self.annotation_context_frames = max(0, int(annotation_context_frames))
+        self.bmode_link_resolution = str(bmode_link_resolution).strip().lower()
         self.recording_cache_dir = None if recording_cache_dir is None else Path(recording_cache_dir)
         self.recording_cache_read_only = bool(recording_cache_read_only)
         self.recording_cache_include = tuple(str(path) for path in recording_cache_include) or (
-            ("data/2d_brightness_mode*", "data/*_contour") if self.recording_cache_dir is not None else ()
+            ("data/2d_brightness_mode*", "annotations/*_contour") if self.recording_cache_dir is not None else ()
         )
         self.recording_cache_exclude = tuple(str(path) for path in recording_cache_exclude)
         if self.coordinate_space not in {"beamspace", "cartesian"}:
             raise ValueError(
                 f"segmentation coordinate_space must be 'beamspace' or 'cartesian', got {coordinate_space!r}"
+            )
+        if self.cartesian_preprocessing not in {"centered_native_spacing", "full_scan_then_resize"}:
+            raise ValueError(
+                "segmentation cartesian_preprocessing must be 'centered_native_spacing' or "
+                f"'full_scan_then_resize', got {cartesian_preprocessing!r}"
             )
         if self.sampling_mode not in {"sliding", "full_recording", "annotation"}:
             raise ValueError(
@@ -113,6 +132,11 @@ class RawDataset(Dataset[Sample]):
         if self.target_frame_policy not in {"all", "annotated"}:
             raise ValueError(
                 f"segmentation target_frame_policy must be 'all' or 'annotated', got {target_frame_policy!r}"
+            )
+        if self.bmode_link_resolution not in {"timestamp_fallback", "manifest_only"}:
+            raise ValueError(
+                "segmentation bmode_link_resolution must be 'timestamp_fallback' or "
+                f"'manifest_only', got {bmode_link_resolution!r}"
             )
         self.training_transform = training_transform_from_args(training_transform=training_transform)
         self.skipped_cases: list[SkippedCase] = []
@@ -138,10 +162,16 @@ class RawDataset(Dataset[Sample]):
         obj = store.load_object()
         panel = next(panel for panel in obj.panels if panel.role_id == ref.role_id)
         source_store = store.open_reference(panel.bmode.recording)
+        bmode_data_path, bmode_timestamps_path = _resolved_panel_bmode_paths(
+            store,
+            source_store,
+            panel,
+            resolution=self.bmode_link_resolution,
+        )
         frames, bmode_timestamps, bmode_metadata = _load_bmode_clip(
             source_store,
-            data_path=panel.bmode.data_path,
-            timestamps_path=panel.bmode.timestamps_path,
+            data_path=bmode_data_path,
+            timestamps_path=bmode_timestamps_path,
             start=ref.start,
             stop=ref.stop,
         )
@@ -210,13 +240,21 @@ class RawDataset(Dataset[Sample]):
                 raise ValueError(
                     f"Segmentation cartesian coordinate_space requires sector geometry for {panel.role_id!r}"
                 )
-            grid = CartesianGrid.from_sector_height(geometry, self.cartesian_height)
+            native_grid = CartesianGrid.from_sector_height(geometry, self.cartesian_height)
+            grid = (
+                native_grid
+                if self.cartesian_preprocessing == "full_scan_then_resize"
+                else _centered_cartesian_grid(native_grid, self.input_spatial_shape)
+            )
             converted = tuple(
                 sector_to_cartesian(frame, geometry, grid=grid, interpolation="linear") for frame in frames
             )
             frames = np.stack([image.data for image in converted], axis=0).astype(np.float32, copy=False)
             valid = np.asarray(converted[0].mask, dtype=np.float32)
-            if tuple(frames.shape[-2:]) != self.input_spatial_shape:
+            if (
+                self.cartesian_preprocessing == "full_scan_then_resize"
+                and tuple(frames.shape[-2:]) != self.input_spatial_shape
+            ):
                 frames = resize_stack(frames, self.input_spatial_shape)
                 valid = resize_stack(valid[None], self.input_spatial_shape)[0]
             frames = _minmax_normalize_frames_per_frame(frames)
@@ -261,7 +299,7 @@ class RawDataset(Dataset[Sample]):
             target_mask_channels=target_mask_channels,
             target_frame_policy=target_frame_policy,
         )
-        sector_mask = _cartesian_sector_mask(geometry, grid, shape=metric_shape).astype(np.float32, copy=False)
+        sector_mask = cartesian_sector_mask(geometry, grid, shape=metric_shape).astype(np.float32, copy=False)
         metric_valid_mask = metric_valid * sector_mask[None, None, :, :]
         if self.coordinate_space == "beamspace":
             sample_grid = _cartesian_grid_sample_grid(
@@ -326,6 +364,24 @@ class RawDataset(Dataset[Sample]):
         )
 
     def _build_sample_refs(self, *, max_samples: int | None) -> list[SampleRef]:
+        # Per-recording scan results are cached on disk and shared by every fold, split and method (see
+        # tasks.utils.ref_cache); replaying them in record order gives exactly the uncached lists.
+        cache = RecordingScanCache(
+            self.sample_ref_cache_dir,
+            namespace="segmentation_sample_refs",
+            settings={
+                "content_types": list(self.content_types),
+                "allowed_roles": list(self.allowed_roles),
+                "sampling_mode": self.sampling_mode,
+                "clip_length": self.clip_length,
+                "clip_stride": self.clip_stride,
+                "target_frame_policy": self.target_frame_policy,
+                "annotation_context_frames": self.annotation_context_frames,
+                "bmode_link_resolution": self.bmode_link_resolution,
+            },
+            data_root=self.data_root,
+            read_only=self.sample_ref_cache_read_only,
+        )
         refs: list[SampleRef] = []
         for record in progress_iter(
             self.records,
@@ -333,110 +389,120 @@ class RawDataset(Dataset[Sample]):
             total=len(self.records),
             unit="case",
         ):
-            store = open_recording(
-                record,
-                root=self.data_root,
-                cache_dir=self.recording_cache_dir,
-                cache_read_only=self.recording_cache_read_only,
-                cache_include=self.recording_cache_include,
-                cache_exclude=self.recording_cache_exclude,
-            )
-            obj = store.load_object()
-            content_type = _primary_segmentation_content_type(record, wanted=self.content_types)
-            if not content_type:
+            for event in cache.get(record, self._scan_record_sample_refs):
+                if event[0] == "skip":
+                    self.skipped_cases.append(SkippedCase(case_id=str(event[1]), reason=str(event[2])))
+                    continue
+                _kind, role_id, start, stop, content_type, view_code, sample_id = event
+                refs.append(
+                    SampleRef(
+                        record=record,
+                        role_id=str(role_id),
+                        start=int(start),
+                        stop=int(stop),
+                        content_type=str(content_type),
+                        view_code=str(view_code),
+                        sample_id=str(sample_id),
+                    )
+                )
+                if max_samples is not None and len(refs) >= int(max_samples):
+                    return refs
+        return refs
+
+    def _scan_record_sample_refs(self, record: RecordingRecord) -> list[list[Any]]:
+        """Sample references and skipped panels of one recording, in scan order, as cacheable events.
+
+        ``["ref", role_id, start, stop, content_type, view_code, sample_id]`` adds a sample reference and
+        ``["skip", case_id, reason]`` a skipped case.
+        """
+        events: list[list[Any]] = []
+        store = open_recording(
+            record,
+            root=self.data_root,
+            cache_dir=self.recording_cache_dir,
+            cache_read_only=self.recording_cache_read_only,
+            cache_include=self.recording_cache_include,
+            cache_exclude=self.recording_cache_exclude,
+        )
+        obj = store.load_object()
+        content_type = _primary_segmentation_content_type(record, wanted=self.content_types)
+        if not content_type:
+            return events
+        for panel in obj.panels:
+            if self.allowed_roles and str(panel.role_id).strip().lower() not in self.allowed_roles:
                 continue
-            for panel in obj.panels:
-                if not _role_matches_content_type(str(panel.role_id), content_type):
-                    continue
-                if not _has_contour(store, panel):
-                    continue
-                contour_path, _contour_timestamps_path = _contour_paths(panel)
-                contour_shape = _contour_shape(store, contour_path)
-                if contour_shape is not None and int(contour_shape[0]) == 0:
-                    self.skipped_cases.append(
-                        SkippedCase(
+            if not _role_matches_content_type(str(panel.role_id), content_type):
+                continue
+            if not _has_contour(store, panel):
+                continue
+            contour_path, _contour_timestamps_path = _contour_paths(panel)
+            contour_shape = _contour_shape(store, contour_path)
+            if contour_shape is not None and int(contour_shape[0]) == 0:
+                events.append(
+                    _skip_event(
+                        case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
+                        reason=f"empty contour array {contour_path!r} with shape {contour_shape}",
+                    )
+                )
+                continue
+            frame_count = _panel_frame_count(
+                store,
+                panel,
+                bmode_link_resolution=self.bmode_link_resolution,
+            )
+            if frame_count is None:
+                events.append(
+                    _skip_event(
+                        case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
+                        reason=f"missing linked B-mode array {panel.bmode.data_path!r}",
+                    )
+                )
+                continue
+            if frame_count <= 0:
+                events.append(
+                    _skip_event(
+                        case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
+                        reason=f"empty linked B-mode array {panel.bmode.data_path!r}",
+                    )
+                )
+                continue
+            view_code = str(panel.view_code or panel.role_id)
+            if self.sampling_mode == "annotation":
+                bounds = _annotation_window_bounds(
+                    store,
+                    panel=panel,
+                    frame_count=frame_count,
+                    context_frames=self.annotation_context_frames,
+                    bmode_link_resolution=self.bmode_link_resolution,
+                )
+                if bounds is None:
+                    events.append(
+                        _skip_event(
                             case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
-                            reason=f"empty contour array {contour_path!r} with shape {contour_shape}",
+                            reason="no contour annotations align to linked B-mode frames",
                         )
                     )
                     continue
-                frame_count = _panel_frame_count(store, panel)
-                if frame_count is None:
-                    self.skipped_cases.append(
-                        SkippedCase(
-                            case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
-                            reason=f"missing linked B-mode array {panel.bmode.data_path!r}",
-                        )
+                start, stop = bounds
+                events.append(
+                    _ref_event(
+                        record=record,
+                        role_id=panel.role_id,
+                        start=start,
+                        stop=stop,
+                        content_type=content_type,
+                        view_code=view_code,
+                        sample_id=(
+                            f"{record.exam_id}/{record.recording_id}/{panel.role_id}:"
+                            f"frames_annotation_{start}_{stop - 1}"
+                        ),
                     )
-                    continue
-                if frame_count <= 0:
-                    self.skipped_cases.append(
-                        SkippedCase(
-                            case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
-                            reason=f"empty linked B-mode array {panel.bmode.data_path!r}",
-                        )
-                    )
-                    continue
-                view_code = str(panel.view_code or panel.role_id)
-                if self.sampling_mode == "annotation":
-                    bounds = _annotation_window_bounds(
-                        store,
-                        panel=panel,
-                        frame_count=frame_count,
-                        context_frames=self.annotation_context_frames,
-                    )
-                    if bounds is None:
-                        self.skipped_cases.append(
-                            SkippedCase(
-                                case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
-                                reason="no contour annotations align to linked B-mode frames",
-                            )
-                        )
-                        continue
-                    start, stop = bounds
-                    refs.append(
-                        SampleRef(
-                            record=record,
-                            role_id=panel.role_id,
-                            start=start,
-                            stop=stop,
-                            content_type=content_type,
-                            view_code=view_code,
-                            sample_id=(
-                                f"{record.exam_id}/{record.recording_id}/{panel.role_id}:"
-                                f"frames_annotation_{start}_{stop - 1}"
-                            ),
-                        )
-                    )
-                    if max_samples is not None and len(refs) >= int(max_samples):
-                        return refs
-                    continue
-                if frame_count < self.clip_length:
-                    if self.sampling_mode == "full_recording":
-                        refs.append(
-                            SampleRef(
-                                record=record,
-                                role_id=panel.role_id,
-                                start=0,
-                                stop=frame_count,
-                                content_type=content_type,
-                                view_code=view_code,
-                                sample_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}:frames_full",
-                            )
-                        )
-                        if max_samples is not None and len(refs) >= int(max_samples):
-                            return refs
-                        continue
-                    self.skipped_cases.append(
-                        SkippedCase(
-                            case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
-                            reason=f"only {frame_count} linked B-mode frames, need at least {self.clip_length}",
-                        )
-                    )
-                    continue
+                )
+                continue
+            if frame_count < self.clip_length:
                 if self.sampling_mode == "full_recording":
-                    refs.append(
-                        SampleRef(
+                    events.append(
+                        _ref_event(
                             record=record,
                             role_id=panel.role_id,
                             start=0,
@@ -446,27 +512,88 @@ class RawDataset(Dataset[Sample]):
                             sample_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}:frames_full",
                         )
                     )
-                    if max_samples is not None and len(refs) >= int(max_samples):
-                        return refs
                     continue
-                for start in range(0, frame_count - self.clip_length + 1, self.clip_stride):
-                    refs.append(
-                        SampleRef(
-                            record=record,
-                            role_id=panel.role_id,
-                            start=start,
-                            stop=start + self.clip_length,
-                            content_type=content_type,
-                            view_code=view_code,
-                            sample_id=(
-                                f"{record.exam_id}/{record.recording_id}/{panel.role_id}:"
-                                f"frames_{start}_{start + self.clip_length - 1}"
-                            ),
+                events.append(
+                    _skip_event(
+                        case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
+                        reason=f"only {frame_count} linked B-mode frames, need at least {self.clip_length}",
+                    )
+                )
+                continue
+            if self.sampling_mode == "full_recording":
+                events.append(
+                    _ref_event(
+                        record=record,
+                        role_id=panel.role_id,
+                        start=0,
+                        stop=frame_count,
+                        content_type=content_type,
+                        view_code=view_code,
+                        sample_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}:frames_full",
+                    )
+                )
+                continue
+            annotated_frames: tuple[int, ...] | None = None
+            if self.target_frame_policy == "annotated":
+                annotated_frames = _linked_annotation_frame_indices(
+                    store,
+                    panel=panel,
+                    frame_count=frame_count,
+                    bmode_link_resolution=self.bmode_link_resolution,
+                )
+                if not annotated_frames:
+                    events.append(
+                        _skip_event(
+                            case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
+                            reason="no contour annotations align to linked B-mode frames",
                         )
                     )
-                    if max_samples is not None and len(refs) >= int(max_samples):
-                        return refs
-        return refs
+                    continue
+            refs_before_panel = len(events)
+            for start in range(0, frame_count - self.clip_length + 1, self.clip_stride):
+                stop = start + self.clip_length
+                if annotated_frames is not None and not any(start <= index < stop for index in annotated_frames):
+                    continue
+                events.append(
+                    _ref_event(
+                        record=record,
+                        role_id=panel.role_id,
+                        start=start,
+                        stop=stop,
+                        content_type=content_type,
+                        view_code=view_code,
+                        sample_id=(f"{record.exam_id}/{record.recording_id}/{panel.role_id}:frames_{start}_{stop - 1}"),
+                    )
+                )
+            if annotated_frames is not None and len(events) == refs_before_panel:
+                events.append(
+                    _skip_event(
+                        case_id=f"{record.exam_id}/{record.recording_id}/{panel.role_id}",
+                        reason=(
+                            f"no length-{self.clip_length} stride-{self.clip_stride} sliding window "
+                            "intersects linked contour annotations"
+                        ),
+                    )
+                )
+        return events
+
+
+def _ref_event(
+    *,
+    record: RecordingRecord,
+    role_id: str,
+    start: int,
+    stop: int,
+    content_type: str,
+    view_code: str,
+    sample_id: str,
+) -> list[Any]:
+    del record
+    return ["ref", str(role_id), int(start), int(stop), str(content_type), str(view_code), str(sample_id)]
+
+
+def _skip_event(*, case_id: str, reason: str) -> list[Any]:
+    return ["skip", str(case_id), str(reason)]
 
 
 def discover_records(
@@ -478,11 +605,8 @@ def discover_records(
     seed: int | None = None,
     content_types: tuple[str, ...] | None = None,
 ) -> list[RecordingRecord]:
-    wanted = {str(value).strip() for value in (content_types or ()) if str(value).strip()}
-    found = find_recordings(
-        root=root_dir,
-        predicate=lambda record: _segmentation_discovery_predicate(record, wanted=tuple(wanted)),
-    )
+    wanted = tuple(str(value).strip() for value in content_types or () if str(value).strip())
+    found = find_recordings(root=root_dir, annotated=STRAIN_CONTOUR_ANNOTATIONS, content_types=wanted)
     return discover_records_from_candidates(
         found,
         exam_ids=exam_ids,
@@ -491,18 +615,6 @@ def discover_records(
         seed=seed,
         description="Scanning segmentation recordings",
     )
-
-
-def _segmentation_discovery_predicate(record: RecordingRecord, *, wanted: tuple[str, ...]) -> bool:
-    if not any("strain" in content_type for content_type in record.content_types):
-        return False
-    if wanted and not bool(set(wanted) & set(record.content_types)):
-        return False
-    return any(path.startswith("data/") and path.endswith("_contour") for path in record.array_paths)
-
-
-def discover_case_dirs(*, root_dir: str | Path, max_cases: int | None = None) -> list[Path]:
-    return [record.path(root_dir) for record in discover_records(root_dir=root_dir, max_cases=max_cases)]
 
 
 def _discover_kwargs(data_config: Mapping[str, object]) -> dict[str, object]:
@@ -521,19 +633,31 @@ def _dataset_kwargs(config: Any, data_config: Mapping[str, object], root: str | 
         "target_mask_channels": int(cast(Any, data_config.get("target_mask_channels", max(1, model_out_channels - 1)))),
         "coordinate_space": str(data_config.get("coordinate_space", "beamspace")),
         "cartesian_height": optional_int(data_config.get("cartesian_height")),
+        "cartesian_preprocessing": str(data_config.get("cartesian_preprocessing", "centered_native_spacing")),
         "content_types": _string_tuple(data_config.get("content_types")),
+        "allowed_roles": _string_tuple(data_config.get("allowed_roles")),
+        "bmode_link_resolution": str(data_config.get("bmode_link_resolution", "timestamp_fallback")),
+        "sample_ref_cache_dir": scan_cache_dir(data_config),
+        "sample_ref_cache_read_only": _config_bool(data_config.get("sample_ref_cache_read_only", False)),
     }
 
 
 def _train_dataset_kwargs(data_config: Mapping[str, object]) -> dict[str, object]:
-    return {"training_transform": shared_training_transform_from_config(data_config)}
+    return {
+        "training_transform": shared_training_transform_from_config(data_config),
+        "sampling_mode": str(data_config.get("train_sampling_mode", data_config.get("sampling_mode", "sliding"))),
+        "target_frame_policy": str(
+            data_config.get("train_target_frame_policy", data_config.get("target_frame_policy", "all"))
+        ),
+        "annotation_context_frames": int(cast(Any, data_config.get("train_annotation_context_frames", 0))),
+    }
 
 
 def _val_dataset_kwargs(data_config: Mapping[str, object]) -> dict[str, object]:
     return {
         "include_cartesian_metrics": True,
         "sampling_mode": str(data_config.get("val_sampling_mode", data_config.get("sampling_mode", "full_recording"))),
-        "target_frame_policy": "annotated",
+        "target_frame_policy": str(data_config.get("val_target_frame_policy", "annotated")),
         "annotation_context_frames": int(cast(Any, data_config.get("val_annotation_context_frames", 8))),
     }
 
@@ -548,8 +672,13 @@ def _extra_fields(
     return {
         "coordinate_space": dataset_kwargs["coordinate_space"],
         "cartesian_height": dataset_kwargs["cartesian_height"],
+        "cartesian_preprocessing": dataset_kwargs["cartesian_preprocessing"],
+        "allowed_roles": list(cast(tuple[str, ...], dataset_kwargs["allowed_roles"])),
+        "bmode_link_resolution": dataset_kwargs["bmode_link_resolution"],
         "clip_length": dataset_kwargs["clip_length"],
-        "train_target_frame_policy": "full_clip_qrs_aware_contour",
+        "train_sampling_mode": cast(Any, train_dataset).sampling_mode,
+        "train_target_frame_policy": cast(Any, train_dataset).target_frame_policy,
+        "train_annotation_context_frames": cast(Any, train_dataset).annotation_context_frames,
         "val_sampling_mode": cast(Any, val_dataset).sampling_mode,
         "val_target_frame_policy": cast(Any, val_dataset).target_frame_policy,
         "val_annotation_context_frames": cast(Any, val_dataset).annotation_context_frames,
@@ -567,9 +696,6 @@ build_dataloaders = partial(
     dataset_cls=RawDataset,
     discover_records=discover_records,
     empty_message="Segmentation dataset is empty",
-    validate_data_config=lambda data_config: _reject_obsolete_segmentation_data_config(
-        cast(dict[str, Any], data_config)
-    ),
     discover_kwargs_fn=_discover_kwargs,
     dataset_kwargs_fn=_dataset_kwargs,
     train_dataset_kwargs_fn=_train_dataset_kwargs,
@@ -591,34 +717,14 @@ def _annotation_window_bounds(
     panel: Any,
     frame_count: int,
     context_frames: int,
+    bmode_link_resolution: str = "timestamp_fallback",
 ) -> tuple[int, int] | None:
-    contour_path, contour_timestamps_path = _contour_paths(panel)
-    if contour_path is None or contour_path not in store.group:
-        return None
-    contour_count = int(getattr(store.group[contour_path], "shape", (0,))[0])
-    if contour_count <= 0 or int(frame_count) <= 0:
-        return None
-    contour_timestamps = _load_timestamps(store, contour_timestamps_path, start=0, stop=contour_count)
-    if contour_timestamps_path and contour_timestamps_path in store.group:
-        try:
-            source_store = store.open_reference(panel.bmode.recording)
-        except (FileNotFoundError, KeyError, ValueError):
-            return None
-        target_timestamps = _load_timestamps(
-            source_store,
-            panel.bmode.timestamps_path,
-            start=0,
-            stop=int(frame_count),
-        )
-        matches = _annotated_target_frame_matches(
-            contour_timestamps=contour_timestamps,
-            target_timestamps=target_timestamps,
-            contour_count=contour_count,
-            target_count=int(frame_count),
-        )
-        annotated_frames = [int(target_index) for _contour_index, target_index in matches]
-    else:
-        annotated_frames = list(range(min(int(frame_count), contour_count)))
+    annotated_frames = _linked_annotation_frame_indices(
+        store,
+        panel=panel,
+        frame_count=frame_count,
+        bmode_link_resolution=bmode_link_resolution,
+    )
     if not annotated_frames:
         return None
     first = min(annotated_frames)
@@ -629,24 +735,171 @@ def _annotation_window_bounds(
     return (start, stop) if stop > start else None
 
 
+def _linked_annotation_frame_indices(
+    store: Any,
+    *,
+    panel: Any,
+    frame_count: int,
+    bmode_link_resolution: str = "timestamp_fallback",
+) -> tuple[int, ...]:
+    contour_path, contour_timestamps_path = _contour_paths(panel)
+    if contour_path is None or contour_path not in store.group:
+        return ()
+    contour_count = int(getattr(store.group[contour_path], "shape", (0,))[0])
+    if contour_count <= 0 or int(frame_count) <= 0:
+        return ()
+    contour_timestamps = _load_timestamps(store, contour_timestamps_path, start=0, stop=contour_count)
+    if contour_timestamps_path and contour_timestamps_path in store.group:
+        try:
+            source_store = store.open_reference(panel.bmode.recording)
+        except (FileNotFoundError, KeyError, ValueError):
+            return ()
+        _bmode_data_path, bmode_timestamps_path = _resolved_panel_bmode_paths(
+            store,
+            source_store,
+            panel,
+            resolution=bmode_link_resolution,
+        )
+        target_timestamps = _load_timestamps(
+            source_store,
+            bmode_timestamps_path,
+            start=0,
+            stop=int(frame_count),
+        )
+        matches = _annotated_target_frame_matches(
+            contour_timestamps=contour_timestamps,
+            target_timestamps=target_timestamps,
+            contour_count=contour_count,
+            target_count=int(frame_count),
+        )
+        return tuple(sorted({int(target_index) for _contour_index, target_index in matches}))
+    return tuple(range(min(int(frame_count), contour_count)))
+
+
 def _has_contour(store: Any, panel: Any) -> bool:
     return any(
         _is_contour_annotation(annotation) and annotation.value.path in store.group for annotation in panel.annotations
     )
 
 
-def _panel_frame_count(store: Any, panel: Any) -> int | None:
+def _panel_frame_count(
+    store: Any,
+    panel: Any,
+    *,
+    bmode_link_resolution: str = "timestamp_fallback",
+) -> int | None:
     try:
         source_store = store.open_reference(panel.bmode.recording)
     except (FileNotFoundError, KeyError, ValueError):
         return None
-    data_path = str(panel.bmode.data_path).strip("/")
+    data_path, _timestamps_path = _resolved_panel_bmode_paths(
+        store,
+        source_store,
+        panel,
+        resolution=bmode_link_resolution,
+    )
     if data_path not in source_store.group:
         return None
     shape = tuple(getattr(source_store.group[data_path], "shape", ()))
     if not shape:
         return None
     return int(shape[0])
+
+
+def _resolved_panel_bmode_paths(
+    store: Any,
+    source_store: Any,
+    panel: Any,
+    *,
+    resolution: str = "timestamp_fallback",
+) -> tuple[str, str | None]:
+    data_path = str(panel.bmode.data_path).strip("/")
+    timestamps_path = None if panel.bmode.timestamps_path is None else str(panel.bmode.timestamps_path).strip("/")
+    if data_path in source_store.group:
+        return data_path, timestamps_path
+    if resolution == "manifest_only":
+        return data_path, timestamps_path
+    resolved_data_path = _timestamp_aligned_panel_bmode_path(store, source_store, panel, data_path)
+    if resolved_data_path is None:
+        return data_path, timestamps_path
+    resolved_timestamps_path = _timestamp_path_for_bmode_data_path(source_store, resolved_data_path)
+    return resolved_data_path, resolved_timestamps_path
+
+
+def _timestamp_aligned_panel_bmode_path(
+    store: Any,
+    source_store: Any,
+    panel: Any,
+    data_path: str,
+) -> str | None:
+    candidates = _suffixed_bmode_candidates(source_store, data_path)
+    if not candidates:
+        return None
+    contour_path, contour_timestamps_path = _contour_paths(panel)
+    if not contour_timestamps_path or contour_timestamps_path not in store.group:
+        return None
+    contour_count = _array_length(store, contour_path) or _array_length(store, contour_timestamps_path)
+    if contour_count <= 0:
+        return None
+    contour_timestamps = _load_timestamps(store, contour_timestamps_path, start=0, stop=contour_count)
+    if contour_timestamps.size == 0:
+        return None
+
+    scores: list[tuple[float, str]] = []
+    for candidate in candidates:
+        timestamps_path = _timestamp_path_for_bmode_data_path(source_store, candidate)
+        if timestamps_path is None or timestamps_path not in source_store.group:
+            continue
+        target_count = _array_length(source_store, candidate)
+        if target_count <= 0:
+            continue
+        target_timestamps = _load_timestamps(source_store, timestamps_path, start=0, stop=target_count)
+        if target_timestamps.size == 0:
+            continue
+        scores.append((_mean_nearest_timestamp_delta(contour_timestamps, target_timestamps), candidate))
+    if not scores:
+        return None
+    return min(scores, key=lambda item: item[0])[1]
+
+
+def _suffixed_bmode_candidates(source_store: Any, data_path: str) -> tuple[str, ...]:
+    return tuple(
+        candidate for candidate in (f"{data_path}_{index}" for index in range(10)) if candidate in source_store.group
+    )
+
+
+def _timestamp_path_for_bmode_data_path(source_store: Any, data_path: str) -> str | None:
+    direct = f"timestamps/{str(data_path).strip('/').removeprefix('data/')}"
+    if direct in source_store.group:
+        return direct
+    timestamp_path = getattr(source_store, "timestamp_path", lambda _name: None)(data_path)
+    if timestamp_path and timestamp_path in source_store.group:
+        return str(timestamp_path)
+    return None
+
+
+def _array_length(store: Any, path: str | None) -> int:
+    if not path or path not in store.group:
+        return 0
+    shape = tuple(getattr(store.group[path], "shape", ()))
+    return int(shape[0]) if shape else 0
+
+
+def _mean_nearest_timestamp_delta(values: np.ndarray, candidates: np.ndarray) -> float:
+    query = np.asarray(values, dtype=np.float64)
+    target = np.asarray(candidates, dtype=np.float64)
+    query = query[np.isfinite(query)]
+    target = target[np.isfinite(target)]
+    if query.size == 0 or target.size == 0:
+        return float("inf")
+    if target.size == 1:
+        return float(np.mean(np.abs(query - float(target[0]))))
+    target = np.sort(target)
+    indices = np.searchsorted(target, query)
+    previous_indices = np.clip(indices - 1, 0, target.size - 1)
+    next_indices = np.clip(indices, 0, target.size - 1)
+    delta = np.minimum(np.abs(query - target[previous_indices]), np.abs(query - target[next_indices]))
+    return float(np.mean(delta))
 
 
 def _load_bmode_clip(
@@ -1098,71 +1351,22 @@ def _role_matches_content_type(role_id: str, content_type: str) -> bool:
     return True
 
 
-def _reject_obsolete_segmentation_data_config(data_config: dict[str, Any]) -> None:
-    obsolete = {
-        "sample_unit",
-        "sector_resample_enabled",
-        "sector_resample_depth_start_cm",
-        "sector_resample_depth_end_cm",
-        "sector_resample_tilt_deg",
-        "sector_resample_width_deg",
-    }
-    present = sorted(key for key in obsolete if key in data_config and data_config.get(key) not in {None, ""})
-    if present:
-        raise ValueError(
-            "Segmentation now runs in native beamspace; remove obsolete data config keys: " + ", ".join(present)
-        )
-
-
-def _cartesian_sector_mask(
-    geometry: SectorGeometry,
-    grid: CartesianGrid,
-    *,
-    shape: tuple[int, int] | None = None,
-) -> np.ndarray:
-    out_h, out_w = grid.shape if shape is None else (int(shape[0]), int(shape[1]))
-    xs = np.linspace(grid.x_range_m[0], grid.x_range_m[1], out_w, dtype=np.float64)
-    ys = np.linspace(grid.y_range_m[0], grid.y_range_m[1], out_h, dtype=np.float64)
-    xx, yy = np.meshgrid(xs, ys)
-    radii = np.sqrt(xx**2 + yy**2)
-    angles = np.arctan2(xx, yy)
-    return cast(
-        np.ndarray,
-        (
-            (radii >= geometry.depth_start_m)
-            & (radii <= geometry.depth_end_m)
-            & (angles >= geometry.angle_start_rad)
-            & (angles <= geometry.angle_end_rad)
-        ),
+def _centered_cartesian_grid(
+    native_grid: CartesianGrid,
+    target_shape: tuple[int, int],
+) -> CartesianGrid:
+    """Center-crop or pad a Cartesian grid without changing physical pixel spacing."""
+    target_h, target_w = int(target_shape[0]), int(target_shape[1])
+    dx, dy = native_grid.spacing_m
+    center_x = 0.5 * (float(native_grid.x_range_m[0]) + float(native_grid.x_range_m[1]))
+    center_y = 0.5 * (float(native_grid.y_range_m[0]) + float(native_grid.y_range_m[1]))
+    half_x = 0.5 * float(dx) * max(0, target_w - 1)
+    half_y = 0.5 * float(dy) * max(0, target_h - 1)
+    return CartesianGrid(
+        shape=(target_h, target_w),
+        x_range_m=(center_x - half_x, center_x + half_x),
+        y_range_m=(center_y - half_y, center_y + half_y),
     )
-
-
-def _cartesian_grid_sample_grid(
-    geometry: SectorGeometry,
-    grid: CartesianGrid,
-    *,
-    source_shape: tuple[int, int],
-) -> np.ndarray:
-    out_h, out_w = grid.shape
-    src_h, src_w = int(source_shape[0]), int(source_shape[1])
-    xs = np.linspace(grid.x_range_m[0], grid.x_range_m[1], out_w, dtype=np.float64)
-    ys = np.linspace(grid.y_range_m[0], grid.y_range_m[1], out_h, dtype=np.float64)
-    xx, yy = np.meshgrid(xs, ys)
-    radii = np.sqrt(xx**2 + yy**2)
-    angles = np.arctan2(xx, yy)
-    rows = (radii - geometry.depth_start_m) / geometry.depth_span_m * max(0, src_h - 1)
-    cols = (angles - geometry.angle_start_rad) / geometry.angle_span_rad * max(0, src_w - 1)
-    x = cols / max(1, src_w - 1) * 2.0 - 1.0
-    y = rows / max(1, src_h - 1) * 2.0 - 1.0
-    return np.stack([x, y], axis=-1).astype(np.float32)
-
-
-def _cartesian_image_sample_grid(grid: CartesianGrid) -> np.ndarray:
-    out_h, out_w = grid.shape
-    x = np.linspace(-1.0, 1.0, out_w, dtype=np.float64)
-    y = np.linspace(-1.0, 1.0, out_h, dtype=np.float64)
-    xx, yy = np.meshgrid(x, y)
-    return np.stack([xx, yy], axis=-1).astype(np.float32)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:
@@ -1239,17 +1443,8 @@ def _segmentation_qrs_arrays_from_mapping(raw: Any) -> list[np.ndarray]:
 
 
 def _segmentation_qrs_arrays_from_paths(store: Any, role_id: str) -> list[np.ndarray]:
-    candidate_pairs = (
-        (f"timestamps/{role_id}_ecg_qrs", f"data/{role_id}_ecg_qrs"),
-        (f"timestamps/{role_id}_qrs", f"data/{role_id}_qrs"),
-        ("timestamps/ecg_qrs", "data/ecg_qrs"),
-    )
-    values: list[np.ndarray] = []
-    for timestamp_path, data_path in candidate_pairs:
-        path = timestamp_path if timestamp_path in store.group else data_path
-        if path in store.group:
-            values.append(np.asarray(store.group[path][:], dtype=np.float64))
-    return values
+    candidate_paths = (f"timestamps/{role_id}_ecg_qrs", f"timestamps/{role_id}_qrs", "timestamps/ecg_qrs")
+    return [np.asarray(store.group[path][:], dtype=np.float64) for path in candidate_paths if path in store.group]
 
 
 def _optional_float_array(value: Any) -> np.ndarray | None:

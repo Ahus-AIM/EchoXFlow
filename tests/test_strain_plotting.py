@@ -5,13 +5,16 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+from conftest import make_record, strain_document
 
-from echoxflow.croissant import RecordingRecord
 from echoxflow.plotting.renderer import RecordingPlotRenderer
 from echoxflow.plotting.style import PlotStyle
 from echoxflow.plotting.timeline import select_timeline
 
 zarr = pytest.importorskip("zarr")
+
+_strain_document = strain_document
+_record = make_record
 
 
 def test_strain_plotter_builds_self_referenced_bmode_with_contour_and_curve(tmp_path: Path) -> None:
@@ -60,14 +63,20 @@ def test_strain_plotter_builds_self_referenced_bmode_with_contour_and_curve(tmp_
         "field": "contour_points",
     }
     assert panels[0].loaded.attrs["annotation_overlays"][0]["timestamps"].shape == (3,)
+    layout = panels[0].loaded.attrs["annotation_overlays"][0]["group_layout"]
+    assert (layout.group_size, layout.endo_index, layout.outer_index) == (3, 0, 2)
     assert panels[1].kind == "line"
     assert panels[1].loaded.attrs["strain_curve"] is True
     assert ecg.signal.shape == (1,)
 
     figure = renderer.render_figure_from_specs(panels=panels, ecg=ecg, time_s=0.1, frame_index=1, dpi=100)
     try:
-        assert len(figure.axes[0].lines) >= 2
-        assert any(np.asarray(line.get_xdata()).size >= 3 for line in figure.axes[0].lines)
+        lines = figure.axes[0].lines
+        mid = [line for line in lines if line.get_zorder() == 8.3]
+        assert len(mid) == 1 and mid[0].get_marker() == "o" and mid[0].get_linestyle() == "-"
+        dots = [line for line in lines if line.get_zorder() == 8.2]
+        assert [line.get_alpha() for line in dots] == [0.7, 0.7]
+        assert all(line.get_linestyle() == "None" for line in dots)
     finally:
         plt.close(figure)
 
@@ -243,6 +252,53 @@ def test_strain_plotter_can_select_one_role_from_explicit_modalities(tmp_path: P
     }
 
 
+def test_strain_both_view_emits_beamspace_and_cartesian_panel_per_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from echoxflow.plotting import renderer as renderer_module
+
+    for role in ("2ch", "4ch"):
+        source = zarr.open_group(tmp_path / f"{role}.zarr", mode="w")
+        source.create_array("data/2d_brightness_mode", data=np.zeros((1, 8, 8), dtype=np.uint8))
+        source.create_array("timestamps/2d_brightness_mode", data=np.asarray([0.0], dtype=np.float32))
+    strain = zarr.open_group(tmp_path / "strain.zarr", mode="w")
+    for role in ("2ch", "4ch"):
+        strain.create_array(f"data/{role}_contour", data=_contours()[:1])
+        strain.create_array(f"timestamps/{role}_contour", data=np.asarray([0.0], dtype=np.float32))
+    strain.attrs["recording_manifest"] = _strain_document(("2ch", "4ch"))
+    record = _record(
+        "strain",
+        "strain.zarr",
+        content_types=("2d_left_ventricular_strain",),
+        array_paths=(
+            "data/2ch_contour",
+            "timestamps/2ch_contour",
+            "data/4ch_contour",
+            "timestamps/4ch_contour",
+        ),
+    )
+    monkeypatch.setattr(renderer_module, "_loaded_has_sector_geometry", lambda loaded: True)
+    monkeypatch.setattr(renderer_module, "cartesian_loaded_arrays", lambda loaded, **_: loaded)
+    renderer = RecordingPlotRenderer(style=PlotStyle(width_px=420, height_px=320, dpi=100))
+
+    panels, _ = renderer._load_specs(
+        record,
+        root=tmp_path,
+        modalities=("strain",),
+        view_mode="both",
+        show_annotations=True,
+    )
+
+    views = [(panel.view, panel.loaded.attrs["strain_role_id"]) for panel in panels]
+    assert views == [
+        ("beamspace", "2ch"),
+        ("beamspace", "4ch"),
+        ("cartesian", "2ch"),
+        ("cartesian", "4ch"),
+    ]
+    assert all(panel.loaded.attrs["annotation_overlays"] for panel in panels)
+
+
 def _contours() -> np.ndarray:
     return np.asarray(
         [
@@ -250,97 +306,4 @@ def _contours() -> np.ndarray:
             [[-0.005, 0.032], [0.0, 0.042], [0.005, 0.032]],
         ],
         dtype=np.float32,
-    )
-
-
-def _strain_document(
-    roles: tuple[str, ...],
-    *,
-    self_recording_id: str | None = None,
-    include_qrs: bool = False,
-) -> dict[str, object]:
-    annotations: list[dict[str, object]] = []
-    for role in roles:
-        annotations.extend(
-            [
-                {
-                    "target": {
-                        "type": "linked_panel",
-                        "semantic_id": role,
-                        "field": "contour_points",
-                    },
-                    "target_data": {"zarr_path": "data/2d_brightness_mode", "format": "zarr_array"},
-                    "time": {"zarr_path": f"timestamps/{role}_contour", "format": "zarr_array"},
-                    "value": {"zarr_path": f"data/{role}_contour", "format": "zarr_array"},
-                },
-                {
-                    "target": {
-                        "type": "linked_panel",
-                        "semantic_id": role,
-                        "field": "strain_curve",
-                    },
-                    "target_data": {"zarr_path": "data/2d_brightness_mode", "format": "zarr_array"},
-                    "time": {"zarr_path": f"timestamps/{role}_curve", "format": "zarr_array"},
-                    "value": {"zarr_path": f"data/{role}_curve", "format": "zarr_array"},
-                },
-            ]
-        )
-        if include_qrs:
-            annotations.append(
-                {
-                    "target": {
-                        "type": "linked_panel",
-                        "semantic_id": role,
-                        "field": "ecg_qrs",
-                    },
-                    "target_data": {"zarr_path": "data/2d_brightness_mode", "format": "zarr_array"},
-                    "time": {"zarr_path": f"timestamps/{role}_ecg_qrs", "format": "zarr_array"},
-                    "value": {"zarr_path": f"data/{role}_ecg_qrs", "format": "zarr_array"},
-                }
-            )
-    return {
-        "manifest_type": "strain",
-        "schema_version": 4,
-        "annotation_type": "right_ventricular_strain" if roles == ("rv",) else "left_ventricular_strain",
-        "linked_panels": [
-            {
-                "role_id": role,
-                "view_code": role.upper(),
-                "geometry": {
-                    "depth_start_m": 0.0,
-                    "depth_end_m": 0.08,
-                    "tilt_rad": 0.0,
-                    "width_rad": 0.5,
-                },
-                "frame_timestamps": {"zarr_path": "timestamps/2d_brightness_mode", "format": "zarr_array"},
-                "linked_recording": {
-                    "recording_id": self_recording_id or f"{role}_source",
-                    "recording_zarr_path": "rv.zarr" if self_recording_id is not None else f"{role}.zarr",
-                    "relative_zarr_path": "rv.zarr" if self_recording_id is not None else f"{role}.zarr",
-                    "frames_array_path": "data/2d_brightness_mode",
-                    "timestamps_array_path": "timestamps/2d_brightness_mode",
-                },
-            }
-            for role in roles
-        ],
-        "annotations": annotations,
-    }
-
-
-def _record(
-    recording_id: str,
-    zarr_path: str,
-    *,
-    content_types: tuple[str, ...],
-    array_paths: tuple[str, ...],
-) -> RecordingRecord:
-    return RecordingRecord(
-        exam_id="exam",
-        recording_id=recording_id,
-        zarr_path=zarr_path,
-        modes=("2d", "aps"),
-        content_types=content_types,
-        frame_counts_by_content_type={content_type: 1 for content_type in content_types},
-        median_delta_time_by_content_type={},
-        array_paths=array_paths,
     )

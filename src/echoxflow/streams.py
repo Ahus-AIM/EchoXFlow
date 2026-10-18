@@ -2,27 +2,42 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Literal, Mapping, TypeAlias, cast
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, Mapping, Sequence, TypeAlias, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from echoxflow.scan.geometry import SectorGeometry
-
-TDI_NATIVE_STORAGE_ENCODING = "ge_tdi_raw_u16"
-TDI_LINEAR_UINT8_STORAGE_ENCODING = "linear_velocity_uint8_mps_v1"
+from echoxflow.schema import (
+    ARRAY_GROUPS,
+    TDI_PACKED_STORAGE_ENCODING,
+    TDI_SAMPLE_TYPES,
+    ArrayInfo,
+    color_flow_raw_to_power,
+    color_flow_raw_to_velocity,
+    semantic_name,
+    tdi_raw_to_velocity,
+)
 
 FloatArray: TypeAlias = NDArray[np.float32]
 UInt8Array: TypeAlias = NDArray[np.uint8]
-UInt16Array: TypeAlias = NDArray[np.uint16]
 Int32Array: TypeAlias = NDArray[np.int32]
 Int64Array: TypeAlias = NDArray[np.int64]
 
 
 @dataclass(frozen=True)
 class StreamMetadata:
-    """Validated metadata relevant to stream interpretation."""
+    """Validated metadata relevant to stream interpretation.
+
+    Doppler calibration has two forms. ``velocity_limit_mps`` is a single scale and is set only when one scale
+    applies to every frame. ``velocity_scale_mps_per_frame`` is the exported per-frame scale, sliced together with
+    the frames, with NaN marking frames that carry no calibration. A stream whose scale changes therefore has a
+    per-frame scale and no scalar limit; no first, median or maximum value stands in for it.
+
+    ``source_data_path`` is the source array a derived product inherits its sector, clock and calibration from, and
+    ``array_info`` the store's own declaration (units, dimensions, derivation) of the loaded array.
+    """
 
     data_path: str
     value_range: tuple[float, float] | None = None
@@ -31,12 +46,76 @@ class StreamMetadata:
     storage_encoding: str | None = None
     fenc_table_path: str | None = None
     colormap_path: str | None = None
+    colormap_selection: str | None = None
+    colormap_candidates: tuple[str, ...] = ()
     geometry: SectorGeometry | None = None
     stitch_beat_count: int | None = None
     raw: Mapping[str, Any] | None = None
+    velocity_scale_mps_per_frame: np.ndarray | None = field(default=None, compare=False, repr=False)
+    velocity_scale_path: str | None = None
+    source_data_path: str | None = None
+    validity_mask_path: str | None = None
+    segment_offsets_path: str | None = None
+    array_info: ArrayInfo | None = None
 
     def with_value_range(self, value_range: tuple[float, float] | None) -> StreamMetadata:
         return replace(self, value_range=value_range)
+
+    def with_frame_slice(self, start: int, stop: int | None) -> StreamMetadata:
+        """Return this metadata for frames ``start:stop``; the per-frame scale is sliced with them."""
+        scale = self.velocity_scale_mps_per_frame
+        if scale is None:
+            return self
+        return replace(self, velocity_scale_mps_per_frame=np.asarray(scale)[int(start) : stop])
+
+    @property
+    def acquisition_controls(self) -> Mapping[str, Any]:
+        """The sector's scanner controls (gain, PRF, packet size, ...), for reporting and covariates.
+
+        These are the controls as the source recorded them; calibration that changes during the stream is carried
+        by ``velocity_scale_mps_per_frame``, not by the control snapshot.
+        """
+        controls = None if self.raw is None else self.raw.get("stream_controls")
+        return controls if isinstance(controls, Mapping) else {}
+
+    @property
+    def velocity_scale_status(self) -> str:
+        """``constant``, ``varying``, ``partial`` (some frames uncalibrated) or ``missing``."""
+        scale = self.velocity_scale_mps_per_frame
+        if scale is None:
+            return "missing" if self.velocity_limit_mps is None else "constant"
+        return velocity_scale_status(scale)
+
+    def velocity_scales_mps(self, frame_count: int) -> np.ndarray | None:
+        """Return one scale per frame (NaN where uncalibrated), or ``None`` without any calibration."""
+        if self.velocity_scale_mps_per_frame is not None:
+            scale = np.asarray(self.velocity_scale_mps_per_frame, dtype=np.float64).reshape(-1)
+            if scale.size != int(frame_count):
+                raise ValueError(
+                    f"{self.data_path} has {frame_count} frames but {scale.size} per-frame velocity scales"
+                )
+            return scale
+        if self.velocity_limit_mps is None:
+            return None
+        return np.full(int(frame_count), float(self.velocity_limit_mps), dtype=np.float64)
+
+
+def velocity_scale_status(scale: np.ndarray) -> str:
+    """Classify a per-frame velocity scale as ``constant``, ``varying``, ``partial`` or ``missing``."""
+    values = np.asarray(scale, dtype=np.float64).reshape(-1)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return "missing"
+    if finite.size < values.size:
+        return "partial"
+    return "constant" if np.all(finite == finite[0]) else "varying"
+
+
+def constant_velocity_scale(scale: np.ndarray | None) -> float | None:
+    """Return the one scale of a fully calibrated, constant per-frame scale, else ``None``."""
+    if scale is None or velocity_scale_status(scale) != "constant":
+        return None
+    return float(np.asarray(scale, dtype=np.float64).reshape(-1)[0])
 
 
 @dataclass(frozen=True)
@@ -113,13 +192,65 @@ class ColorDopplerPowerStream(BaseStream):
 
 
 @dataclass(frozen=True)
+class ColorFlowRawStream(BaseStream):
+    """Native GE colour-flow estimator output, `[time, radial, beam, 4]` uint8.
+
+    Channels are `rx`, `ry`, `power`, `auxiliary`. Velocity is the phase of the lag-one
+    autocorrelation `(rx, ry)`; power is the third channel as a fraction of full scale.
+    """
+
+    data: UInt8Array
+    kind: Literal["color_flow_raw"] = "color_flow_raw"
+
+    def to_velocity(self) -> ColorDopplerVelocityStream:
+        scale = _velocity_scale(self.metadata, int(self.data.shape[0]), "Color Doppler velocity_limit_mps")
+        return ColorDopplerVelocityStream(
+            name=self.name,
+            data_path=self.data_path,
+            data=color_flow_raw_to_velocity(self.data, velocity_limit_mps=scale),
+            timestamps_path=self.timestamps_path,
+            timestamps=self.timestamps,
+            sample_rate_hz=self.sample_rate_hz,
+            metadata=self.metadata.with_value_range(_velocity_value_range(scale)),
+        )
+
+    def to_power(self) -> ColorDopplerPowerStream:
+        return ColorDopplerPowerStream(
+            name=self.name,
+            data_path=self.data_path,
+            data=color_flow_raw_to_power(self.data),
+            timestamps_path=self.timestamps_path,
+            timestamps=self.timestamps,
+            sample_rate_hz=self.sample_rate_hz,
+            metadata=self.metadata.with_value_range((0.0, 1.0)),
+        )
+
+    def to_float(self) -> ColorDopplerVelocityStream:
+        return self.to_velocity()
+
+
+@dataclass(frozen=True)
 class TissueDopplerRawStream(BaseStream):
-    data: UInt16Array
+    """Native tissue Doppler estimator output, decoded by its declared storage encoding.
+
+    Stores two uint8 channels, ``[time, radial, beam, 2]``, in one of two encodings
+    (``metadata.storage_encoding``): the bytes of a packed ``RxRyPower(5,5,6)`` code that the sector's FencTable
+    maps to a frequency, or separate ``FreqBw(8,8)`` frequency and bandwidth channels.
+    """
+
+    data: UInt8Array
     kind: Literal["tissue_doppler_raw"] = "tissue_doppler_raw"
 
-    def to_float(self, fenc_table: np.ndarray) -> TissueDopplerFloatStream:
-        velocity_limit = _positive_float(self.metadata.velocity_limit_mps, "Tissue Doppler velocity_limit_mps")
-        physical = render_tdi_native_codes(self.data, fenc_table=fenc_table, velocity_scale_mps=velocity_limit)
+    def to_float(self, fenc_table: np.ndarray | None = None) -> TissueDopplerFloatStream:
+        frame_count = int(self.data.shape[0])
+        scale = _velocity_scale(self.metadata, frame_count, "Tissue Doppler velocity_limit_mps")
+        physical = tdi_raw_to_velocity(
+            self.data,
+            storage_encoding=str(self.metadata.storage_encoding),
+            velocity_scale_mps=scale,
+            fenc_table=fenc_table,
+        )
+        value_range = _velocity_value_range(scale)
         return TissueDopplerFloatStream(
             name=self.name,
             data_path=self.data_path,
@@ -127,7 +258,7 @@ class TissueDopplerRawStream(BaseStream):
             timestamps_path=self.timestamps_path,
             timestamps=self.timestamps,
             sample_rate_hz=self.sample_rate_hz,
-            metadata=self.metadata.with_value_range((-velocity_limit, velocity_limit)),
+            metadata=self.metadata.with_value_range(value_range),
         )
 
 
@@ -180,6 +311,7 @@ EchoStream: TypeAlias = (
     | FloatImageStream
     | ColorDopplerVelocityStream
     | ColorDopplerPowerStream
+    | ColorFlowRawStream
     | TissueDopplerRawStream
     | TissueDopplerFloatStream
     | SpectralDopplerStream
@@ -190,17 +322,32 @@ EchoStream: TypeAlias = (
 )
 
 
-def temporal_axis_for_path(data_path: str, data_ndim: int) -> int:
-    """Return the axis that carries time for an EchoXFlow data path."""
-    return 0
-
-
 def temporal_sample_count(data_path: str, data: np.ndarray) -> int:
     """Return the number of temporal samples for one data array."""
     arr = np.asarray(data)
     if arr.ndim == 0:
         return 0
-    return int(arr.shape[temporal_axis_for_path(data_path, arr.ndim)])
+    return int(arr.shape[0])
+
+
+def validated_stream_timestamps(
+    data_path: str,
+    shape: Sequence[int],
+    timestamps: np.ndarray | None,
+) -> FloatArray | None:
+    """Type and check timestamps for an array of ``shape`` exactly as :func:`stream_from_arrays` does for its data.
+
+    This validates a stream's timestamps against the stored array length without reading the samples.
+    """
+    normalized_path = _normalize_data_path(data_path)
+    typed_timestamps = _timestamps_or_none(timestamps)
+    dims = tuple(int(size) for size in shape)
+    if typed_timestamps is None or not dims:
+        return typed_timestamps
+    expected = dims[0]
+    if typed_timestamps.size != expected:
+        raise ValueError(f"{normalized_path} has {expected} temporal samples but {typed_timestamps.size} timestamps")
+    return typed_timestamps
 
 
 def stream_from_arrays(
@@ -214,7 +361,7 @@ def stream_from_arrays(
 ) -> EchoStream:
     """Validate arrays and return the strongest typed stream for a data path."""
     normalized_path = _normalize_data_path(data_path)
-    name = normalized_path.removeprefix("data/")
+    name = semantic_name(normalized_path)
     stream_metadata = metadata or StreamMetadata(data_path=normalized_path)
     typed_timestamps = _timestamps_or_none(timestamps)
     base_kwargs: dict[str, Any] = {
@@ -232,19 +379,31 @@ def stream_from_arrays(
         return BrightnessModeStream(
             data=_uint8_array(arr, min_ndim=2, label=normalized_path), metadata=stream_metadata, **base_kwargs
         )
-    if name == "2d_color_doppler_velocity":
-        limit = _positive_float(stream_metadata.velocity_limit_mps, "Color Doppler velocity_limit_mps")
-        metadata_with_range = stream_metadata.with_value_range((-limit, limit))
-        return ColorDopplerVelocityStream(
-            data=_float_array(arr, min_ndim=2, label=normalized_path), metadata=metadata_with_range, **base_kwargs
+    if _is_color_doppler_role(name, "velocity"):
+        scale = _velocity_scale(
+            stream_metadata, temporal_sample_count(normalized_path, arr), "Color Doppler velocity_limit_mps"
         )
-    if name == "2d_color_doppler_power":
+        metadata_with_range = stream_metadata.with_value_range(_velocity_value_range(scale))
+        return ColorDopplerVelocityStream(
+            # Samples with no flow estimate are NaN by construction: the lag-one
+            # autocorrelation has no phase where its real and imaginary parts are both zero.
+            data=_float_array(arr, min_ndim=2, label=normalized_path, allow_nan=True),
+            metadata=metadata_with_range,
+            **base_kwargs,
+        )
+    if _is_color_doppler_role(name, "power"):
         return ColorDopplerPowerStream(
             data=_float_array(arr, min_ndim=2, label=normalized_path),
             metadata=stream_metadata.with_value_range((0.0, 1.0)),
             **base_kwargs,
         )
-    if name == "tissue_doppler":
+    if _is_color_doppler_role(name, "raw"):
+        return ColorFlowRawStream(
+            data=_uint8_array(arr, min_ndim=4, label=normalized_path),
+            metadata=stream_metadata.with_value_range(_dtype_value_range(arr)),
+            **base_kwargs,
+        )
+    if _is_tissue_doppler_stream(name):
         return _tissue_doppler_stream(arr, stream_metadata, base_kwargs)
     if name.startswith("1d_"):
         return SpectralDopplerStream(
@@ -265,74 +424,9 @@ def stream_from_arrays(
     return GenericStream(data=arr, metadata=stream_metadata, **base_kwargs)
 
 
-def render_tdi_native_codes(
-    raw_codes: np.ndarray,
-    *,
-    fenc_table: np.ndarray,
-    velocity_scale_mps: float,
-) -> FloatArray:
-    """Convert native GE TDI uint16 codes to physical velocities."""
-    codes = np.asarray(raw_codes, dtype=np.uint16)
-    if codes.ndim != 3:
-        raise ValueError(f"TDI native raw codes must be a 3D frame stack, got shape={codes.shape}")
-    fenc_flat = np.asarray(fenc_table, dtype=np.uint8).reshape(-1, 4)
-    if fenc_flat.shape[0] < 256 * 256:
-        raise ValueError(f"TDI FencTable must contain at least 65536 rows, got {fenc_flat.shape[0]}")
-    scale = _positive_float(velocity_scale_mps, "TDI velocity_scale_mps")
-    mapped = fenc_flat[: 256 * 256][codes]
-    col = mapped[..., 0].astype(np.int16)
-    col_physical = 255 - ((col + 128) & 0xFF)
-    physical = (((col_physical.astype(np.float32) / 255.0) * 2.0) - 1.0) * scale
-    return np.asarray(physical, dtype=np.float32)
-
-
-def encode_tdi_native_codes(
-    velocities_mps: np.ndarray,
-    *,
-    fenc_table: np.ndarray,
-    velocity_scale_mps: float,
-) -> UInt16Array:
-    """Quantize physical TDI velocities back to native GE uint16 codes."""
-    scale = _positive_float(velocity_scale_mps, "TDI velocity_scale_mps")
-    fenc_flat = np.asarray(fenc_table, dtype=np.uint8).reshape(-1, 4)
-    if fenc_flat.shape[0] < 256 * 256:
-        raise ValueError(f"TDI FencTable must contain at least 65536 rows, got {fenc_flat.shape[0]}")
-    code_by_bucket = _native_tdi_code_by_velocity_bucket(fenc_flat[: 256 * 256])
-    values = np.nan_to_num(np.asarray(velocities_mps, dtype=np.float32), nan=0.0, posinf=scale, neginf=-scale)
-    normalized = ((np.clip(values, -scale, scale) / scale) + 1.0) * 0.5
-    buckets = np.clip(np.rint(normalized * 255.0), 0.0, 255.0).astype(np.uint8)
-    return cast(UInt16Array, code_by_bucket[buckets])
-
-
-def render_tdi_linear_uint8_codes(
-    velocity_codes: np.ndarray,
-    *,
-    velocity_scale_mps: float,
-) -> FloatArray:
-    """Convert exported linear TDI uint8 velocity codes to physical velocities."""
-    codes = np.asarray(velocity_codes)
-    if codes.dtype != np.uint8:
-        raise ValueError(f"TDI linear velocity codes must use uint8 storage, got {codes.dtype}")
-    scale = _positive_float(velocity_scale_mps, "TDI velocity_scale_mps")
-    physical = (((codes.astype(np.float32) / 255.0) * 2.0) - 1.0) * scale
-    return np.asarray(physical, dtype=np.float32)
-
-
-def encode_tdi_linear_uint8_codes(
-    velocities_mps: np.ndarray,
-    *,
-    velocity_scale_mps: float,
-) -> UInt8Array:
-    """Quantize physical TDI velocities to linear uint8 velocity codes."""
-    scale = _positive_float(velocity_scale_mps, "TDI velocity_scale_mps")
-    values = np.nan_to_num(np.asarray(velocities_mps, dtype=np.float32), nan=0.0, posinf=scale, neginf=-scale)
-    normalized = ((np.clip(values, -scale, scale) / scale) + 1.0) * 0.5
-    return cast(UInt8Array, np.clip(np.rint(normalized * 255.0), 0.0, 255.0).astype(np.uint8))
-
-
 def default_value_range_for_path(data_path: str, values: np.ndarray | None = None) -> tuple[float, float] | None:
     """Return a fixed non-adaptive range for streams without metadata-derived ranges."""
-    name = _normalize_data_path(data_path).removeprefix("data/")
+    name = semantic_name(data_path)
     if name.startswith("2d_brightness_mode") or name in {
         "2d_biplane_brightness_mode",
         "2d_triplane_brightness_mode",
@@ -352,26 +446,70 @@ def default_value_range_for_path(data_path: str, values: np.ndarray | None = Non
 def _tissue_doppler_stream(
     arr: np.ndarray, metadata: StreamMetadata, base_kwargs: Mapping[str, Any]
 ) -> TissueDopplerRawStream | TissueDopplerFloatStream:
-    limit = _positive_float(metadata.velocity_limit_mps, "Tissue Doppler velocity_limit_mps")
-    if metadata.storage_encoding == TDI_NATIVE_STORAGE_ENCODING:
-        if not metadata.fenc_table_path:
-            raise ValueError("Native TDI stream is missing fenc_table_path metadata")
+    values = np.asarray(arr)
+    # A sector's storage encoding describes its raw array even when the caller asked for the derived display
+    # velocity beside it, so dispatch on the array's own layout first.
+    if values.dtype == np.uint8 and values.ndim == 4:
+        encoding = metadata.storage_encoding
+        if encoding not in TDI_SAMPLE_TYPES:
+            raise ValueError(
+                f"{metadata.data_path} is two-channel native TDI without a supported storage encoding: {encoding!r}"
+            )
+        if encoding == TDI_PACKED_STORAGE_ENCODING and not metadata.fenc_table_path:
+            raise ValueError("Packed native TDI stream is missing its sector's fenc_table_path metadata")
+        _velocity_scale(metadata, int(values.shape[0]), "Tissue Doppler velocity_limit_mps")
         return TissueDopplerRawStream(
-            data=_uint16_array(arr, ndim=3, label="data/tissue_doppler"),
-            metadata=metadata.with_value_range(_dtype_value_range(arr)),
+            data=_uint8_array(values, ndim=4, label=metadata.data_path),
+            metadata=metadata.with_value_range(_dtype_value_range(values)),
             **base_kwargs,
         )
-    if metadata.storage_encoding == TDI_LINEAR_UINT8_STORAGE_ENCODING:
-        return TissueDopplerFloatStream(
-            data=render_tdi_linear_uint8_codes(arr, velocity_scale_mps=limit),
-            metadata=metadata.with_value_range((-limit, limit)),
-            **base_kwargs,
-        )
+    # Physical velocities (the display product): values are already in m/s, scaled frame by frame.
+    data = _float_array(arr, min_ndim=2, label="data/tissue_doppler", allow_nan=True)
+    scale = _velocity_scale(metadata, int(data.shape[0]), "Tissue Doppler velocity_limit_mps")
     return TissueDopplerFloatStream(
-        data=_float_array(arr, min_ndim=2, label="data/tissue_doppler"),
-        metadata=metadata.with_value_range((-limit, limit)),
+        data=data,
+        metadata=metadata.with_value_range(_velocity_value_range(scale)),
         **base_kwargs,
     )
+
+
+def _velocity_scale(metadata: StreamMetadata, frame_count: int, label: str) -> float | np.ndarray:
+    """Return the calibration a Doppler stream decodes with: one scalar, or one scale per frame."""
+    if metadata.velocity_scale_mps_per_frame is not None:
+        scale = metadata.velocity_scales_mps(frame_count)
+        assert scale is not None
+        if np.any(np.isinf(scale)) or np.any(np.isfinite(scale) & (scale <= 0.0)):
+            raise ValueError(f"{label} per-frame scale must be positive where calibrated")
+        if frame_count and not np.any(np.isfinite(scale)):
+            raise ValueError(f"{label} is required: no frame of {metadata.data_path} has a calibrated scale")
+        constant = constant_velocity_scale(scale)
+        return constant if constant is not None else scale
+    return _positive_float(metadata.velocity_limit_mps, label)
+
+
+def _velocity_value_range(scale: float | np.ndarray) -> tuple[float, float] | None:
+    """Symmetric display range covering every calibrated frame; a display bound, not a physical scale."""
+    values = np.asarray(scale, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None
+    limit = float(np.max(finite))
+    return (-limit, limit)
+
+
+def _is_color_doppler_role(name: str, role: str) -> bool:
+    """Match primary and numbered secondary colour streams, e.g. ``2d_color_doppler_velocity_2``."""
+    stem = f"2d_color_doppler_{role}"
+    return name == stem or (name.startswith(f"{stem}_") and name.removeprefix(f"{stem}_").isdigit())
+
+
+def _is_tissue_doppler_stream(name: str) -> bool:
+    if name == "tissue_doppler":
+        return True
+    for stem in ("2d_tissue_doppler_raw", "2d_tissue_doppler_display_velocity"):
+        if name == stem or (name.startswith(f"{stem}_") and name.removeprefix(f"{stem}_").isdigit()):
+            return True
+    return False
 
 
 def _timestamps_or_none(timestamps: np.ndarray | None) -> FloatArray | None:
@@ -391,38 +529,20 @@ def _validate_temporal_length(data_path: str, data: np.ndarray, timestamps: Floa
         raise ValueError(f"{data_path} has {expected} temporal samples but {timestamps.size} timestamps")
 
 
-def _native_tdi_code_by_velocity_bucket(fenc_table: np.ndarray) -> UInt16Array:
-    col = fenc_table[:, 0].astype(np.int16)
-    buckets = np.asarray(255 - ((col + 128) & 0xFF), dtype=np.uint8)
-    code_by_bucket = np.zeros(256, dtype=np.uint16)
-    seen = np.zeros(256, dtype=bool)
-    for code, bucket in enumerate(buckets):
-        index = int(bucket)
-        if not seen[index]:
-            code_by_bucket[index] = np.uint16(code)
-            seen[index] = True
-    if np.all(seen):
-        return cast(UInt16Array, code_by_bucket)
-    available = np.flatnonzero(seen)
-    if available.size == 0:
-        raise ValueError("TDI FencTable does not contain any usable velocity buckets")
-    for missing in np.flatnonzero(~seen):
-        nearest = available[int(np.argmin(np.abs(available - missing)))]
-        code_by_bucket[int(missing)] = code_by_bucket[int(nearest)]
-    return cast(UInt16Array, code_by_bucket)
-
-
 def _float_array(
     values: np.ndarray,
     *,
     label: str,
     ndim: int | None = None,
     min_ndim: int | None = None,
+    allow_nan: bool = False,
 ) -> FloatArray:
     arr = np.asarray(values, dtype=np.float32)
     _validate_ndim(arr, label=label, ndim=ndim, min_ndim=min_ndim)
-    if arr.size and not np.all(np.isfinite(arr)):
-        raise ValueError(f"{label} contains non-finite values")
+    if arr.size:
+        invalid = np.isinf(arr) if allow_nan else ~np.isfinite(arr)
+        if np.any(invalid):
+            raise ValueError(f"{label} contains non-finite values")
     return cast(FloatArray, arr)
 
 
@@ -432,16 +552,6 @@ def _uint8_array(values: np.ndarray, *, label: str, ndim: int | None = None, min
     if arr.dtype != np.uint8:
         raise ValueError(f"{label} must use uint8 storage, got {arr.dtype}")
     return cast(UInt8Array, arr)
-
-
-def _uint16_array(
-    values: np.ndarray, *, label: str, ndim: int | None = None, min_ndim: int | None = None
-) -> UInt16Array:
-    arr = np.asarray(values)
-    _validate_ndim(arr, label=label, ndim=ndim, min_ndim=min_ndim)
-    if arr.dtype != np.uint16:
-        raise ValueError(f"{label} must use uint16 storage, got {arr.dtype}")
-    return cast(UInt16Array, arr)
 
 
 def _mesh_points(values: np.ndarray, label: str) -> FloatArray:
@@ -497,8 +607,6 @@ def _dtype_value_range(values: np.ndarray) -> tuple[float, float]:
     if np.issubdtype(arr.dtype, np.integer):
         info = np.iinfo(arr.dtype)
         return float(info.min), float(info.max)
-    if np.issubdtype(arr.dtype, np.bool_):
-        return 0.0, 1.0
     return 0.0, 1.0
 
 
@@ -528,4 +636,5 @@ def _is_mesh_frame_offsets(name: str) -> bool:
 
 def _normalize_data_path(path: str) -> str:
     text = str(path).strip("/")
-    return text if text.startswith("data/") else f"data/{text}"
+    head = text.split("/", 1)[0]
+    return text if head in ARRAY_GROUPS else f"data/{text}"

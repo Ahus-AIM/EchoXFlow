@@ -1,3 +1,11 @@
+# Benchmark methods for `python -m tasks.bench`.
+#
+# Trainable methods resolve their architecture from tasks/utils/models/registry.py (METHODS) by method name,
+# or by an explicit `architecture:` key. `config_overrides` are merged into the task config after the protocol
+# profile; `resolution_overrides` are merged last when `--resolution` matches the key.
+#
+# Every method trains with an effective batch of 4 examples: memory-heavy models use a smaller physical batch and
+# example-weighted gradient accumulation (`trainer.accumulate_grad_batches`).
 methods:
   temporal_mean:
     kind: baseline
@@ -6,6 +14,62 @@ methods:
     kind: trainable
   frame_unet:
     kind: trainable
-    config_transform: tasks.utils.models.unet.framewise_temporal_config
+    config_overrides:
+      data:
+        train_batch_size: 1
+      trainer:
+        accumulate_grad_batches: 4
+    resolution_overrides:
+      "128":
+        data:
+          train_batch_size: 4
+        trainer:
+          accumulate_grad_batches: 1
+      "256":
+        data:
+          train_batch_size: 4
+        trainer:
+          accumulate_grad_batches: 1
+  convnext_v2_atto:
+    kind: trainable
+  segformer_b0:
+    kind: trainable
+  dinov3_vit_s16:
+    kind: trainable
+    config_overrides:
+      data:
+        train_batch_size: 4
+      trainer:
+        accumulate_grad_batches: 1
+  mambaout_femto:
+    kind: trainable
+  video_swin_t:
+    kind: trainable
+    config_overrides:
+      data:
+        train_batch_size: 2
+      trainer:
+        accumulate_grad_batches: 2
+  mvit_v2_s:
+    kind: trainable
+    config_overrides:
+      data:
+        train_batch_size: 2
+      trainer:
+        accumulate_grad_batches: 2
+  uniformer_s_32f:
+    kind: trainable
+    config_overrides:
+      data:
+        train_batch_size: 1
+      trainer:
+        accumulate_grad_batches: 4
+  u_mamba_bot:
+    kind: trainable
+    config_overrides:
+      data:
+        train_batch_size: 4
+      trainer:
+        accumulate_grad_batches: 1
 aliases:
   unet: temporal_unet

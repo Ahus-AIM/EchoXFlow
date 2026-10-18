@@ -16,15 +16,20 @@ class TissueGateConfig:
     min_bmode_intensity: float = 0.05
     max_bmode_intensity: float = 1.0
     bmode_value_range: tuple[float, float] | None = None
+    smoothing_px: int = 0  # box-blur radius applied to the B-mode before thresholding, so speckle does not gate
 
 
 @dataclass(frozen=True)
 class BloodGateConfig:
-    """B-mode and Doppler-power gate for blood-flow overlays."""
+    """B-mode and Doppler-power gate for blood-flow overlays.
 
-    min_doppler_power: float = 0.30
-    min_power_minus_bmode: float = 0.12
-    max_bmode_intensity: float = 0.90
+    Colour is hidden over bright tissue: the B-mode must stay below ``max_bmode_intensity`` and the Doppler power
+    must exceed it by ``min_power_minus_bmode``, both on the normalised ``[0, 1]`` scales.
+    """
+
+    min_doppler_power: float = 0.20
+    min_power_minus_bmode: float = 0.15
+    max_bmode_intensity: float = 0.50
     bmode_value_range: tuple[float, float] | None = None
     power_value_range: tuple[float, float] | None = None
 
@@ -38,6 +43,8 @@ def tissue_gate(
     """Return a tissue overlay mask from normalized B-mode intensity."""
     cfg = config or TissueGateConfig()
     normalized_bmode = normalize_bmode_intensity(bmode, value_range=cfg.bmode_value_range)
+    if cfg.smoothing_px > 0:
+        normalized_bmode = box_blur(normalized_bmode, int(cfg.smoothing_px))
     mask = (normalized_bmode >= float(cfg.min_bmode_intensity)) & (normalized_bmode <= float(cfg.max_bmode_intensity))
     return _apply_region_mask(mask, region_mask)
 
@@ -65,6 +72,33 @@ def blood_gate(
         & (normalized_bmode <= float(cfg.max_bmode_intensity))
     )
     return _apply_region_mask(mask, region_mask)
+
+
+def box_blur(values: np.ndarray, radius: int) -> np.ndarray:
+    """Mean over a ``(2 * radius + 1)`` square window with edge padding, as a separable cumulative sum."""
+    arr: np.ndarray = np.asarray(values, dtype=np.float32)
+    if radius <= 0 or arr.ndim != 2:
+        return arr
+    window = 2 * radius + 1
+    for axis in (0, 1):
+        padded = np.pad(arr, [(radius, radius) if a == axis else (0, 0) for a in (0, 1)], mode="edge")
+        summed = np.cumsum(padded, axis=axis, dtype=np.float64)
+        summed = np.concatenate([np.zeros_like(np.take(summed, [0], axis=axis)), summed], axis=axis)
+        head = np.take(summed, range(window, summed.shape[axis]), axis=axis)
+        tail = np.take(summed, range(0, summed.shape[axis] - window), axis=axis)
+        arr = np.asarray((head - tail) / window, dtype=np.float32)
+    return arr
+    for axis in (0, 1):
+        padded = np.pad(arr, [(radius, radius) if a == axis else (0, 0) for a in (0, 1)], mode="edge")
+        summed = np.cumsum(padded, axis=axis, dtype=np.float64)
+        summed = np.concatenate([np.zeros_like(np.take(summed, [0], axis=axis)), summed], axis=axis)
+        window = 2 * radius + 1
+        arr = (
+            np.take(summed, range(window, summed.shape[axis]), axis=axis)
+            - np.take(summed, range(0, summed.shape[axis] - window), axis=axis)
+        ) / window
+        arr = arr.astype(np.float32)
+    return arr
 
 
 def normalize_bmode_intensity(

@@ -56,10 +56,6 @@ def load_training_config(path: str | Path | None, *, default_path: Path) -> Trai
     return TrainingConfig(raw=raw)
 
 
-def load_task_training_config(path: str | Path | None, *, module_file: str) -> TrainingConfig:
-    return load_training_config(path, default_path=Path(module_file).resolve().parents[1] / "train.yaml")
-
-
 def _normalize(value: Any) -> Any:
     if isinstance(value, list):
         return tuple(_normalize(item) for item in value)

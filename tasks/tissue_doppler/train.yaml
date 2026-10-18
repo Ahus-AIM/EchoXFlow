@@ -30,6 +30,7 @@ trainer:
   accelerator: auto
   devices: 1
   precision: bf16-mixed
+  accumulate_grad_batches: 1
 data:
   root_dir: null
   clip_length: 32
@@ -48,8 +49,9 @@ data:
   max_train_samples: null
   max_val_samples: null
   train_batch_size: 4
-  val_batch_size: 2
+  val_batch_size: 1
   num_workers: 8
+  device_preprocessing: true
   prefetch_factor: 4
   pin_memory: true
   persistent_workers: true

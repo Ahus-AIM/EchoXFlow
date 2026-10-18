@@ -8,15 +8,19 @@ from typing import Any, ContextManager, cast
 import torch
 from torch import Tensor
 
+from tasks.utils.batching import carry_batch_items
+from tasks.utils.deferred import DeferredBatch, DeferredSample, finish_on
 from tasks.utils.training.runtime import AmpConfig
 
 
 def move_to_device(value: object, device: torch.device) -> object:
+    if isinstance(value, (DeferredSample, DeferredBatch)):
+        return finish_on(value, torch.device(device))
     if isinstance(value, Tensor):
         return value.to(device=device)
     if is_dataclass(value) and not isinstance(value, type):
         updates = {field.name: move_to_device(getattr(value, field.name), device) for field in fields(value)}
-        return replace(value, **updates)
+        return carry_batch_items(value, replace(value, **updates))
     if isinstance(value, Mapping):
         return {key: move_to_device(item, device) for key, item in value.items()}
     if isinstance(value, tuple):

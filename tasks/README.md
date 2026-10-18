@@ -1,124 +1,86 @@
-# Making a New Task
+# Benchmark Tasks
 
-Tasks are discovered from local `tasks/<name>/task.py` files. A new CLI-visible task needs this minimum structure:
+Tasks 1-3 (tissue velocity, blood flow, LV segmentation) share one training and evaluation pipeline. Task 4 (video
+diffusion) has its own, see [video_diffusion/README.md](video_diffusion/README.md).
 
-```text
-tasks/my_task/
-  task.py
-  dataset.py
-  train.yaml
-```
+## Running
 
-`task.py` defines the task spec:
-
-```python
-from tasks.registry import TaskSpec
-
-
-def loss_terms(model, sample, config):
-    prediction = model(sample.frames)
-    loss = ...
-    return {"loss": loss}
-
-
-TASK_SPEC = TaskSpec(name="my_task", loss_fn=loss_terms)
-```
-
-`dataset.py` provides dataloaders:
-
-```python
-def build_dataloaders(*, config, data_root=None):
-    train_loader = ...
-    val_loader = ...
-    return train_loader, val_loader
-```
-
-`train.yaml` must include the sections consumed by the shared training loop: `model`, `data`, `trainer`,
-`optimizer`, `loss`, and `artifacts`. Add `metrics` when validation metrics need task-specific options.
-
-## Setup and Running
-
-Install the library, task dependencies, and development tools from an active `uv` environment:
-
-```bash
-uv pip install --editable ".[tasks]" --requirement requirements-dev.txt
-```
-
-Run one task by name:
+Install the task dependencies with `uv sync --extra tasks`, then train one task on the five-fold `splits.csv` of the
+data root (fold 4 held out by default):
 
 ```bash
 uv run python -m tasks.train <task> --data-root /path/to/EchoXFlow
+uv run python -m tasks.train <task> --data-root /path/to/EchoXFlow --max-train-steps 1 --max-val-steps 0  # smoke
+uv run python scripts/run_full_benchmark.py --data-root /path/to/EchoXFlow --output-dir /path/with/space --smoke
 ```
 
-For a quick smoke-style training step, limit train and validation work:
+`tasks.bench` runs one benchmark cell (task, method, domain, fold) and `--protocol-profile echoxflow_paper_v1` applies
+the article's settings from [configs/protocols/echoxflow_paper_v1.yaml](../configs/protocols/echoxflow_paper_v1.yaml).
+The benchmark methods are defined in [configs/benchmark_methods.yaml](../configs/benchmark_methods.yaml) and the table
+cells in [configs/benchmark_table.yaml](../configs/benchmark_table.yaml). The launcher and the paper protocol are
+described in [docs/REPRODUCE.md](../docs/REPRODUCE.md#tasks-1-3).
 
-```bash
-uv run python -m tasks.train <task> --data-root /path/to/EchoXFlow --max-train-steps 1 --max-val-steps 0
+Training recordings and discovery results are cached under `outputs/cache/`. Both caches are safe to delete.
+
+## Making a New Task
+
+A task is a folder with three files:
+
+```text
+tasks/my_task/
+  task.py       # TASK_SPEC = TaskSpec(name="my_task", loss_fn=loss_terms)
+  dataset.py    # build_dataloaders(*, config, data_root=None) -> (train, val, selection)
+  train.yaml    # model, data, trainer, optimizer, loss, artifacts (and metrics, if needed)
 ```
 
-Run the benchmark matrix in smoke mode:
+`loss_terms(model, sample, config)` returns a dict with at least `"loss"`. Optional `TaskSpec` fields add validation
+metrics (`val_metrics_fn`, `metric_keys`), epoch previews (`preview`), the temporal-mean baseline (`baseline`) and a
+custom model head (`model_factory`). See [registry.py](registry.py). The shared training loop, models and dataset
+helpers live in [utils/](utils/).
 
-```bash
-scripts/run_full_benchmark.sh --data-root /path/to/EchoXFlow --smoke
-```
+## Model Selection
 
-## Optional Hooks
+Training never sees the reported validation fold. A fixed 12.5% of the training-fold examinations (chosen by a seeded
+hash, the same for every method) form a selection split. After every epoch the selection loss is evaluated as an
+examination-equal mean of per-clip losses, the best epoch's `weights.pt` is kept, and training stops after 3 epochs
+without improvement (at most 25 epochs). `early_stopping.json` records the split and the stopping state.
 
-`TaskSpec` defaults `dataset_module` to `tasks.<name>.dataset`, `config_path` to the task folder's `train.yaml`, and
-`batch_size_fn` to `sample.frames.shape[0]`.
+## Evaluation Metrics
 
-Use optional fields only when the task needs them:
+Every metric is defined per clip and averaged within each examination, then over examinations (`val_metrics.json`,
+per-clip values in `val_clip_metrics.csv`). L1 metrics are masked means over a clip's valid pixels. Dice is computed per
+clip and channel and averaged over the structures present. The segmentation headline `dice_mean` is the thresholded
+(argmax) Dice. Clips without valid pixels are left out of a metric, not scored 0.
 
-- `val_metrics_fn` and `metric_keys` for evaluation metrics and benchmark output names.
-- `result_factory` for task-specific result metadata.
-- `preview=PreviewSpec(prediction_fn=..., writer=...)` for epoch previews. Tasks without this skip previews cleanly.
-- `baseline=BaselineSpec(...)` for temporal-mean benchmark support. Tasks without it report an unsupported baseline.
-- `model_factory` or a dotted model head path in config, for example `kind: my_package.my_heads.MyHead`, to avoid editing
-  the built-in head registry.
+Clips longer than the training clip are predicted in sliding windows of the training length, starting every half
+window, and overlapping predictions are averaged, so every method sees the same temporal context. Tissue Doppler is
+scored on the Cartesian metric grid inside the scan sector in both domains. Its headline `velocity_l1` is the absolute
+error in m/s after wrapping into one Nyquist period.
 
-Package exports such as `tasks.segmentation.run_training` require the task package to call
-`bind_task_api("segmentation", globals())` in `__init__.py`. This is useful for imports, but it is not required for CLI
-discovery.
+## Models
 
-Shared training behavior lives outside task folders:
+| Type | Method | Name in configs |
+| --- | --- | --- |
+| 2D control | Framewise U-Net | `frame_unet` |
+| 2D | ConvNeXt V2 Atto + FPN | `convnext_v2_atto` |
+| 2D | SegFormer-B0 | `segformer_b0` |
+| 2D | DINOv3 ViT-S/16 + dense decoder | `dinov3_vit_s16` |
+| 2D | MambaOut-Femto + FPN | `mambaout_femto` |
+| 3D control | Spatiotemporal U-Net | `temporal_unet` |
+| 3D | Video Swin-T | `video_swin_t` |
+| 3D | MViT-v2-S | `mvit_v2_s` |
+| 3D | UniFormer-S (32 frames) | `uniformer_s_32f` |
+| 3D | U-Mamba-Bot-style | `u_mamba_bot` |
 
-- `tasks/registry.py` discovers task specs and exposes stable helpers used by `tasks/train.py`, `tasks/bench.py`, and
-  package imports.
-- `tasks/utils/models/` contains model implementations, currently the shared U-Net heads in `unet.py` and temporal-mean
-  benchmark model in `temporal_mean.py`.
-- `tasks/utils/training/` contains the common training loop, evaluation, loss helpers, logging, checkpoints, metrics, and
-  epoch preview machinery.
-- `tasks/utils/` contains reusable dataset, optimizer, seed, and type helpers.
+All models are trained from random initialisation with an effective batch of four clips. 2D models process each frame
+independently. 3D models see the whole clip.
 
-## Dataset Caches
+## Adding a Model
 
-Use `data.recording_cache_dir` when repeated window sampling would otherwise duplicate the same source frames on disk.
-This raw recording-array cache stores each complete pre-resize training array once under `arrays/`, then task datasets
-slice their windows from the cached arrays. By default the task datasets cache only their training-relevant raw arrays:
+1. Implement a `DenseVideoBackbone` ([utils/models/backbone.py](utils/models/backbone.py)) mapping `[B,C,T,H,W]` to
+   `[B,out_channels,T,H,W]`; for a 2D network, subclass `FramewiseDenseVideoBackbone` and implement `forward_frames`.
+2. Register it in `METHODS` ([utils/models/registry.py](utils/models/registry.py)), for example
+   `"my_net": MethodSpec(builder="tasks.utils.models.my_module:MyNetBackbone", options={"width": 64})`.
+3. Add `my_net: {kind: trainable}` to [configs/benchmark_methods.yaml](../configs/benchmark_methods.yaml).
 
-- segmentation: `data/2d_brightness_mode*` and `data/*_contour`
-- color Doppler: `data/2d_brightness_mode`, `data/2d_color_doppler_velocity`, and `data/2d_color_doppler_power`
-- tissue Doppler: `data/2d_brightness_mode` and `data/tissue_doppler`
-
-Set `data.recording_cache: true` in a task config to use the default `outputs/cache/recordings` directory. Use
-`data.recording_cache_read_only: true` to read existing cached arrays without writing misses, and use
-`data.recording_cache_include` or `data.recording_cache_exclude` for shell-style path patterns when a task needs a
-tighter or broader set.
-
-The benchmark launcher exposes the same recording cache controls as CLI flags: `--recording-cache-dir`,
-`--recording-cache-read-only`, `--recording-cache-include`, and `--recording-cache-exclude`. These flags are forwarded to
-`tasks.bench` for each benchmark cell.
-
-The older `data.sample_cache_dir` and `--sample-cache-dir` store completed `dataset[index]` samples. They can still be
-useful for deterministic preprocessed samples, but sliding-window tasks may duplicate overlapping frames across many
-cached samples.
-
-Benchmark methods and table rows are config-driven:
-
-- `configs/benchmark_methods.yaml` defines benchmark methods such as temporal mean, frame U-Net, and temporal U-Net.
-  Frame U-Net is implemented as a config transform that forces temporal kernel sizes to `1`.
-- `configs/benchmark_table.yaml` defines the task/method/domain cells that `scripts/run_full_benchmark.sh` launches.
-  Add rows or columns there instead of editing the launcher.
-
-Keep reusable logic in `tasks/utils/` or `src/echoxflow/`. Add task-local `types.py`, model heads, preview writers,
-benchmarks, package exports, or a README only when they are useful for that task.
+`tasks.bench --method my_net` then trains it, and saved weights reload from the run directory alone.

@@ -59,7 +59,11 @@ def select_timeline(panels: tuple[PanelSpec, ...], *, max_fps: float = 60.0) -> 
         if fps is not None and np.isfinite(fps) and fps > 0.0:
             candidates.append((fps, timestamps))
     if not candidates:
-        return RenderTimeline(timestamps=np.asarray([0.0], dtype=np.float64), fps=1.0)
+        strip = _longest_strip_timestamps(panels)
+        if strip is None:
+            return RenderTimeline(timestamps=np.asarray([0.0], dtype=np.float64), fps=1.0)
+        fps = fps_from_timestamps(strip)
+        candidates.append((float(fps) if fps is not None and fps > 0.0 else float(max_fps), strip))
     fps, timestamps = max(candidates, key=lambda item: item[0])
     capped_fps = min(float(fps), float(max_fps))
     if capped_fps >= float(fps):
@@ -72,10 +76,38 @@ def select_timeline(panels: tuple[PanelSpec, ...], *, max_fps: float = 60.0) -> 
     return RenderTimeline(timestamps=start + np.arange(count, dtype=np.float64) / capped_fps, fps=capped_fps)
 
 
+def _longest_strip_timestamps(panels: tuple[PanelSpec, ...]) -> np.ndarray | None:
+    """Return the timestamps of the longest 1D strip or line panel, used when no 2D stream animates."""
+    best: np.ndarray | None = None
+    best_span = 0.0
+    for panel in panels:
+        name = panel.loaded.name
+        if not (name.startswith("1d_") or panel.kind == "line") or panel.loaded.timestamps is None:
+            continue
+        timestamps = np.asarray(panel.loaded.timestamps, dtype=np.float64).reshape(-1)
+        if timestamps.size < 2 or timestamps.size != temporal_length(panel.loaded.data):
+            continue
+        finite = timestamps[np.isfinite(timestamps)]
+        span = float(finite[-1] - finite[0]) if finite.size > 1 else 0.0
+        if span > best_span:
+            best, best_span = finite, span
+    return best
+
+
+def strip_drives_timeline(panels: tuple[PanelSpec, ...]) -> bool:
+    """Return whether no 2D stream animates and a 1D strip sets the timeline instead."""
+    return not any(is_timeline_driver(panel) for panel in panels) and _longest_strip_timestamps(panels) is not None
+
+
 def resolve_frame_time(panels: tuple[PanelSpec, ...], request: FrameRequest) -> float:
     if request.time_s is not None:
         return float(request.time_s)
     frame_index = 0 if request.frame_index is None else max(0, int(request.frame_index))
+    strip = _longest_strip_timestamps(panels) if strip_drives_timeline(panels) else None
+    if strip is not None:
+        if request.frame_index is None:
+            return float(0.5 * (strip[0] + strip[-1]))
+        return float(strip[min(frame_index, strip.size - 1)])
     for panel in (*tuple(panel for panel in panels if is_timeline_driver(panel)), *panels):
         timestamps = panel.loaded.timestamps
         if timestamps is None:

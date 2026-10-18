@@ -1,3 +1,21 @@
+# Benchmark table: which cells scripts/run_full_benchmark.py launches and how
+# scripts/build_benchmark_table.py reports them.
+#
+# The table reports, per row and column, the mean over validation folds of each fold's examination-equal metric,
+# "+- SD across folds", and the paired per-fold difference to the reference row of the same domain.
+protocol:
+  profile: echoxflow_paper_v1
+  selection_fraction: 0.125
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.0
+  max_epochs: 25
+  spatial_resolutions: [128, 256, 320]
+  seeds: [0]
+  folds: [0, 1, 2, 3, 4]
+
+# Paired differences are taken against this method in the same domain (override with --reference METHOD:DOMAIN).
+reference_method: frame_unet
+
 rows:
   - method: temporal_mean
     domain: beamspace
@@ -15,6 +33,38 @@ rows:
     domain: cartesian
     label: 2D U-Net
     input_domain: Scan-converted
+  - method: convnext_v2_atto
+    domain: beamspace
+    label: ConvNeXt V2 Atto
+    input_domain: Beamspace
+  - method: convnext_v2_atto
+    domain: cartesian
+    label: ConvNeXt V2 Atto
+    input_domain: Scan-converted
+  - method: segformer_b0
+    domain: beamspace
+    label: SegFormer-B0
+    input_domain: Beamspace
+  - method: segformer_b0
+    domain: cartesian
+    label: SegFormer-B0
+    input_domain: Scan-converted
+  - method: dinov3_vit_s16
+    domain: beamspace
+    label: DINOv3 ViT-S/16
+    input_domain: Beamspace
+  - method: dinov3_vit_s16
+    domain: cartesian
+    label: DINOv3 ViT-S/16
+    input_domain: Scan-converted
+  - method: mambaout_femto
+    domain: beamspace
+    label: MambaOut-Femto
+    input_domain: Beamspace
+  - method: mambaout_femto
+    domain: cartesian
+    label: MambaOut-Femto
+    input_domain: Scan-converted
   - method: temporal_unet
     domain: beamspace
     label: 3D U-Net
@@ -22,6 +72,38 @@ rows:
   - method: temporal_unet
     domain: cartesian
     label: 3D U-Net
+    input_domain: Scan-converted
+  - method: video_swin_t
+    domain: beamspace
+    label: Video Swin-T
+    input_domain: Beamspace
+  - method: video_swin_t
+    domain: cartesian
+    label: Video Swin-T
+    input_domain: Scan-converted
+  - method: mvit_v2_s
+    domain: beamspace
+    label: MViT-v2-S
+    input_domain: Beamspace
+  - method: mvit_v2_s
+    domain: cartesian
+    label: MViT-v2-S
+    input_domain: Scan-converted
+  - method: uniformer_s_32f
+    domain: beamspace
+    label: UniFormer-S 32f
+    input_domain: Beamspace
+  - method: uniformer_s_32f
+    domain: cartesian
+    label: UniFormer-S 32f
+    input_domain: Scan-converted
+  - method: u_mamba_bot
+    domain: beamspace
+    label: U-Mamba-Bot
+    input_domain: Beamspace
+  - method: u_mamba_bot
+    domain: cartesian
+    label: U-Mamba-Bot
     input_domain: Scan-converted
 
 columns:
@@ -32,6 +114,12 @@ columns:
     display_scale: 100.0
     precision: 2
     best: min
+  - name: tissue_nyq
+    task: tissue_doppler
+    title: "Task 1: Tissue velocity (fraction of Nyquist)"
+    metric: velocity_nyquist_l1
+    precision: 3
+    best: min
   - name: color_v
     task: color_doppler
     title: "Task 2: Blood velocity (cm/s)"
@@ -41,18 +129,20 @@ columns:
     best: min
   - name: color_p
     task: color_doppler
+    title: "Task 2: Power"
     metric: power_l1
     precision: 3
     best: min
   - name: color_s
     task: color_doppler
+    title: "Task 2: Velocity variation (cm/s)"
     metric: variation_l1
     display_scale: 100.0
     precision: 2
     best: min
   - name: dice
     task: segmentation
-    title: "Task 3: Segmentation"
+    title: "Task 3: Segmentation Dice (%, thresholded)"
     metric: dice_mean
     display_scale: 100.0
     precision: 1

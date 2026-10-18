@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from echoxflow.croissant import RecordingRecord
-from echoxflow.manifest import manifest_documents
+from echoxflow.manifest import annotation_documents, manifest_documents
 
 RecordingObjectKind = Literal["strain", "3d_bmode", "generic"]
 
@@ -47,9 +47,11 @@ class AnnotationRef:
     target_entity: str
     target_semantic_id: str
     field: str
-    value: ArrayRef
+    value: ArrayRef | None
     time: ArrayRef | None = None
     raw: Mapping[str, Any] | None = None
+    document_path: tuple[int, ...] = ()
+    annotation_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,7 @@ class RecordingObject:
     panels: tuple[StrainPanel, ...] = ()
     mesh_sequences: tuple[MeshSequenceRef, ...] = ()
     annotations: tuple[AnnotationRef, ...] = ()
+    raw_documents: tuple[Mapping[str, Any], ...] = ()
 
 
 def load_recording_object(
@@ -96,7 +99,8 @@ def load_recording_object(
     """Open a recording and return its semantic object references."""
     from echoxflow.loading import open_recording
 
-    return open_recording(record, root=root).load_object()
+    with open_recording(record, root=root) as store:
+        return store.load_object()
 
 
 def recording_object_from_metadata(
@@ -106,8 +110,8 @@ def recording_object_from_metadata(
     store_path: str | Path | None = None,
 ) -> RecordingObject:
     """Parse object references from recording metadata without loading referenced arrays."""
-    documents = _manifest_documents(group_attrs)
-    annotations = _annotation_refs(documents)
+    documents = manifest_documents(group_attrs)
+    annotations = _annotation_refs(annotation_documents(group_attrs))
     panels = _strain_panels(record, store_path=store_path, documents=documents, annotations=annotations)
     mesh_sequences = _mesh_sequence_refs(documents)
     if panels:
@@ -122,6 +126,7 @@ def recording_object_from_metadata(
         panels=panels,
         mesh_sequences=mesh_sequences,
         annotations=annotations,
+        raw_documents=documents,
     )
 
 
@@ -149,7 +154,9 @@ def _strain_panels(
             frame_path = _optional_str(linked.get("frames_array_path")) or "data/2d_brightness_mode"
             timestamps_path = _panel_timestamps_path(item, linked)
             panel_annotations = tuple(
-                annotation for annotation in annotations if annotation.target_semantic_id == role_id
+                annotation
+                for annotation in annotations
+                if annotation.target_semantic_id == role_id and not annotation.document_path
             )
             panels.append(
                 StrainPanel(
@@ -181,9 +188,9 @@ def _panel_timestamps_path(panel: Mapping[str, Any], linked: Mapping[str, Any]) 
     return _normalize_timestamp_path(timestamps_path) if timestamps_path else None
 
 
-def _annotation_refs(documents: tuple[Mapping[str, Any], ...]) -> tuple[AnnotationRef, ...]:
+def _annotation_refs(documents: tuple[tuple[tuple[int, ...], Mapping[str, Any]], ...]) -> tuple[AnnotationRef, ...]:
     refs: list[AnnotationRef] = []
-    for document in documents:
+    for document_path, document in documents:
         annotations = document.get("annotations")
         if not isinstance(annotations, list):
             continue
@@ -192,11 +199,8 @@ def _annotation_refs(documents: tuple[Mapping[str, Any], ...]) -> tuple[Annotati
                 continue
             target = item.get("target")
             value = item.get("value")
-            if not isinstance(target, Mapping) or not isinstance(value, Mapping):
-                continue
+            target = target if isinstance(target, Mapping) else {}
             value_ref = _array_ref(value)
-            if value_ref is None:
-                continue
             field = _optional_str(target.get("field")) or ""
             refs.append(
                 AnnotationRef(
@@ -206,6 +210,8 @@ def _annotation_refs(documents: tuple[Mapping[str, Any], ...]) -> tuple[Annotati
                     value=value_ref,
                     time=_array_ref(item.get("time")),
                     raw=item,
+                    document_path=document_path,
+                    annotation_identity=_optional_str(item.get("annotation_identity")),
                 )
             )
     return tuple(refs)
@@ -327,10 +333,6 @@ def _array_ref(value: Any) -> ArrayRef | None:
         format=_optional_str(value.get("format")) or "zarr_array",
         recording_zarr_path=_optional_str(value.get("recording_zarr_path")),
     )
-
-
-def _manifest_documents(group_attrs: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
-    return manifest_documents(group_attrs)
 
 
 def _has_3d_bmode(record: RecordingRecord | None, group_attrs: Mapping[str, Any]) -> bool:

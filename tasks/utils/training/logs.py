@@ -10,12 +10,17 @@ from typing import Any, cast
 import numpy as np
 
 from echoxflow.plotting import PlotStyle
+from tasks.utils.atomic import atomic_open
 from tasks.utils.training.runtime import _PREVIEW_STYLE, BatchMetrics, EpochMetrics
 
 CARTESIAN_METRIC_PREFIX = "cartesian_"
+#: Default number of steps aggregated into one ``batch_scores.jsonl`` row (``artifacts.batch_log_every_steps``).
+#: A row is ~0.4 KB, so 25 epochs of 400 steps stay near 160 KB per run. 0 disables the batch log.
+DEFAULT_BATCH_LOG_EVERY_STEPS = 25
+_LOSS_PLOT_DPI = 80
 
 
-def _prepare_epoch_log(*, config: Any, task_name: str) -> Path | None:
+def _prepare_epoch_log(*, config: Any, task_name: str, resume: bool = False) -> Path | None:
     artifacts = config.section("artifacts")
     root = Path(cast(Any, artifacts.get("root_dir", "outputs/runs")))
     run_name = _artifact_run_name(
@@ -26,16 +31,124 @@ def _prepare_epoch_log(*, config: Any, task_name: str) -> Path | None:
     run_dir = root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / str(artifacts.get("epoch_scores_name", "train_scores.jsonl"))
-    path.write_text("", encoding="utf-8")
+    if not resume:
+        path.write_text("", encoding="utf-8")
     return path
 
 
-def _prepare_batch_log(epoch_log_path: Path | None) -> Path | None:
+def _prepare_batch_log(epoch_log_path: Path | None, *, resume: bool = False, enabled: bool = True) -> Path | None:
     if epoch_log_path is None:
         return None
     path = epoch_log_path.with_name("batch_scores.jsonl")
-    path.write_text("", encoding="utf-8")
+    if not enabled:
+        path.unlink(missing_ok=True)
+        return None
+    if not resume:
+        path.write_text("", encoding="utf-8")
     return path
+
+
+def batch_log_every_steps(config: Any) -> int:
+    """Steps per ``batch_scores.jsonl`` row from ``artifacts.batch_log_every_steps`` (0 disables the batch log)."""
+    value = config.section("artifacts").get("batch_log_every_steps", DEFAULT_BATCH_LOG_EVERY_STEPS)
+    every = int(cast(Any, DEFAULT_BATCH_LOG_EVERY_STEPS if value is None else value))
+    if every < 0:
+        raise ValueError(f"artifacts.batch_log_every_steps must be non-negative, got {every}")
+    return every
+
+
+class BatchLogWindow:
+    """Aggregate consecutive steps into one ``batch_scores.jsonl`` row every ``every`` steps.
+
+    A row reports the clip-weighted mean loss and loss terms of its window, the summed load and step time, and the
+    last step of the window, so the batch log stays small while keeping the loss curve within each epoch.
+    """
+
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        every: int,
+        task: str,
+        split: str,
+        epoch: int,
+        device: str,
+        precision: str,
+    ) -> None:
+        self.path = path if every > 0 else None
+        self.every = max(1, int(every))
+        self.task = task
+        self.split = split
+        self.epoch = int(epoch)
+        self.device = device
+        self.precision = precision
+        self._reset()
+
+    def _reset(self) -> None:
+        self.steps = 0
+        self.last_step = 0
+        self.loss_sum = 0.0
+        self.loss_count = 0
+        self.term_sums: dict[str, float] = {}
+        self.term_counts: dict[str, int] = {}
+        self.examples = 0
+        self.load_seconds = 0.0
+        self.step_seconds = 0.0
+
+    def add(
+        self,
+        *,
+        step: int,
+        loss_sum: float,
+        loss_count: int,
+        term_sums: Mapping[str, float],
+        term_counts: Mapping[str, int],
+        batch_size: int,
+        load_seconds: float,
+        step_seconds: float,
+    ) -> None:
+        if self.path is None:
+            return
+        self.steps += 1
+        self.last_step = int(step)
+        self.loss_sum += float(loss_sum)
+        self.loss_count += int(loss_count)
+        for name, value in term_sums.items():
+            self.term_sums[name] = self.term_sums.get(name, 0.0) + float(value)
+            self.term_counts[name] = self.term_counts.get(name, 0) + int(term_counts.get(name, 0))
+        self.examples += int(batch_size)
+        self.load_seconds += float(load_seconds)
+        self.step_seconds += float(step_seconds)
+        if self.steps >= self.every:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.path is None or self.steps == 0:
+            return
+        loss = self.loss_sum / self.loss_count if self.loss_count else float("nan")
+        terms = {
+            name: round(value / self.term_counts[name], 4)
+            for name, value in self.term_sums.items()
+            if self.term_counts.get(name, 0) > 0
+        }
+        _write_batch_metrics(
+            self.path,
+            BatchMetrics(
+                task=self.task,
+                split=self.split,
+                epoch=self.epoch,
+                step=self.last_step,
+                loss=round(loss, 4),
+                loss_terms=terms,
+                batch_size=self.examples,
+                load_seconds=round(self.load_seconds, 2),
+                step_seconds=round(self.step_seconds, 2),
+                device=self.device,
+                precision=self.precision,
+                window_steps=self.steps,
+            ),
+        )
+        self._reset()
 
 
 def _default_run_name(task_name: str) -> str:
@@ -69,16 +182,25 @@ def _write_batch_metrics(path: Path | None, metrics: BatchMetrics) -> None:
 
 def _write_loss_plot(scores_path: Path) -> Path:
     rows = _read_score_rows(scores_path)
-    figure = _loss_plot_figure(rows)
+    batch_path = scores_path.with_name("batch_scores.jsonl")
+    batch_rows = _read_score_rows(batch_path) if batch_path.is_file() else []
+    figure = _loss_plot_figure(rows, batch_rows=batch_rows)
     output = scores_path.with_name("loss.png")
+    _save_figure(figure, output)
+    _write_cartesian_domain_loss_plot(scores_path, rows)
+    return output
+
+
+def _save_figure(figure: Any, output: Path) -> None:
     try:
-        figure.savefig(output, dpi=int(_PREVIEW_STYLE.dpi), facecolor=figure.get_facecolor(), bbox_inches="tight")
+        with atomic_open(output, "wb") as handle:
+            figure.savefig(
+                handle, format="png", dpi=_LOSS_PLOT_DPI, facecolor=figure.get_facecolor(), bbox_inches="tight"
+            )
     finally:
         import matplotlib.pyplot as plt
 
         plt.close(figure)
-    _write_cartesian_domain_loss_plot(scores_path, rows)
-    return output
 
 
 def _write_cartesian_domain_loss_plot(
@@ -89,26 +211,7 @@ def _write_cartesian_domain_loss_plot(
         return None
     figure = _cartesian_domain_loss_plot_figure(score_rows)
     output = scores_path.with_name("cartesian_domain_loss.png")
-    try:
-        figure.savefig(output, dpi=int(_PREVIEW_STYLE.dpi), facecolor=figure.get_facecolor(), bbox_inches="tight")
-    finally:
-        import matplotlib.pyplot as plt
-
-        plt.close(figure)
-    return output
-
-
-def _write_batch_loss_plot(scores_path: Path | None) -> Path | None:
-    if scores_path is None:
-        return None
-    figure = _batch_loss_plot_figure(_read_score_rows(scores_path))
-    output = scores_path.with_name("batch_loss.png")
-    try:
-        figure.savefig(output, dpi=int(_PREVIEW_STYLE.dpi), facecolor=figure.get_facecolor(), bbox_inches="tight")
-    finally:
-        import matplotlib.pyplot as plt
-
-        plt.close(figure)
+    _save_figure(figure, output)
     return output
 
 
@@ -117,18 +220,30 @@ def _read_score_rows(scores_path: Path) -> list[Mapping[str, Any]]:
     for line in scores_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a line cut short by a crash; resume truncates it
         if isinstance(row, Mapping):
             rows.append(row)
     return rows
 
 
-def _loss_plot_figure(rows: Sequence[Mapping[str, Any]]) -> Any:
+def _loss_plot_figure(rows: Sequence[Mapping[str, Any]], *, batch_rows: Sequence[Mapping[str, Any]] = ()) -> Any:
+    """Epoch train/val loss terms, the selection loss, and the (window-averaged) batch train loss in one plot."""
     import matplotlib.pyplot as plt
 
     style = PlotStyle.from_config()
     figure, ax = plt.subplots(figsize=(8.0, 4.5), dpi=int(_PREVIEW_STYLE.dpi), facecolor=style.figure_facecolor)
     x_values = _epoch_training_batch_x_values(rows)
+    batch_points = _batch_train_points(rows, batch_rows)
+    if batch_points:
+        batch_x, batch_y = zip(*batch_points)
+        ax.plot(batch_x, batch_y, linewidth=0.8, alpha=0.35, color=style.text_dim_color, label="train (batches)")
+    selection_loss = [_score_float(row.get("selection_loss")) for row in rows]
+    _plot_loss_series(
+        ax, x_values, selection_loss, label="selection", color=style.annotation_color, linestyle="-.", marker="o"
+    )
     term_names = _epoch_loss_term_names(rows)
     if not term_names:
         train_loss = [_score_float(row.get("train_loss")) for row in rows]
@@ -146,28 +261,24 @@ def _loss_plot_figure(rows: Sequence[Mapping[str, Any]]) -> Any:
     return figure
 
 
-def _batch_loss_plot_figure(rows: Sequence[Mapping[str, Any]]) -> Any:
-    import matplotlib.pyplot as plt
-
-    style = PlotStyle.from_config()
-    figure, ax = plt.subplots(figsize=(8.0, 4.5), dpi=int(_PREVIEW_STYLE.dpi), facecolor=style.figure_facecolor)
-    term_names = _batch_loss_term_names(rows)
-    if not term_names:
-        term_names = ("loss",)
-    for term_index, term_name in enumerate(term_names):
-        color = _loss_term_color(style, term_index)
-        for split, linestyle in (("train", "-"), ("val", "--")):
-            split_points = _batch_training_batch_points(rows, split=split)
-            split_rows = [row for _x_value, row in split_points]
-            x_values = [x_value for x_value, _row in split_points]
-            y_values = [
-                _score_float(_plottable_loss_terms(row.get("loss_terms")).get(term_name, row.get("loss")))
-                for row in split_rows
-            ]
-            _plot_loss_series(ax, x_values, y_values, label=f"{split} {term_name}", color=color, linestyle=linestyle)
-    _style_loss_axes(ax, style=style, xlabel="training batches", ylabel="loss")
-    figure.tight_layout()
-    return figure
+def _batch_train_points(
+    epoch_rows: Sequence[Mapping[str, Any]], batch_rows: Sequence[Mapping[str, Any]]
+) -> list[tuple[float, float]]:
+    """``(cumulative training batch, loss)`` of the train rows of ``batch_scores.jsonl``."""
+    offsets: dict[int, int] = {}
+    cumulative = 0
+    for row in sorted(epoch_rows, key=_score_epoch):
+        offsets[_score_epoch(row)] = cumulative
+        train_steps = row.get("train_steps")
+        cumulative += int(train_steps) if isinstance(train_steps, int | float) else 0
+    points: list[tuple[float, float]] = []
+    for row in batch_rows:
+        epoch = _score_epoch(row)
+        value = _score_float(row.get("loss"))
+        if row.get("split") != "train" or epoch not in offsets or value is None:
+            continue
+        points.append((float(offsets[epoch] + int(row.get("step") or 0)), value))
+    return points
 
 
 def _cartesian_domain_loss_plot_figure(rows: Sequence[Mapping[str, Any]]) -> Any:
@@ -194,6 +305,7 @@ def _plot_loss_series(
     label: str,
     color: str,
     linestyle: str = "-",
+    marker: str | None = None,
 ) -> None:
     points = [(x_value, value) for x_value, value in zip(x_values, values) if value is not None]
     if not points:
@@ -206,6 +318,8 @@ def _plot_loss_series(
         label=label,
         color=color,
         linestyle=linestyle,
+        marker=marker,
+        markersize=3,
     )
 
 
@@ -222,51 +336,11 @@ def _epoch_training_batch_x_values(rows: Sequence[Mapping[str, Any]]) -> list[fl
     return values
 
 
-def _batch_training_batch_points(
-    rows: Sequence[Mapping[str, Any]], *, split: str
-) -> list[tuple[float, Mapping[str, Any]]]:
-    epoch_order: list[int] = []
-    rows_by_epoch: dict[int, list[Mapping[str, Any]]] = {}
-    for row in rows:
-        epoch = _score_epoch(row)
-        if epoch not in rows_by_epoch:
-            epoch_order.append(epoch)
-            rows_by_epoch[epoch] = []
-        rows_by_epoch[epoch].append(row)
-
-    points: list[tuple[float, Mapping[str, Any]]] = []
-    train_offset = 0
-    for epoch in epoch_order:
-        epoch_rows = rows_by_epoch[epoch]
-        train_rows = [row for row in epoch_rows if row.get("split") == "train"]
-        val_rows = [row for row in epoch_rows if row.get("split") == "val"]
-        train_count = len(train_rows)
-        if split == "train":
-            points.extend((float(train_offset + index), row) for index, row in enumerate(train_rows, start=1))
-        elif split == "val" and val_rows:
-            if train_count > 0:
-                scale = float(train_count) / float(len(val_rows))
-                points.extend(
-                    (float(train_offset) + scale * float(index), row) for index, row in enumerate(val_rows, start=1)
-                )
-            else:
-                points.extend((float(train_offset + index), row) for index, row in enumerate(val_rows, start=1))
-        train_offset += train_count
-    return points
-
-
 def _epoch_loss_term_names(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     names: set[str] = set()
     for row in rows:
         names.update(_plottable_loss_terms(row.get("train_loss_terms")))
         names.update(_plottable_loss_terms(row.get("val_loss_terms")))
-    return _ordered_loss_term_names(names)
-
-
-def _batch_loss_term_names(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
-    names: set[str] = set()
-    for row in rows:
-        names.update(_plottable_loss_terms(row.get("loss_terms")))
     return _ordered_loss_term_names(names)
 
 

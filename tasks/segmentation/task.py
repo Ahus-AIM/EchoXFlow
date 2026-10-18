@@ -11,7 +11,8 @@ from tasks.utils.training.preview import (
 TASK_SPEC = TaskSpec(
     name="segmentation",
     loss_fn=segmentation_loss_terms,
-    metric_keys={"cartesian_dice_mean": "dice_mean"},
+    # dice_mean thresholds the prediction (argmax); soft_dice_mean is the Dice of the probabilities.
+    metric_keys={"cartesian_dice_mean": "dice_mean", "cartesian_soft_dice_mean": "soft_dice_mean"},
     val_metrics_fn=segmentation_val_metrics,
     preview=PreviewSpec(
         prediction_fn=segmentation_preview_prediction,

@@ -1,51 +1,70 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Mapping, cast
 
 import numpy as np
 import torch
+from torch import Tensor
 from torch.utils.data import Dataset
 
 from echoxflow import (
     BrightnessModeStream,
     ColorDopplerPowerStream,
     ColorDopplerVelocityStream,
+    CroissantCatalog,
     RecordingRecord,
     find_recordings,
+    load_croissant,
     open_recording,
 )
-from echoxflow.scan import CartesianGrid, SectorGeometry, sector_to_cartesian
+from echoxflow.scan import CartesianGrid, SectorGeometry
+from echoxflow.schema import current_array_candidates
+from echoxflow.timing import run_ids, within_one_run
 from tasks.color_doppler.types import Sample
-from tasks.utils.dataset import SharedTrainingTransform, SkippedCase
+from tasks.utils.dataset import (
+    SharedTrainingTransform,
+    SkippedCase,
+    _config_bool,
+    build_task_dataloaders,
+    discover_records_from_candidates,
+    progress_iter,
+    shared_training_transform_from_config,
+    two_dimensional_frame_count,
+)
 from tasks.utils.dataset import as_spatial_shape as _as_spatial_shape
-from tasks.utils.dataset import build_task_dataloaders, discover_records_from_candidates
+from tasks.utils.dataset import cartesian_grid_sample_grid as _cartesian_grid_sample_grid
+from tasks.utils.dataset import cartesian_image_sample_grid as _cartesian_image_sample_grid
 from tasks.utils.dataset import fps_from_timestamps as _fps_from_timestamps
-from tasks.utils.dataset import local_std_3x3 as _local_std_3x3
-from tasks.utils.dataset import minmax_normalize as _minmax_normalize
 from tasks.utils.dataset import optional_int as _optional_int
 from tasks.utils.dataset import optional_ordered_float_pair as _optional_ordered_float_pair
 from tasks.utils.dataset import ordered_float_pair as _ordered_float_pair
-from tasks.utils.dataset import preprocess_bmode_frames as _preprocess_bmode_frames
-from tasks.utils.dataset import progress_iter
-from tasks.utils.dataset import resample_to_reference_geometry as _resample_to_reference_geometry
-from tasks.utils.dataset import resize_stack as _resize_stack
 from tasks.utils.dataset import sample_indices_by_case as _sample_indices_by_case
-from tasks.utils.dataset import shared_training_transform_from_config
 from tasks.utils.dataset import slice_timestamps as _slice_timestamps
+from tasks.utils.dataset import timestamps_or_index as _timestamps_or_index
 from tasks.utils.dataset import training_transform_from_args as _training_transform_from_args
-from tasks.utils.dataset import two_dimensional_frame_count
 from tasks.utils.dataset import velocity_limit_from_stream as _velocity_limit_from_stream
+from tasks.utils.deferred import DeferredSample
+from tasks.utils.device_sampling import (
+    as_device_tensor,
+    cartesian_sampling_grid,
+    sample_stack,
+    sector_sampling_grid,
+    velocity_std_3x3,
+)
+from tasks.utils.device_sampling import minmax_normalize as _minmax_normalize
+from tasks.utils.device_sampling import resize_stack as _resize_stack
+from tasks.utils.ref_cache import DEFAULT_REF_CACHE_DIR, RecordingScanCache, scan_cache_dir
 
 __all__ = [
     "RawDataset",
     "SampleRef",
     "SkippedCase",
     "build_dataloaders",
-    "discover_case_dirs",
     "discover_records",
 ]
 
@@ -59,6 +78,9 @@ _TEMPORAL_UPSAMPLE_FACTOR = 2
 _FRAME_RATIO_RANGE = (0.45, 1.1)
 _FPS_RANGE = (10.0, 13.0)
 _NYQUIST_MPS_RANGE = (0.60, 0.61)
+_RAW_COLOR_PATH = "data/2d_color_doppler_raw"
+# 2: clip starts stay on one strictly increasing clock run and one calibrated Nyquist scale inside nyquist_mps_range.
+_CLIP_STARTS_CACHE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -95,6 +117,9 @@ class RawDataset(Dataset[Sample]):
         recording_cache_read_only: bool = False,
         recording_cache_include: tuple[str, ...] = (),
         recording_cache_exclude: tuple[str, ...] = (),
+        sample_ref_cache_dir: str | Path | None = DEFAULT_REF_CACHE_DIR,
+        sample_ref_cache_read_only: bool = False,
+        device_preprocessing: bool = False,
         **_: object,
     ) -> None:
         self.records = sorted(records, key=lambda record: (record.exam_id, record.recording_id))
@@ -120,10 +145,19 @@ class RawDataset(Dataset[Sample]):
             int(cartesian_height) if cartesian_height is not None else int(self.input_spatial_shape[0])
         )
         self.include_cartesian_metrics = bool(include_cartesian_metrics)
+        self.device_preprocessing = bool(device_preprocessing)
         self.recording_cache_dir = None if recording_cache_dir is None else Path(recording_cache_dir)
         self.recording_cache_read_only = bool(recording_cache_read_only)
         self.recording_cache_include = tuple(str(path) for path in recording_cache_include) or (
-            (_BMODE_PATH, _VELOCITY_PATH, _POWER_PATH) if self.recording_cache_dir is not None else ()
+            tuple(
+                dict.fromkeys(
+                    candidate
+                    for path in (_BMODE_PATH, _VELOCITY_PATH, _POWER_PATH)
+                    for candidate in current_array_candidates(path)
+                )
+            )
+            if self.recording_cache_dir is not None
+            else ()
         )
         self.recording_cache_exclude = tuple(str(path) for path in recording_cache_exclude)
         self.skipped_cases: list[SkippedCase] = []
@@ -141,16 +175,38 @@ class RawDataset(Dataset[Sample]):
             recording_cache_read_only=self.recording_cache_read_only,
             recording_cache_include=self.recording_cache_include,
             recording_cache_exclude=self.recording_cache_exclude,
+            sample_ref_cache_dir=sample_ref_cache_dir,
+            sample_ref_cache_read_only=sample_ref_cache_read_only,
         )
         self.sample_indices_by_case = _sample_indices_by_case(self.sample_refs)
 
     def __len__(self) -> int:
         return len(self.sample_refs)
 
-    def __getitem__(self, index: int) -> Sample:
-        return self.sample_from_ref(self.sample_refs[index])
+    def __getitem__(self, index: int) -> Any:  # Sample, or DeferredSample with device_preprocessing
+        raw = self.load_raw(self.sample_refs[index])
+        if self.device_preprocessing:
+            return DeferredSample(raw=raw, finisher=self.finisher)
+        return self.finisher.finish(raw, torch.device("cpu"))
 
     def sample_from_ref(self, ref: SampleRef) -> Sample:
+        return self.finisher.finish(self.load_raw(ref), torch.device("cpu"))
+
+    @property
+    def finisher(self) -> _Finisher:
+        return _Finisher(
+            coordinate_space=self.coordinate_space,
+            cartesian_height=self.cartesian_height,
+            input_spatial_shape=self.input_spatial_shape,
+            target_spatial_shape=self.target_spatial_shape,
+            include_cartesian_metrics=self.include_cartesian_metrics,
+            velocity_loss_bmode_threshold=self.velocity_loss_bmode_threshold,
+            velocity_loss_power_threshold=self.velocity_loss_power_threshold,
+            velocity_loss_mask_floor=self.velocity_loss_mask_floor,
+        )
+
+    def load_raw(self, ref: SampleRef) -> _RawClip:
+        """Load one clip's native arrays and scalars; all resampling happens in :meth:`_Finisher.finish`."""
         store = open_recording(
             ref.record,
             root=self.data_root,
@@ -176,234 +232,264 @@ class RawDataset(Dataset[Sample]):
             raise TypeError(f"{_VELOCITY_PATH} must be ColorDopplerVelocityStream")
         if not isinstance(power, ColorDopplerPowerStream):
             raise TypeError(f"{_POWER_PATH} must be ColorDopplerPowerStream")
-        bmode_frames = bmode.to_float().data
+        bmode_frames = np.asarray(bmode.data)
         fps = ref.record.sample_rate_hz("2d_brightness_mode") or _fps_from_timestamps(bmode.timestamps) or 0.0
-        if self.coordinate_space == "cartesian":
-            frames = _cartesian_bmode_stack(
-                bmode_frames,
-                reference=bmode,
-                transform=self.training_transform,
-                cartesian_height=self.cartesian_height,
-                output_shape=self.input_spatial_shape,
-            )
-        else:
-            frames = _preprocess_bmode_frames(
-                bmode_frames,
-                transform=self.training_transform,
-                input_spatial_shape=self.input_spatial_shape,
-            )
         velocity_frames = np.asarray(velocity.data, dtype=np.float32)
         power_frames = np.asarray(power.data, dtype=np.float32)
-        if temporal_mode == "repeat_one_per_interval":
-            velocity_frames = np.repeat(velocity_frames, _TEMPORAL_UPSAMPLE_FACTOR, axis=0)
-            power_frames = np.repeat(power_frames, _TEMPORAL_UPSAMPLE_FACTOR, axis=0)
+        source_validity = store.load_validity_mask(_VELOCITY_PATH, doppler_slice.start, doppler_slice.stop)
+        frame_nyquist = velocity.metadata.velocity_scales_mps(int(velocity_frames.shape[0]))
+        repeat = temporal_mode == "repeat_one_per_interval"
+        if repeat and frame_nyquist is not None:
+            frame_nyquist = np.repeat(frame_nyquist, _TEMPORAL_UPSAMPLE_FACTOR, axis=0)
+        target_count = int(velocity_frames.shape[0]) * (_TEMPORAL_UPSAMPLE_FACTOR if repeat else 1)
         expected_target_time = _TEMPORAL_UPSAMPLE_FACTOR * (int(bmode_frames.shape[0]) - 1)
-        if int(velocity_frames.shape[0]) != expected_target_time:
+        if target_count != expected_target_time:
             raise ValueError(
-                f"{ref.sample_id} has {velocity_frames.shape[0]} color targets and {bmode_frames.shape[0]} "
+                f"{ref.sample_id} has {target_count} color targets and {bmode_frames.shape[0]} "
                 f"B-mode frames; expected {expected_target_time} color targets"
             )
-        if self.coordinate_space == "cartesian":
-            velocity_values, velocity_region = _cartesian_target_stack(
-                velocity_frames,
-                source=velocity,
-                reference=bmode,
-                cartesian_height=self.cartesian_height,
-                target_shape=self.target_spatial_shape,
-            )
-            power_values, power_region = _cartesian_target_stack(
-                power_frames,
-                source=power,
-                reference=bmode,
-                cartesian_height=self.cartesian_height,
-                target_shape=self.target_spatial_shape,
-            )
-        else:
-            velocity_values, velocity_region = _resample_target_stack(
-                velocity_frames,
-                source=velocity,
-                reference=bmode,
-                target_shape=self.target_spatial_shape,
-            )
-            power_values, power_region = _resample_target_stack(
-                power_frames,
-                source=power,
-                reference=bmode,
-                target_shape=self.target_spatial_shape,
-            )
-        power_values = np.clip(power_values, 0.0, 1.0)
-        color_region = _combined_color_region(
-            velocity_region=velocity_region,
-            power_region=power_region,
-            target_shape=self.target_spatial_shape,
-            target_count=int(velocity_values.shape[0]),
-        )
-        velocity_std = _local_std_3x3(velocity_values)
-        target = np.stack([velocity_values, power_values, velocity_std], axis=1).astype(np.float32)
-        valid_mask = cast(np.ndarray, np.isfinite(target).all(axis=1, keepdims=True).astype(np.float32))
-        if color_region is None:
-            valid_mask *= np.any(target != 0.0, axis=1, keepdims=True).astype(np.float32)
-        color_box_values = _color_box_target(
-            color_region=color_region,
-            fallback_valid_mask=np.asarray(valid_mask[:, 0], dtype=np.float32),
-            target_count=int(target.shape[0]),
-            target_shape=self.target_spatial_shape,
-        )
-        bmode_on_target = _bmode_interval_stack_for_target_grid(
-            bmode_frames=frames if self.coordinate_space == "cartesian" else bmode_frames,
-            target_shape=self.target_spatial_shape,
-        )
-        velocity_loss_mask_values = _velocity_loss_mask(
-            bmode=bmode_on_target,
-            power=power_values,
-            valid_mask=np.asarray(valid_mask[:, 0], dtype=np.float32),
-            bmode_threshold=self.velocity_loss_bmode_threshold,
-            power_threshold=self.velocity_loss_power_threshold,
-            mask_floor=self.velocity_loss_mask_floor,
-        )
-        velocity_loss_mask = velocity_loss_mask_values[:, None]
-        nyquist = _velocity_limit(velocity)
+        nyquist = _velocity_limit_from_stream(velocity) if frame_nyquist is None else _clip_nyquist(frame_nyquist, ref)
         frame_timestamps = _slice_timestamps(bmode.timestamps, 0, int(bmode_frames.shape[0]))
         target_timestamps = _target_timestamps_from_bmode(
             bmode_timestamps=frame_timestamps,
             target_count=expected_target_time,
             fps=fps,
         )
-        metric_target = None
-        metric_valid_mask = None
-        metric_velocity_loss_mask = None
-        metric_color_box_target = None
-        metric_sample_grid = None
-        if self.include_cartesian_metrics:
-            (
-                metric_target,
-                metric_valid_mask,
-                metric_velocity_loss_mask,
-                metric_color_box_target,
-                metric_sample_grid,
-            ) = self._cartesian_metric_values(
-                bmode=bmode,
-                bmode_frames=bmode_frames,
-                velocity=velocity,
-                velocity_frames=velocity_frames,
-                power=power,
-                power_frames=power_frames,
-            )
-        return Sample(
-            frames=torch.from_numpy(np.transpose(frames[:, None, :, :], (1, 0, 2, 3))[None, ...]),
-            frame_timestamps=torch.from_numpy(frame_timestamps[None, :]),
-            target_timestamps=torch.from_numpy(target_timestamps[None, :]),
-            conditioning=torch.tensor([[fps, nyquist]], dtype=torch.float32),
-            doppler_target=torch.from_numpy(np.transpose(target, (1, 0, 2, 3))[None, ...]),
-            color_box_target=torch.from_numpy(np.transpose(color_box_values[:, None], (1, 0, 2, 3))[None, ...]),
-            valid_mask=torch.from_numpy(np.transpose(valid_mask, (1, 0, 2, 3))[None, ...]),
-            velocity_loss_mask=torch.from_numpy(np.transpose(velocity_loss_mask, (1, 0, 2, 3))[None, ...]),
-            nyquist_mps=torch.tensor([nyquist], dtype=torch.float32),
+        return _RawClip(
+            bmode=bmode_frames,
+            bmode_geometry=_required_geometry(bmode, role="B-mode reference"),
+            velocity=velocity_frames,
+            velocity_geometry=_required_geometry(velocity, role="Color Doppler source"),
+            power=power_frames,
+            power_geometry=_required_geometry(power, role="Color Doppler source"),
+            validity=None if source_validity is None else np.asarray(source_validity, dtype=bool),
+            repeat_targets=repeat,
+            fps=float(fps),
+            nyquist=float(nyquist),
+            frame_nyquist=None if frame_nyquist is None else np.asarray(frame_nyquist, dtype=np.float32),
+            frame_timestamps=np.asarray(frame_timestamps),
+            target_timestamps=np.asarray(target_timestamps),
             sample_id=ref.sample_id,
             record=ref.record,
             data_root=self.data_root,
             clip_start=ref.bmode_start,
             clip_stop=ref.bmode_stop,
+        )
+
+
+@dataclass(frozen=True)
+class _RawClip:
+    """Native-resolution arrays of one Color Doppler clip, as loaded by a data-loader worker."""
+
+    bmode: np.ndarray
+    bmode_geometry: SectorGeometry
+    velocity: np.ndarray
+    velocity_geometry: SectorGeometry
+    power: np.ndarray
+    power_geometry: SectorGeometry
+    validity: np.ndarray | None
+    repeat_targets: bool
+    fps: float
+    nyquist: float
+    frame_nyquist: np.ndarray | None
+    frame_timestamps: np.ndarray
+    target_timestamps: np.ndarray
+    sample_id: str
+    record: RecordingRecord
+    data_root: str | Path | None
+    clip_start: int
+    clip_stop: int
+
+
+@dataclass(frozen=True)
+class _TargetGrid:
+    """The grid targets are resampled onto: B-mode beamspace at ``shape``, or a Cartesian grid resized to it."""
+
+    shape: tuple[int, int]
+    cartesian: CartesianGrid | None
+
+
+@dataclass(frozen=True)
+class _Finisher:
+    """Builds a :class:`Sample` from a :class:`_RawClip` on any torch device."""
+
+    coordinate_space: str
+    cartesian_height: int
+    input_spatial_shape: tuple[int, int]
+    target_spatial_shape: tuple[int, int]
+    include_cartesian_metrics: bool
+    velocity_loss_bmode_threshold: float
+    velocity_loss_power_threshold: float
+    velocity_loss_mask_floor: float
+
+    def finish(self, raw: _RawClip, device: torch.device) -> Sample:
+        bmode = as_device_tensor(raw.bmode, device).to(dtype=torch.float32) / 255.0
+        velocity = as_device_tensor(raw.velocity, device)
+        power = as_device_tensor(raw.power, device)
+        validity = None if raw.validity is None else as_device_tensor(raw.validity, device).to(dtype=torch.float32)
+        if raw.repeat_targets:
+            velocity = torch.repeat_interleave(velocity, _TEMPORAL_UPSAMPLE_FACTOR, dim=0)
+            power = torch.repeat_interleave(power, _TEMPORAL_UPSAMPLE_FACTOR, dim=0)
+            if validity is not None:
+                validity = torch.repeat_interleave(validity, _TEMPORAL_UPSAMPLE_FACTOR, dim=0)
+        cartesian_grid = CartesianGrid.from_sector_height(raw.bmode_geometry, self.cartesian_height)
+        if self.coordinate_space == "cartesian":
+            frames = self._cartesian_bmode(bmode, raw, cartesian_grid, self.input_spatial_shape)
+            interval_source = frames
+            grid = _TargetGrid(shape=self.target_spatial_shape, cartesian=cartesian_grid)
+        else:
+            frames = _minmax_normalize(_resize_stack(bmode, self.input_spatial_shape))
+            interval_source = bmode
+            grid = _TargetGrid(shape=self.target_spatial_shape, cartesian=None)
+        target, valid_mask, velocity_loss_mask, color_box = self._targets(
+            raw, velocity=velocity, power=power, validity=validity, bmode_intervals=interval_source, grid=grid
+        )
+        metric: tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
+        if self.include_cartesian_metrics:
+            metric_grid = _TargetGrid(shape=cartesian_grid.shape, cartesian=cartesian_grid)
+            cartesian_bmode = self._cartesian_bmode(bmode, raw, cartesian_grid, cartesian_grid.shape)
+            metric_values = self._targets(
+                raw,
+                velocity=velocity,
+                power=power,
+                validity=validity,
+                bmode_intervals=cartesian_bmode,
+                grid=metric_grid,
+            )
+            if self.coordinate_space == "beamspace":
+                sample_grid = _cartesian_grid_sample_grid(
+                    raw.bmode_geometry,
+                    cartesian_grid,
+                    source_shape=self.target_spatial_shape,
+                    output_shape=cartesian_grid.shape,
+                )
+            else:
+                sample_grid = _cartesian_image_sample_grid(cartesian_grid)
+            metric = (*metric_values, as_device_tensor(sample_grid, device))
+        conditioning = torch.tensor([[raw.fps, raw.nyquist]], dtype=torch.float32, device=device)
+        return Sample(
+            frames=frames[None, None],
+            frame_timestamps=as_device_tensor(raw.frame_timestamps[None, :], device),
+            target_timestamps=as_device_tensor(raw.target_timestamps[None, :], device),
+            conditioning=conditioning,
+            doppler_target=target,
+            color_box_target=color_box,
+            valid_mask=valid_mask,
+            velocity_loss_mask=velocity_loss_mask,
+            nyquist_mps=torch.tensor([raw.nyquist], dtype=torch.float32, device=device),
+            sample_id=raw.sample_id,
+            record=raw.record,
+            data_root=raw.data_root,
+            clip_start=raw.clip_start,
+            clip_stop=raw.clip_stop,
             coordinate_space=self.coordinate_space,
-            cartesian_metric_doppler_target=(
-                None
-                if metric_target is None
-                else torch.from_numpy(np.transpose(metric_target, (1, 0, 2, 3))[None, ...])
-            ),
-            cartesian_metric_valid_mask=(
-                None
-                if metric_valid_mask is None
-                else torch.from_numpy(np.transpose(metric_valid_mask, (1, 0, 2, 3))[None, ...])
-            ),
-            cartesian_metric_velocity_loss_mask=(
-                None
-                if metric_velocity_loss_mask is None
-                else torch.from_numpy(np.transpose(metric_velocity_loss_mask, (1, 0, 2, 3))[None, ...])
-            ),
-            cartesian_metric_color_box_target=(
-                None
-                if metric_color_box_target is None
-                else torch.from_numpy(np.transpose(metric_color_box_target, (1, 0, 2, 3))[None, ...])
-            ),
-            cartesian_metric_sample_grid=(
-                None if metric_sample_grid is None else torch.from_numpy(metric_sample_grid[None, ...])
+            cartesian_metric_doppler_target=None if metric is None else metric[0],
+            cartesian_metric_valid_mask=None if metric is None else metric[1],
+            cartesian_metric_velocity_loss_mask=None if metric is None else metric[2],
+            cartesian_metric_color_box_target=None if metric is None else metric[3],
+            cartesian_metric_sample_grid=None if metric is None else metric[4][None],
+            nyquist_mps_per_frame=(
+                None if raw.frame_nyquist is None else as_device_tensor(raw.frame_nyquist[None, :], device)
             ),
         )
 
-    def _cartesian_metric_values(
+    def _cartesian_bmode(
+        self, bmode: Tensor, raw: _RawClip, grid: CartesianGrid, output_shape: tuple[int, int]
+    ) -> Tensor:
+        sampling, mask = cartesian_sampling_grid(
+            raw.bmode_geometry, grid, source_shape=(int(bmode.shape[1]), int(bmode.shape[2])), device=bmode.device
+        )
+        converted = sample_stack(bmode, sampling, mask)
+        return _minmax_normalize(_resize_stack(converted, output_shape))
+
+    def _resample(
+        self, values: Tensor, *, geometry: SectorGeometry, raw: _RawClip, grid: _TargetGrid
+    ) -> tuple[Tensor, Tensor]:
+        """Resample ``[T,R,A]`` source-sector values onto the target grid; returns values and the region mask."""
+        source_shape = (int(values.shape[1]), int(values.shape[2]))
+        if grid.cartesian is None:
+            target_geometry = replace(raw.bmode_geometry, grid_shape=grid.shape)
+            sampling, mask = sector_sampling_grid(
+                geometry, target_geometry, source_shape=source_shape, output_shape=grid.shape, device=values.device
+            )
+            return sample_stack(values, sampling, mask), mask
+        sampling, mask = cartesian_sampling_grid(
+            geometry, grid.cartesian, source_shape=source_shape, device=values.device
+        )
+        converted = sample_stack(values, sampling, mask)
+        region = _resize_stack(mask[None].to(dtype=torch.float32), grid.shape)[0] > 0.5
+        return _resize_stack(converted, grid.shape), region
+
+    def _targets(
         self,
+        raw: _RawClip,
         *,
-        bmode: BrightnessModeStream,
-        bmode_frames: np.ndarray,
-        velocity: ColorDopplerVelocityStream,
-        velocity_frames: np.ndarray,
-        power: ColorDopplerPowerStream,
-        power_frames: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-        geometry = _required_geometry(bmode, role="B-mode reference")
-        grid = CartesianGrid.from_sector_height(geometry, self.cartesian_height)
-        metric_shape = grid.shape
-        velocity_values, velocity_region = _cartesian_target_stack(
-            velocity_frames,
-            source=velocity,
-            reference=bmode,
-            cartesian_height=self.cartesian_height,
-            target_shape=metric_shape,
-        )
-        power_values, power_region = _cartesian_target_stack(
-            power_frames,
-            source=power,
-            reference=bmode,
-            cartesian_height=self.cartesian_height,
-            target_shape=metric_shape,
-        )
-        power_values = np.clip(power_values, 0.0, 1.0)
-        color_region = _combined_color_region(
-            velocity_region=velocity_region,
-            power_region=power_region,
-            target_shape=metric_shape,
-            target_count=int(velocity_values.shape[0]),
-        )
-        velocity_std = _local_std_3x3(velocity_values)
-        target = np.stack([velocity_values, power_values, velocity_std], axis=1).astype(np.float32)
-        valid_mask = cast(np.ndarray, np.isfinite(target).all(axis=1, keepdims=True).astype(np.float32))
-        if color_region is None:
-            valid_mask *= np.any(target != 0.0, axis=1, keepdims=True).astype(np.float32)
-        color_box = _color_box_target(
-            color_region=color_region,
-            fallback_valid_mask=np.asarray(valid_mask[:, 0], dtype=np.float32),
-            target_count=int(target.shape[0]),
-            target_shape=metric_shape,
-        )
-        cartesian_bmode = _cartesian_bmode_stack(
-            bmode_frames,
-            reference=bmode,
-            transform=None,
-            cartesian_height=self.cartesian_height,
-            output_shape=metric_shape,
-        )
-        bmode_on_target = _bmode_interval_stack_for_target_grid(
-            bmode_frames=cartesian_bmode,
-            target_shape=metric_shape,
-        )
-        velocity_loss_mask = _velocity_loss_mask(
+        velocity: Tensor,
+        power: Tensor,
+        validity: Tensor | None,
+        bmode_intervals: Tensor,
+        grid: _TargetGrid,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Return ``doppler_target``, ``valid_mask``, ``velocity_loss_mask`` and ``color_box_target`` (5-D)."""
+        count = int(velocity.shape[0])
+        # Velocity and its validity share a source sector and grid, so one sampling pass serves both.
+        stacked = velocity if validity is None else torch.cat([velocity, validity], dim=0)
+        sampled, velocity_region = self._resample(stacked, geometry=raw.velocity_geometry, raw=raw, grid=grid)
+        velocity_values = sampled[:count]
+        power_values, power_region = self._resample(power, geometry=raw.power_geometry, raw=raw, grid=grid)
+        power_values = torch.clamp(power_values, 0.0, 1.0)
+        in_box = velocity_region & power_region
+        color_region = in_box.to(dtype=torch.float32)
+        velocity_std = velocity_std_3x3(velocity_values, in_box, nyquist=raw.nyquist)
+        target = torch.stack([velocity_values, power_values, velocity_std], dim=1)
+        valid = torch.isfinite(target).all(dim=1).to(dtype=torch.float32)
+        if validity is not None:
+            # Samples the exporter marks as having no velocity estimate (power code 0 or Rx = Ry = 0) are already
+            # NaN or below the power threshold; this only removes their floor weight from the velocity loss.
+            valid_for_velocity = valid * (torch.nan_to_num(sampled[count:], nan=0.0) > 0.5).to(dtype=torch.float32)
+        else:
+            valid_for_velocity = valid
+        bmode_on_target = _bmode_interval_stack(bmode_intervals, grid.shape)
+        loss_mask = _velocity_loss_mask(
             bmode=bmode_on_target,
             power=power_values,
-            valid_mask=np.asarray(valid_mask[:, 0], dtype=np.float32),
+            valid_mask=valid_for_velocity,
             bmode_threshold=self.velocity_loss_bmode_threshold,
             power_threshold=self.velocity_loss_power_threshold,
             mask_floor=self.velocity_loss_mask_floor,
-        )[:, None]
-        if self.coordinate_space == "beamspace":
-            sample_grid = _cartesian_grid_sample_grid(
-                geometry,
-                grid,
-                source_shape=self.target_spatial_shape,
-                output_shape=metric_shape,
-            )
-        else:
-            sample_grid = _cartesian_image_sample_grid(grid)
-        return target, valid_mask, velocity_loss_mask, color_box[:, None], sample_grid
+        )
+        color_box = color_region.expand(count, *grid.shape)
+        return (
+            target.permute(1, 0, 2, 3)[None],
+            valid[None, None],
+            loss_mask[None, None],
+            color_box[None, None].contiguous(),
+        )
+
+
+def _bmode_interval_stack(frames: Tensor, target_shape: tuple[int, int]) -> Tensor:
+    """B-mode on the target clock and grid: the mean of each interval's two frames, once per target frame."""
+    values = _minmax_normalize(frames)
+    if values.ndim != 3 or values.shape[0] < 2:
+        raise ValueError(f"B-mode clip must contain at least two frames, got {tuple(values.shape)}")
+    intervals = 0.5 * (values[:-1] + values[1:])
+    repeated = torch.repeat_interleave(intervals, _TEMPORAL_UPSAMPLE_FACTOR, dim=0)
+    return _resize_stack(repeated, target_shape)
+
+
+def _velocity_loss_mask(
+    *,
+    bmode: Tensor,
+    power: Tensor,
+    valid_mask: Tensor,
+    bmode_threshold: float,
+    power_threshold: float,
+    mask_floor: float,
+) -> Tensor:
+    finite_valid = torch.isfinite(bmode) & torch.isfinite(power) & torch.isfinite(valid_mask) & (valid_mask > 0.5)
+    selected = finite_valid & (bmode < float(bmode_threshold)) & (power > float(power_threshold))
+    floor = torch.where(finite_valid, float(mask_floor), 0.0)
+    return torch.where(selected, 1.0, floor).to(dtype=torch.float32)
 
 
 def discover_records(
@@ -416,9 +502,20 @@ def discover_records(
     frame_ratio_range: tuple[float, float] = _FRAME_RATIO_RANGE,
     fps_range: tuple[float, float] = _FPS_RANGE,
     nyquist_mps_range: tuple[float, float] | None = _NYQUIST_MPS_RANGE,
+    sample_ref_cache_dir: str | Path | None = DEFAULT_REF_CACHE_DIR,
+    sample_ref_cache_read_only: bool = False,
 ) -> list[RecordingRecord]:
+    filter_cache = _color_filter_cache(
+        cache_dir=sample_ref_cache_dir,
+        read_only=sample_ref_cache_read_only,
+        data_root=root_dir,
+        frame_ratio_range=frame_ratio_range,
+        fps_range=fps_range,
+        nyquist_mps_range=nyquist_mps_range,
+    )
+    catalog = load_croissant(root=root_dir)
     found = find_recordings(
-        root=root_dir,
+        croissant=catalog,
         array_paths=_required_array_paths(),
         require_all=True,
         predicate=lambda record: _color_metadata_discovery_predicate(
@@ -426,6 +523,7 @@ def discover_records(
             frame_ratio_range=frame_ratio_range,
             fps_range=fps_range,
             nyquist_mps_range=nyquist_mps_range,
+            catalog=catalog,
         ),
     )
     return discover_records_from_candidates(
@@ -441,7 +539,33 @@ def discover_records(
             frame_ratio_range=frame_ratio_range,
             fps_range=fps_range,
             nyquist_mps_range=nyquist_mps_range,
+            filter_cache=filter_cache,
         ),
+    )
+
+
+def _color_filter_cache(
+    *,
+    cache_dir: str | Path | None,
+    read_only: bool,
+    data_root: str | Path | None,
+    frame_ratio_range: tuple[float, float],
+    fps_range: tuple[float, float],
+    nyquist_mps_range: tuple[float, float] | None,
+) -> RecordingScanCache:
+    """Cache of the per-recording Color Doppler filter verdicts, shared by discovery and every split."""
+    return RecordingScanCache(
+        cache_dir,
+        namespace="color_doppler_filters",
+        settings={
+            # 2: derived velocity resolves its source sector, and a changing scale passes when any frame is in range.
+            "version": 2,
+            "frame_ratio_range": [float(value) for value in frame_ratio_range],
+            "fps_range": [float(value) for value in fps_range],
+            "nyquist_mps_range": None if nyquist_mps_range is None else [float(value) for value in nyquist_mps_range],
+        },
+        data_root=data_root,
+        read_only=read_only,
     )
 
 
@@ -451,15 +575,17 @@ def _color_metadata_discovery_predicate(
     frame_ratio_range: tuple[float, float],
     fps_range: tuple[float, float],
     nyquist_mps_range: tuple[float, float] | None,
+    catalog: CroissantCatalog | None = None,
 ) -> bool:
     if any("tissue" in str(content_type).lower() for content_type in record.content_types):
         return False
-    return not _record_fails_color_metadata_filters(
-        record,
-        frame_ratio_range=frame_ratio_range,
-        fps_range=fps_range,
-        nyquist_mps_range=nyquist_mps_range,
-    )
+    if nyquist_mps_range is not None and catalog is not None:
+        # Catalog preflight: a stream whose every calibrated frame lies outside the accepted Nyquist range cannot
+        # contribute a clip. A summary without a scale range decides nothing; the store check below still runs.
+        summary = catalog.stream_summary(record.recording_id, _RAW_COLOR_PATH)
+        if summary is not None and summary.velocity_scale_may_intersect(nyquist_mps_range) is False:
+            return False
+    return not _record_fails_color_metadata_filters(record, frame_ratio_range=frame_ratio_range, fps_range=fps_range)
 
 
 def _color_runtime_discovery_predicate(
@@ -469,6 +595,7 @@ def _color_runtime_discovery_predicate(
     frame_ratio_range: tuple[float, float],
     fps_range: tuple[float, float],
     nyquist_mps_range: tuple[float, float] | None,
+    filter_cache: RecordingScanCache | None = None,
 ) -> bool:
     if not _uses_color_filters(
         frame_ratio_range=frame_ratio_range,
@@ -476,17 +603,17 @@ def _color_runtime_discovery_predicate(
         nyquist_mps_range=nyquist_mps_range,
     ):
         return True
-    return _record_matches_color_filters(
-        record,
-        data_root=data_root,
-        frame_ratio_range=frame_ratio_range,
-        fps_range=fps_range,
-        nyquist_mps_range=nyquist_mps_range,
-    )
 
+    def matches(candidate: RecordingRecord) -> bool:
+        return _record_matches_color_filters(
+            candidate,
+            data_root=data_root,
+            frame_ratio_range=frame_ratio_range,
+            fps_range=fps_range,
+            nyquist_mps_range=nyquist_mps_range,
+        )
 
-def discover_case_dirs(*, root_dir: str | Path, max_cases: int | None = None) -> list[Path]:
-    return [record.path(root_dir) for record in discover_records(root_dir=root_dir, max_cases=max_cases)]
+    return bool(matches(record) if filter_cache is None else filter_cache.get(record, matches))
 
 
 def _filter_ranges(
@@ -510,6 +637,14 @@ def _discover_kwargs(data_config: Mapping[str, object]) -> dict[str, object]:
         "frame_ratio_range": frame_ratio_range,
         "fps_range": fps_range,
         "nyquist_mps_range": nyquist_mps_range,
+        **_scan_cache_kwargs(data_config),
+    }
+
+
+def _scan_cache_kwargs(data_config: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "sample_ref_cache_dir": scan_cache_dir(data_config),
+        "sample_ref_cache_read_only": _config_bool(data_config.get("sample_ref_cache_read_only", False)),
     }
 
 
@@ -542,6 +677,8 @@ def _dataset_kwargs(_config: Any, data_config: Mapping[str, object], root: str |
         ),
         "coordinate_space": str(data_config.get("coordinate_space", "beamspace")),
         "cartesian_height": _optional_int(data_config.get("cartesian_height")),
+        "device_preprocessing": _config_bool(data_config.get("device_preprocessing", False)),
+        **_scan_cache_kwargs(data_config),
     }
 
 
@@ -582,23 +719,38 @@ def _build_sample_refs(
     recording_cache_read_only: bool = False,
     recording_cache_include: tuple[str, ...] = (),
     recording_cache_exclude: tuple[str, ...] = (),
+    sample_ref_cache_dir: str | Path | None = DEFAULT_REF_CACHE_DIR,
+    sample_ref_cache_read_only: bool = False,
 ) -> list[SampleRef]:
-    refs: list[SampleRef] = []
+    # Filter verdicts and usable frame counts are cached per recording (see tasks.utils.ref_cache) and shared with
+    # discovery and the other splits; the clip windows are cheap and derived here.
+    filter_cache = _color_filter_cache(
+        cache_dir=sample_ref_cache_dir,
+        read_only=sample_ref_cache_read_only,
+        data_root=data_root,
+        frame_ratio_range=frame_ratio_range,
+        fps_range=fps_range,
+        nyquist_mps_range=nyquist_mps_range,
+    )
     interval_count = int(clip_length)
-    input_frame_count = interval_count + 1
     min_interval_count = max(interval_count, int(min_frames_per_case))
-    for record in progress_iter(
-        records,
-        description="Scanning color Doppler samples",
-        total=len(records),
-        unit="case",
-    ):
-        if _uses_color_filters(
-            frame_ratio_range=frame_ratio_range,
-            fps_range=fps_range,
-            nyquist_mps_range=nyquist_mps_range,
-        ) and not _record_matches_color_filters(
-            record,
+    starts_cache = RecordingScanCache(
+        sample_ref_cache_dir,
+        namespace="color_doppler_clip_starts",
+        settings={
+            "version": _CLIP_STARTS_CACHE_VERSION,
+            "clip_length": interval_count,
+            "clip_stride": max(1, int(clip_stride)),
+            "min_interval_count": min_interval_count,
+            "nyquist_mps_range": None if nyquist_mps_range is None else [float(value) for value in nyquist_mps_range],
+        },
+        data_root=data_root,
+        read_only=sample_ref_cache_read_only,
+    )
+
+    def matches(candidate: RecordingRecord) -> bool:
+        return _record_matches_color_filters(
+            candidate,
             data_root=data_root,
             frame_ratio_range=frame_ratio_range,
             fps_range=fps_range,
@@ -607,13 +759,35 @@ def _build_sample_refs(
             recording_cache_read_only=recording_cache_read_only,
             recording_cache_include=recording_cache_include,
             recording_cache_exclude=recording_cache_exclude,
-        ):
+        )
+
+    def clip_starts(candidate: RecordingRecord) -> list[int]:
+        return _valid_clip_starts(
+            record=candidate,
+            data_root=data_root,
+            interval_count=interval_count,
+            clip_stride=clip_stride,
+            min_interval_count=min_interval_count,
+            nyquist_mps_range=nyquist_mps_range,
+        )
+
+    refs: list[SampleRef] = []
+    input_frame_count = interval_count + 1
+    uses_filters = _uses_color_filters(
+        frame_ratio_range=frame_ratio_range,
+        fps_range=fps_range,
+        nyquist_mps_range=nyquist_mps_range,
+    )
+    for record in progress_iter(
+        records,
+        description="Scanning color Doppler samples",
+        total=len(records),
+        unit="case",
+    ):
+        if uses_filters and not bool(filter_cache.get(record, matches)):
             continue
-        usable_bmode_count = _usable_bmode_count(record=record, data_root=data_root)
-        if usable_bmode_count - 1 < min_interval_count:
-            continue
-        last_start = usable_bmode_count - input_frame_count + 1
-        for start in range(0, last_start, max(1, int(clip_stride))):
+        for start in starts_cache.get(record, clip_starts):
+            start = int(start)
             stop = start + input_frame_count
             refs.append(
                 SampleRef(
@@ -626,6 +800,68 @@ def _build_sample_refs(
             if max_samples is not None and len(refs) >= int(max_samples):
                 return refs
     return refs
+
+
+def _valid_clip_starts(
+    *,
+    record: RecordingRecord,
+    data_root: str | Path | None,
+    interval_count: int,
+    clip_stride: int,
+    min_interval_count: int,
+    nyquist_mps_range: tuple[float, float] | None,
+) -> list[int]:
+    """Return the B-mode clip starts whose frames and colour targets can be read as one consistent clip.
+
+    A clip's B-mode frames and colour frames must each lie on one strictly increasing clock run, so a source-segment
+    clock reset never falls inside a clip. Its colour frames must share one calibrated Nyquist scale, inside
+    ``nyquist_mps_range`` when given, so the scalar Nyquist conditioning is exact for every target frame.
+    """
+    usable_bmode_count = _usable_bmode_count(record=record, data_root=data_root)
+    if usable_bmode_count - 1 < min_interval_count:
+        return []
+    store = open_recording(record, root=data_root)
+    bmode = store.load_stream_header(_BMODE_PATH)
+    velocity = store.load_stream_header(_VELOCITY_PATH)
+    bmode_runs = run_ids(_timestamps_or_index(bmode.timestamps, bmode.frame_count))
+    doppler_runs = run_ids(_timestamps_or_index(velocity.timestamps, velocity.frame_count))
+    scales = velocity.velocity_scale_mps_per_frame
+    bmode_count = two_dimensional_frame_count(record, data_root, _BMODE_PATH)
+    doppler_count = min(
+        two_dimensional_frame_count(record, data_root, _VELOCITY_PATH),
+        two_dimensional_frame_count(record, data_root, _POWER_PATH),
+    )
+    temporal_mode = _temporal_mode_from_frame_counts(bmode_count=bmode_count, doppler_count=doppler_count)
+    input_frame_count = int(interval_count) + 1
+    starts: list[int] = []
+    rejected: dict[str, int] = {}
+    for start in range(0, usable_bmode_count - input_frame_count + 1, max(1, int(clip_stride))):
+        ref = SampleRef(record=record, bmode_start=start, bmode_stop=start + input_frame_count, sample_id="")
+        doppler = np.arange(*_doppler_slice_for_bmode_clip(ref=ref, temporal_mode=temporal_mode).indices(doppler_count))
+        reason = None
+        if not within_one_run(np.arange(start, start + input_frame_count), bmode_runs):
+            reason = "bmode_clock_break"
+        elif not within_one_run(doppler, doppler_runs):
+            reason = "doppler_clock_break"
+        elif scales is not None:
+            clip_scales = np.asarray(scales, dtype=np.float64)[doppler]
+            if not np.all(np.isfinite(clip_scales)):
+                reason = "uncalibrated_doppler_frame"
+            elif np.any(clip_scales != clip_scales[0]):
+                reason = "velocity_scale_change"
+            elif nyquist_mps_range is not None and not (
+                float(nyquist_mps_range[0]) <= float(clip_scales[0]) <= float(nyquist_mps_range[1])
+            ):
+                reason = "nyquist_out_of_range"
+        if reason is None:
+            starts.append(start)
+        else:
+            rejected[reason] = rejected.get(reason, 0) + 1
+    if rejected:
+        logging.getLogger(__name__).info(
+            "%s/%s: skipped Color Doppler clips %s", record.exam_id, record.recording_id, rejected
+        )
+    return starts
 
 
 def _uses_color_filters(
@@ -738,10 +974,11 @@ def _validate_color_record(
     )
     if nyquist is None:
         return False
+    # A recording whose scale changes is kept when any calibrated frame is in range; its clips are then restricted
+    # to frames in range (see _valid_clip_starts), so no sample is conditioned on a borrowed scale.
     nyquist_min, nyquist_max = accepted_nyquist_range
-    if nyquist < nyquist_min or nyquist > nyquist_max:
-        return False
-    return True
+    values = np.atleast_1d(np.asarray(nyquist, dtype=np.float64))
+    return bool(np.any((values >= nyquist_min) & (values <= nyquist_max)))
 
 
 def _record_fails_color_metadata_filters(
@@ -749,7 +986,6 @@ def _record_fails_color_metadata_filters(
     *,
     frame_ratio_range: tuple[float, float],
     fps_range: tuple[float, float],
-    nyquist_mps_range: tuple[float, float] | None,
 ) -> bool:
     bmode_count = record.frame_count("2d_brightness_mode")
     doppler_count = _record_color_doppler_frame_count_from_metadata(record)
@@ -767,13 +1003,6 @@ def _record_fails_color_metadata_filters(
         fps_min, fps_max = _ordered_float_pair(fps_range, name="fps_range")
         if fps < fps_min or fps > fps_max:
             return True
-    accepted_nyquist_range = _optional_ordered_float_pair(nyquist_mps_range, name="nyquist_mps_range")
-    if accepted_nyquist_range is not None:
-        nyquist = _record_color_nyquist_mps_from_metadata(record)
-        if nyquist is not None:
-            nyquist_min, nyquist_max = accepted_nyquist_range
-            if nyquist < nyquist_min or nyquist > nyquist_max:
-                return True
     return False
 
 
@@ -795,10 +1024,11 @@ def _record_has_required_geometries(
             cache_include=recording_cache_include,
             cache_exclude=recording_cache_exclude,
         )
+        # Stream headers carry the typed metadata and geometry without loading the samples.
         streams = (
-            store.load_stream(_BMODE_PATH),
-            store.load_stream(_VELOCITY_PATH),
-            store.load_stream(_POWER_PATH),
+            store.load_stream_header(_BMODE_PATH).stream,
+            store.load_stream_header(_VELOCITY_PATH).stream,
+            store.load_stream_header(_POWER_PATH).stream,
         )
     except (KeyError, FileNotFoundError, TypeError, ValueError):
         return False
@@ -845,53 +1075,24 @@ def _record_color_nyquist_mps(
     recording_cache_read_only: bool = False,
     recording_cache_include: tuple[str, ...] = (),
     recording_cache_exclude: tuple[str, ...] = (),
-) -> float | None:
-    value = _record_color_nyquist_mps_from_metadata(record)
-    if value is not None:
-        return value
-    stream = open_recording(
+) -> float | np.ndarray | None:
+    """Return the recording's Nyquist scale: one value, or the calibrated per-frame values when it changes."""
+    header = open_recording(
         record,
         root=data_root,
         cache_dir=recording_cache_dir,
         cache_read_only=recording_cache_read_only,
         cache_include=recording_cache_include,
         cache_exclude=recording_cache_exclude,
-    ).load_stream(_VELOCITY_PATH)
-    if not isinstance(stream, ColorDopplerVelocityStream):
+    ).load_stream_header(_VELOCITY_PATH)
+    if not isinstance(header.stream, ColorDopplerVelocityStream):
         return None
-    value = stream.metadata.velocity_limit_mps
+    if header.velocity_scale_mps_per_frame is not None:
+        scales = np.asarray(header.velocity_scale_mps_per_frame, dtype=np.float64)
+        calibrated = scales[np.isfinite(scales)]
+        return calibrated if calibrated.size else None
+    value = header.stream.metadata.velocity_limit_mps
     return None if value is None else _positive_float_or_raise(value, key="velocity_limit_mps")
-
-
-def _record_color_nyquist_mps_from_metadata(record: RecordingRecord) -> float | None:
-    raw = dict(record.raw or {})
-    for key in (
-        "nyquist_mps",
-        "velocity_limit_mps",
-        "color_doppler_nyquist_mps",
-        "color_doppler_velocity_limit_mps",
-        "recordings/nyquist_mps",
-        "recordings/velocity_limit_mps",
-        "recordings/color_doppler_nyquist_mps",
-        "recordings/color_doppler_velocity_limit_mps",
-    ):
-        value = _optional_positive_float(raw, key)
-        if value is not None:
-            return value
-    for dict_key in (
-        "nyquist_mps_by_content_type",
-        "velocity_limit_mps_by_content_type",
-        "recordings/nyquist_mps_by_content_type",
-        "recordings/velocity_limit_mps_by_content_type",
-    ):
-        mapping = raw.get(dict_key)
-        if not isinstance(mapping, Mapping):
-            continue
-        for content_key in ("2d_color_doppler", "2d_color_doppler_velocity", "color_doppler"):
-            value = _optional_positive_float(mapping, content_key)
-            if value is not None:
-                return value
-    return None
 
 
 def _temporal_mode_from_frame_counts(*, bmode_count: int, doppler_count: int) -> str:
@@ -910,70 +1111,6 @@ def _doppler_slice_for_bmode_clip(*, ref: SampleRef, temporal_mode: str) -> slic
     raise ValueError(f"Unsupported Color Doppler temporal mode: {temporal_mode}")
 
 
-def _resample_target_stack(
-    frames: np.ndarray,
-    *,
-    source: ColorDopplerVelocityStream | ColorDopplerPowerStream,
-    reference: BrightnessModeStream,
-    target_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray | None]:
-    source_geometry = _required_geometry(source, role="Color Doppler source")
-    reference_geometry = _required_geometry(reference, role="B-mode reference")
-    return cast(
-        tuple[np.ndarray, np.ndarray | None],
-        _resample_to_reference_geometry(
-            frames,
-            source_geometry=source_geometry,
-            reference_geometry=reference_geometry,
-            target_shape=target_shape,
-            return_region_mask=True,
-        ),
-    )
-
-
-def _cartesian_bmode_stack(
-    frames: np.ndarray,
-    *,
-    reference: BrightnessModeStream,
-    transform: SharedTrainingTransform | None,
-    cartesian_height: int,
-    output_shape: tuple[int, int],
-) -> np.ndarray:
-    values = np.asarray(frames, dtype=np.float32)
-    del transform
-    reference_geometry = _required_geometry(reference, role="B-mode reference")
-    converted, _mask = _sector_stack_to_cartesian_values(
-        values,
-        geometry=reference_geometry,
-        cartesian_height=cartesian_height,
-        interpolation="linear",
-    )
-    return _minmax_normalize(_resize_stack(converted, output_shape))
-
-
-def _cartesian_target_stack(
-    frames: np.ndarray,
-    *,
-    source: ColorDopplerVelocityStream | ColorDopplerPowerStream,
-    reference: BrightnessModeStream,
-    cartesian_height: int,
-    target_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray | None]:
-    source_geometry = _required_geometry(source, role="Color Doppler source")
-    reference_geometry = _required_geometry(reference, role="B-mode reference")
-    grid = CartesianGrid.from_sector_height(reference_geometry, int(cartesian_height))
-    converted, mask = _sector_stack_to_cartesian_values(
-        np.asarray(frames, dtype=np.float32),
-        geometry=source_geometry,
-        cartesian_height=cartesian_height,
-        interpolation="linear",
-        grid=grid,
-    )
-    resized = _resize_stack(converted, target_shape)
-    resized_mask = None if mask is None else _resize_stack(mask.astype(np.float32), target_shape) > 0.5
-    return resized, resized_mask
-
-
 def _required_geometry(
     stream: BrightnessModeStream | ColorDopplerVelocityStream | ColorDopplerPowerStream,
     *,
@@ -983,113 +1120,6 @@ def _required_geometry(
     if not isinstance(geometry, SectorGeometry):
         raise ValueError(f"{role} stream {stream.data_path} is missing sector geometry")
     return geometry
-
-
-def _sector_stack_to_cartesian_values(
-    frames: np.ndarray,
-    *,
-    geometry: SectorGeometry | None,
-    cartesian_height: int,
-    interpolation: str,
-    grid: CartesianGrid | None = None,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    if geometry is None:
-        return np.asarray(frames, dtype=np.float32), None
-    output_grid = grid or CartesianGrid.from_sector_height(geometry, int(cartesian_height))
-    converted = tuple(
-        sector_to_cartesian(frame, geometry, grid=output_grid, interpolation=interpolation) for frame in frames
-    )
-    values = np.stack([image.data for image in converted], axis=0).astype(np.float32, copy=False)
-    mask = np.asarray(converted[0].mask, dtype=bool)
-    return values, np.broadcast_to(mask[None], (int(values.shape[0]), *mask.shape)).copy()
-
-
-def _cartesian_grid_sample_grid(
-    geometry: SectorGeometry,
-    grid: CartesianGrid,
-    *,
-    source_shape: tuple[int, int],
-    output_shape: tuple[int, int],
-) -> np.ndarray:
-    out_h, out_w = int(output_shape[0]), int(output_shape[1])
-    src_h, src_w = int(source_shape[0]), int(source_shape[1])
-    xs = np.linspace(grid.x_range_m[0], grid.x_range_m[1], out_w, dtype=np.float64)
-    ys = np.linspace(grid.y_range_m[0], grid.y_range_m[1], out_h, dtype=np.float64)
-    xx, yy = np.meshgrid(xs, ys)
-    radii = np.sqrt(xx**2 + yy**2)
-    angles = np.arctan2(xx, yy)
-    rows = (radii - geometry.depth_start_m) / geometry.depth_span_m * max(0, src_h - 1)
-    cols = (angles - geometry.angle_start_rad) / geometry.angle_span_rad * max(0, src_w - 1)
-    x = cols / max(1, src_w - 1) * 2.0 - 1.0
-    y = rows / max(1, src_h - 1) * 2.0 - 1.0
-    return np.stack([x, y], axis=-1).astype(np.float32)
-
-
-def _cartesian_image_sample_grid(grid: CartesianGrid) -> np.ndarray:
-    out_h, out_w = grid.shape
-    x = np.linspace(-1.0, 1.0, out_w, dtype=np.float64)
-    y = np.linspace(-1.0, 1.0, out_h, dtype=np.float64)
-    xx, yy = np.meshgrid(x, y)
-    return np.stack([xx, yy], axis=-1).astype(np.float32)
-
-
-def _combined_color_region(
-    *,
-    velocity_region: np.ndarray | None,
-    power_region: np.ndarray | None,
-    target_shape: tuple[int, int],
-    target_count: int | None = None,
-) -> np.ndarray | None:
-    if velocity_region is None or power_region is None:
-        return None
-    region = np.asarray(velocity_region, dtype=bool) & np.asarray(power_region, dtype=bool)
-    if region.shape != target_shape:
-        expected_temporal_shape = None if target_count is None else (int(target_count), *target_shape)
-        if expected_temporal_shape is None or region.shape != expected_temporal_shape:
-            expected = (
-                target_shape if expected_temporal_shape is None else f"{target_shape} or {expected_temporal_shape}"
-            )
-            raise ValueError(f"Color Doppler region mask shape {region.shape} does not match target shape {expected}")
-    return cast(np.ndarray, region)
-
-
-def _color_box_target(
-    *,
-    color_region: np.ndarray | None,
-    fallback_valid_mask: np.ndarray,
-    target_count: int,
-    target_shape: tuple[int, int],
-) -> np.ndarray:
-    if color_region is not None:
-        region = np.asarray(color_region, dtype=np.float32)
-        if region.shape == (int(target_count), *target_shape):
-            return region.astype(np.float32, copy=True)
-        if region.shape != target_shape:
-            raise ValueError(
-                f"Color Doppler box mask shape {region.shape} does not match target shape "
-                f"{target_shape} or {(int(target_count), *target_shape)}"
-            )
-        return np.broadcast_to(region[None, :, :], (int(target_count), *target_shape)).astype(np.float32, copy=True)
-    fallback = np.asarray(fallback_valid_mask, dtype=np.float32)
-    if fallback.shape != (int(target_count), *target_shape):
-        raise ValueError(
-            f"Color Doppler fallback mask shape {fallback.shape} does not match "
-            f"{(int(target_count), *target_shape)}"
-        )
-    return np.asarray(fallback > 0.5, dtype=np.float32)
-
-
-def _bmode_interval_stack_for_target_grid(
-    *,
-    bmode_frames: np.ndarray,
-    target_shape: tuple[int, int],
-) -> np.ndarray:
-    arr = _minmax_normalize(np.asarray(bmode_frames, dtype=np.float32))
-    if arr.ndim != 3 or arr.shape[0] < 2:
-        raise ValueError(f"B-mode clip must contain at least two frames, got {arr.shape}")
-    intervals = 0.5 * (arr[:-1] + arr[1:])
-    repeated = np.repeat(intervals, _TEMPORAL_UPSAMPLE_FACTOR, axis=0)
-    return _resize_stack(repeated, target_shape)
 
 
 def _target_timestamps_from_bmode(*, bmode_timestamps: np.ndarray, target_count: int, fps: float) -> np.ndarray:
@@ -1113,34 +1143,11 @@ def _target_timestamps_from_bmode(*, bmode_timestamps: np.ndarray, target_count:
     return np.arange(int(target_count), dtype=np.float32) / rate
 
 
-def _velocity_loss_mask(
-    *,
-    bmode: np.ndarray,
-    power: np.ndarray,
-    valid_mask: np.ndarray,
-    bmode_threshold: float,
-    power_threshold: float,
-    mask_floor: float,
-) -> np.ndarray:
-    finite_valid = (
-        np.isfinite(bmode)
-        & np.isfinite(power)
-        & np.isfinite(valid_mask)
-        & (np.asarray(valid_mask, dtype=np.float32) > 0.5)
-    )
-    selected = (
-        finite_valid
-        & (np.asarray(bmode, dtype=np.float32) < float(bmode_threshold))
-        & (np.asarray(power, dtype=np.float32) > float(power_threshold))
-    )
-    weights = np.zeros_like(np.asarray(valid_mask, dtype=np.float32), dtype=np.float32)
-    weights[finite_valid] = float(mask_floor)
-    weights[selected] = 1.0
-    return weights
-
-
-def _velocity_limit(stream: ColorDopplerVelocityStream) -> float:
-    return _velocity_limit_from_stream(stream)
+def _clip_nyquist(frame_nyquist: np.ndarray, ref: SampleRef) -> float:
+    values = np.asarray(frame_nyquist, dtype=np.float64)
+    if values.size == 0 or not np.all(np.isfinite(values)) or np.any(values != values[0]):
+        raise ValueError(f"{ref.sample_id} spans Color Doppler frames without one calibrated Nyquist scale")
+    return float(values[0])
 
 
 def _positive_float_or_raise(value: object, *, key: str) -> float:
@@ -1148,12 +1155,6 @@ def _positive_float_or_raise(value: object, *, key: str) -> float:
     if not np.isfinite(out) or out <= 0.0:
         raise ValueError(f"{key} must be a positive finite float, got {value!r}")
     return out
-
-
-def _optional_positive_float(values: Mapping[str, object], key: str) -> float | None:
-    if key not in values:
-        return None
-    return _positive_float_or_raise(values[key], key=key)
 
 
 def _config_float(data_config: Mapping[str, object], key: str, default: float) -> float:
