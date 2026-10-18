@@ -2,6 +2,29 @@
 
 <!-- version list -->
 
+## v1.0.0 (2026-10-18)
+
+### Chores
+
+- Align lockfile with release metadata
+  ([`b782e0a`](https://github.com/Ahus-AIM/EchoXFlow/commit/b782e0a4e3dbaadf3c88fa572710bf4254d86143))
+
+### Documentation
+
+- Add task README GIF previews
+  ([`55988c5`](https://github.com/Ahus-AIM/EchoXFlow/commit/55988c5cbd20fb6f724bddf695e159788ee02dbd))
+
+### Features
+
+- Public release of the EchoXFlow readers and paper reproduction workflows
+  ([`a17d432`](https://github.com/Ahus-AIM/EchoXFlow/commit/a17d4326a7636dfaedc318d8fe1f655e001cd44a))
+
+### Breaking Changes
+
+- The reader requires dataset schema EchoXFlow-2 or newer; EchoXFlow-1 exports are rejected at load
+  time.
+
+
 ## v0.0.1 (2026-05-10)
 
 ### Bug Fixes
