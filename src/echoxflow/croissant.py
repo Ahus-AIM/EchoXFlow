@@ -507,6 +507,40 @@ class CroissantCatalog:
                 return record
         return None
 
+    def measurement_names(self) -> tuple[str, ...]:
+        """Names of the measurements the dataset holds, such as `dimension_lvot_diam`, sorted.
+
+        The catalog itself does not name measurements, so the first call opens every downloaded recording that has
+        any (about ten seconds for the full dataset on a local disk). The result is kept for the catalog's lifetime.
+        """
+        return tuple(sorted(self._measurement_index()))
+
+    def with_measurement(self, name: str) -> tuple[RecordingRecord, ...]:
+        """Recordings holding at least one measurement of this name, in catalog order.
+
+        Load the measurements themselves with `open_recording(record).load_measurements(name)`.
+        """
+        return self._measurement_index().get(name, ())
+
+    def _measurement_index(self) -> Mapping[str, tuple[RecordingRecord, ...]]:
+        cached = self.__dict__.get("_measurements")
+        if cached is None:
+            # Imported here because both modules build on this one.
+            from echoxflow.annotations import measurement_names
+            from echoxflow.loading import open_recording
+
+            index: dict[str, list[RecordingRecord]] = {}
+            for record in self.recordings:
+                if not {"measurement_points", "la_trace"} & set(record.annotations) or not record.path().exists():
+                    continue
+                with open_recording(record) as store:
+                    names = measurement_names(dict(getattr(store.group, "attrs", {})))
+                for name in names:
+                    index.setdefault(name, []).append(record)
+            cached = {name: tuple(records) for name, records in index.items()}
+            object.__setattr__(self, "_measurements", cached)
+        return cast(Mapping[str, tuple[RecordingRecord, ...]], cached)
+
     def arrays_by_recording_id(self) -> dict[str, tuple[CroissantArrayRecord, ...]]:
         grouped: dict[str, list[CroissantArrayRecord]] = {}
         for array in self.arrays:

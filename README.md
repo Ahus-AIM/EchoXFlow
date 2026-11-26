@@ -233,6 +233,61 @@ loader = DataLoader(dataset, batch_size=8, collate_fn=collate_clips)
 
 ---
 
+## Reading annotations
+
+```python
+from echoxflow import load_croissant, open_recording, plot_measurements
+
+catalog = load_croissant(root="/path/to/EchoXFlow")  # root not needed if set in the config or ECHOXFLOW_DATA_ROOT
+print(catalog.measurement_names())  # ('aortic_ar_pht', ..., 'dimension_lvot_diam', ...), 59 names
+record = catalog.with_measurement("dimension_lvot_diam")[222]  # 493 recordings
+
+with open_recording(record) as store:
+    lvot = store.load_measurements("dimension_lvot_diam")[0]
+    print(lvot.points)  # [[0.0071 0.0601] [0.0049 0.0800]], x lateral and y depth in metres
+    print(lvot.frame_index)  # 0
+
+    figure = plot_measurements(store, lvot)
+figure.savefig("assets/lvot_diameter.png")
+```
+
+```python
+record = catalog.with_measurement("aortic_lvot_trace_manual")[152]  # 355 recordings
+
+with open_recording(record) as store:
+    traces = store.load_measurements("aortic_lvot_trace_manual")
+    print(len(traces), traces[0].points.shape)  # 5 (70, 2), time in seconds and velocity in m/s
+
+    figure = plot_measurements(store, traces)
+figure.savefig("assets/lvot_vti.png")
+```
+
+```python
+record = catalog.with_measurement("volume_laesv_a4c")[90]  # 280 recordings
+
+with open_recording(record) as store:
+    la = store.load_measurements("volume_laesv_a4c")[0]
+    print(la.points.shape, la.area_m2)  # (389, 2) 0.00239, outline in metres and area in square metres
+
+    figure = plot_measurements(store, la)
+figure.savefig("assets/la_area.png")
+```
+
+<table width="100%">
+  <tr>
+    <th width="33%"><a href="assets/lvot_diameter.png">LVOT Diameter</a></th>
+    <th width="33%"><a href="assets/lvot_vti.png">LVOT Velocity Trace</a></th>
+    <th width="33%"><a href="assets/la_area.png">Left Atrial Area</a></th>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/lvot_diameter.png" alt="LVOT diameter drawn on its B-mode frame" width="100%"></td>
+    <td align="center"><img src="assets/lvot_vti.png" alt="LVOT velocity traces drawn on the pulsed-wave spectrum" width="100%"></td>
+    <td align="center"><img src="assets/la_area.png" alt="Left atrial outline drawn on its four-chamber frame" width="100%"></td>
+  </tr>
+</table>
+
+---
+
 ## Development
 
 ```bash
