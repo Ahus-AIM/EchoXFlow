@@ -6,6 +6,7 @@ from importlib import import_module
 from typing import Any
 
 from echoxflow.aha_strain import AHAStrain, AHAStrainContributor, AHAStrainSegment, load_aha_strain
+from echoxflow.annotations import AnnotationInfo, Measurement
 from echoxflow.config import data_root
 from echoxflow.croissant import (
     CroissantArrayRecord,
@@ -77,6 +78,7 @@ _LAZY_EXPORTS = {
     "RecordingPlotRenderer": ("echoxflow.plotting", "RecordingPlotRenderer"),
     "compose_layers": ("echoxflow.scan.layers", "compose_layers"),
     "opacity_from_values": ("echoxflow.scan.layers", "opacity_from_values"),
+    "plot_measurements": ("echoxflow.plotting", "plot_measurements"),
     "plot_recording": ("echoxflow.plotting", "plot_recording"),
     "rasterize_beamspace_mask": ("echoxflow.scan.rasterization", "rasterize_beamspace_mask"),
     "rasterize_beamspace_volume_mask": ("echoxflow.scan.rasterization", "rasterize_beamspace_volume_mask"),
@@ -105,6 +107,7 @@ __all__ = [
     "AHAStrain",
     "AHAStrainContributor",
     "AHAStrainSegment",
+    "AnnotationInfo",
     "AnnotationMaskStream",
     "AnnotationRef",
     "ArrayInfo",
@@ -123,6 +126,7 @@ __all__ = [
     "ImageLayer",
     "LinkedArray",
     "LoadedArray",
+    "Measurement",
     "MeshFaceStream",
     "MeshFrame",
     "MeshFrameOffsetsStream",
@@ -166,6 +170,7 @@ __all__ = [
     "load_segmental_strain",
     "opacity_from_values",
     "open_recording",
+    "plot_measurements",
     "plot_recording",
     "rasterize_beamspace_mask",
     "rasterize_beamspace_volume_mask",

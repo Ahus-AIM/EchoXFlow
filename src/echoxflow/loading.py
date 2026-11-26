@@ -15,6 +15,9 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from echoxflow.annotations import AnnotationInfo, Measurement
+from echoxflow.annotations import list_annotations as _list_annotations
+from echoxflow.annotations import load_measurements as _load_measurements
 from echoxflow.config import data_root
 from echoxflow.croissant import RecordingRecord, StreamSummary, check_schema_generation, stream_summaries_from_attrs
 from echoxflow.manifest import annotation_documents, manifest_documents
@@ -644,6 +647,20 @@ class RecordingStore:
             dict(getattr(self.group, "attrs", {})),
             store_path=self.path,
         )
+
+    def list_annotations(self) -> tuple[AnnotationInfo, ...]:
+        """Describe every annotation of this recording that has values (kind, name, array path, shape)."""
+        return _list_annotations(self)
+
+    def load_measurements(
+        self, kind: str | None = None, *, coordinate_type: str | None = None
+    ) -> tuple[Measurement, ...]:
+        """Load the scanner measurements of this recording, optionally of one kind or coordinate type.
+
+        Spatial points are returned in the Cartesian frame of the B-mode sector (x lateral, y depth, metres)
+        together with the index of the frame they were drawn on; see `echoxflow.Measurement`.
+        """
+        return _load_measurements(self, kind, coordinate_type=coordinate_type)
 
     def load_packed_mesh_annotation(self, prefix: str = "3d_left_ventricle_mesh") -> PackedMeshAnnotation:
         """Load typed packed LV mesh arrays using conventional EchoXFlow mesh paths."""

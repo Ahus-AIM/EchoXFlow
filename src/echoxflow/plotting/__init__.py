@@ -16,6 +16,7 @@ from echoxflow.plotting.gating import (
     normalize_doppler_power,
     tissue_gate,
 )
+from echoxflow.plotting.measurements import plot_measurements
 from echoxflow.plotting.overlay import blend_segmentation_rgb, normalized_bmode_rgb
 from echoxflow.plotting.renderer import RecordingPlotRenderer
 from echoxflow.plotting.specs import FrameRequest, PanelSpec, PlotViewMode, RenderedFrame, TraceSpec, VideoRequest
@@ -38,6 +39,7 @@ __all__ = [
     "normalize_bmode_intensity",
     "normalized_bmode_rgb",
     "normalize_doppler_power",
+    "plot_measurements",
     "plot_recording",
     "render_loaded_arrays_video",
     "render_panel_video",
