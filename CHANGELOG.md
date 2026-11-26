@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-11-26)
+
+### Features
+
+- Find, read and plot measurements in image coordinates
+  ([#5](https://github.com/Ahus-AIM/EchoXFlow/pull/5),
+  [`7e49d82`](https://github.com/Ahus-AIM/EchoXFlow/commit/7e49d8219865249498eacda7914404ccb17a9ced))
+
+
 ## v1.0.0 (2026-10-18)
 
 ### Chores
